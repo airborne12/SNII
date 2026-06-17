@@ -5,6 +5,8 @@ set(SNII_SOURCES
   src/encoding/varint.cpp
   src/encoding/byte_sink.cpp
   src/encoding/byte_source.cpp
+  src/encoding/crc32c.cpp
+  src/encoding/section_framer.cpp
 )
 
 add_library(snii STATIC ${SNII_SOURCES})

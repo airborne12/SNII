@@ -8,6 +8,8 @@ set(SNII_TEST_SOURCES
   encoding/varint_test.cpp
   encoding/byte_sink_test.cpp
   encoding/byte_source_test.cpp
+  encoding/crc32c_test.cpp
+  encoding/section_framer_test.cpp
 )
 
 add_executable(snii_core_tests ${SNII_TEST_SOURCES})
