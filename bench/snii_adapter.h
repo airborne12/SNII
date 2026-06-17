@@ -1,0 +1,48 @@
+#pragma once
+
+#include <cstdint>
+#include <memory>
+#include <string>
+#include <vector>
+
+#include "corpus_gen.h"
+#include "snii/io/local_file.h"
+#include "snii/io/metered_file_reader.h"
+#include "snii/reader/logical_index_reader.h"
+#include "snii/reader/snii_segment_reader.h"
+
+// SNII benchmark adapter: builds a single-segment .idx from a Corpus and exposes
+// metered term / phrase queries. Each query resets the metered reader first so
+// the returned IoMetrics describe that query in isolation against a cold cache.
+namespace bench {
+
+class SniiAdapter {
+ public:
+  SniiAdapter() = default;
+  ~SniiAdapter();
+
+  SniiAdapter(const SniiAdapter&) = delete;
+  SniiAdapter& operator=(const SniiAdapter&) = delete;
+
+  // Builds the index at a temporary path and opens it for reading. Throws
+  // std::runtime_error on any failure (writer, reader, or open_index).
+  void build_and_open(const Corpus& c);
+
+  // Runs term_query for `term`, filling `docids` (ascending) and `metrics` with
+  // the I/O accounting for this query alone. Throws on query error.
+  void term_query(const std::string& term, std::vector<uint32_t>* docids,
+                  snii::io::IoMetrics* metrics);
+
+  // Runs phrase_query for `words`, filling `docids` and `metrics`. Throws on error.
+  void phrase_query(const std::vector<std::string>& words,
+                    std::vector<uint32_t>* docids, snii::io::IoMetrics* metrics);
+
+ private:
+  std::string path_;
+  std::unique_ptr<snii::io::LocalFileReader> local_;
+  std::unique_ptr<snii::io::MeteredFileReader> metered_;
+  std::unique_ptr<snii::reader::SniiSegmentReader> segment_;
+  std::unique_ptr<snii::reader::LogicalIndexReader> index_;
+};
+
+}  // namespace bench
