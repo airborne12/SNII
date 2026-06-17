@@ -1,0 +1,180 @@
+#include <gtest/gtest.h>
+
+#include <cstdint>
+#include <vector>
+
+#include "snii/common/slice.h"
+#include "snii/common/status.h"
+#include "snii/encoding/byte_sink.h"
+#include "snii/encoding/section_framer.h"
+#include "snii/format/dict_block_directory.h"
+#include "snii/format/format_constants.h"
+
+using namespace snii;
+using namespace snii::format;
+
+namespace {
+
+// 用 builder 序列化一组 block_ref，返回 framed section 字节。
+std::vector<uint8_t> Build(const std::vector<BlockRef>& refs) {
+  DictBlockDirectoryBuilder builder;
+  for (const auto& r : refs) {
+    builder.add(r);
+  }
+  ByteSink sink;
+  builder.finish(&sink);
+  return sink.buffer();
+}
+
+// 断言两个 block_ref 字段逐一相等。
+void ExpectRefEq(const BlockRef& a, const BlockRef& b) {
+  EXPECT_EQ(a.offset, b.offset);
+  EXPECT_EQ(a.length, b.length);
+  EXPECT_EQ(a.n_entries, b.n_entries);
+  EXPECT_EQ(a.flags, b.flags);
+  EXPECT_EQ(a.checksum, b.checksum);
+}
+
+}  // namespace
+
+TEST(DictBlockDirectory, RoundTripMultipleRefs) {
+  std::vector<BlockRef> refs = {
+      {0, 4096, 120, 0x01, 0xDEADBEEFu},
+      {4096, 8192, 300, 0x05, 0x12345678u},
+      {12288, 2048, 64, 0x00, 0xCAFEBABEu},
+  };
+  auto bytes = Build(refs);
+
+  DictBlockDirectoryReader reader;
+  ASSERT_TRUE(DictBlockDirectoryReader::open(Slice(bytes), &reader).ok());
+  ASSERT_EQ(reader.n_blocks(), 3u);
+  for (uint32_t i = 0; i < refs.size(); ++i) {
+    BlockRef out{};
+    ASSERT_TRUE(reader.get(i, &out).ok());
+    ExpectRefEq(out, refs[i]);
+  }
+}
+
+TEST(DictBlockDirectory, GetOrdinalCorrectMapping) {
+  std::vector<BlockRef> refs;
+  for (uint32_t i = 0; i < 50; ++i) {
+    refs.push_back(BlockRef{static_cast<uint64_t>(i) * 1000, 1000,
+                            i + 1, static_cast<uint8_t>(i & 0xFF), i * 7u + 3u});
+  }
+  auto bytes = Build(refs);
+
+  DictBlockDirectoryReader reader;
+  ASSERT_TRUE(DictBlockDirectoryReader::open(Slice(bytes), &reader).ok());
+  ASSERT_EQ(reader.n_blocks(), 50u);
+  // 抽样若干 ordinal，确认映射不串位。
+  for (uint32_t ord : {0u, 1u, 17u, 49u}) {
+    BlockRef out{};
+    ASSERT_TRUE(reader.get(ord, &out).ok());
+    ExpectRefEq(out, refs[ord]);
+  }
+}
+
+TEST(DictBlockDirectory, OutOfRangeOrdinalRejected) {
+  std::vector<BlockRef> refs = {{0, 100, 1, 0, 0xAAu}};
+  auto bytes = Build(refs);
+
+  DictBlockDirectoryReader reader;
+  ASSERT_TRUE(DictBlockDirectoryReader::open(Slice(bytes), &reader).ok());
+  ASSERT_EQ(reader.n_blocks(), 1u);
+  BlockRef out{};
+  // ordinal == n_blocks 越界
+  EXPECT_EQ(reader.get(1, &out).code(), StatusCode::kNotFound);
+  // 远超界
+  EXPECT_EQ(reader.get(1000, &out).code(), StatusCode::kNotFound);
+}
+
+TEST(DictBlockDirectory, EmptyDirectory) {
+  std::vector<BlockRef> refs;  // 0 个 block
+  auto bytes = Build(refs);
+
+  DictBlockDirectoryReader reader;
+  ASSERT_TRUE(DictBlockDirectoryReader::open(Slice(bytes), &reader).ok());
+  EXPECT_EQ(reader.n_blocks(), 0u);
+  BlockRef out{};
+  EXPECT_EQ(reader.get(0, &out).code(), StatusCode::kNotFound);
+}
+
+TEST(DictBlockDirectory, LargeOffsetNear2Pow48) {
+  const uint64_t kBig = (1ull << 48) - 1;  // near 2^48
+  std::vector<BlockRef> refs = {
+      {kBig, kBig - 1, 0xFFFFFFFFu, 0xFF, 0xFFFFFFFFu},
+      {kBig + 12345, 1, 1, 0x02, 0u},
+  };
+  auto bytes = Build(refs);
+
+  DictBlockDirectoryReader reader;
+  ASSERT_TRUE(DictBlockDirectoryReader::open(Slice(bytes), &reader).ok());
+  ASSERT_EQ(reader.n_blocks(), 2u);
+  BlockRef out0{};
+  ASSERT_TRUE(reader.get(0, &out0).ok());
+  ExpectRefEq(out0, refs[0]);
+  BlockRef out1{};
+  ASSERT_TRUE(reader.get(1, &out1).ok());
+  ExpectRefEq(out1, refs[1]);
+}
+
+TEST(DictBlockDirectory, FramedAsDictBlockDirectoryType) {
+  std::vector<BlockRef> refs = {{0, 10, 1, 0, 0}};
+  auto bytes = Build(refs);
+  ASSERT_GE(bytes.size(), 1u);
+  // 首字节为 SectionFramer 的 type，应为 kDictBlockDirectory。
+  EXPECT_EQ(bytes[0], static_cast<uint8_t>(SectionType::kDictBlockDirectory));
+}
+
+TEST(DictBlockDirectory, DetectsCorruption) {
+  std::vector<BlockRef> refs = {
+      {0, 4096, 120, 0x01, 0xDEADBEEFu},
+      {4096, 8192, 300, 0x05, 0x12345678u},
+  };
+  auto bytes = Build(refs);
+  ASSERT_GE(bytes.size(), 4u);
+  // 翻转 payload 区域的一个字节（跳过 type+len 前缀），section crc 必须检出。
+  bytes[3] ^= 0xFF;
+  DictBlockDirectoryReader reader;
+  EXPECT_EQ(DictBlockDirectoryReader::open(Slice(bytes), &reader).code(),
+            StatusCode::kCorruption);
+}
+
+TEST(DictBlockDirectory, DetectsTruncation) {
+  std::vector<BlockRef> refs = {{0, 4096, 120, 0x01, 0xDEADBEEFu}};
+  auto bytes = Build(refs);
+  bytes.pop_back();  // 截断尾字节
+  DictBlockDirectoryReader reader;
+  EXPECT_FALSE(DictBlockDirectoryReader::open(Slice(bytes), &reader).ok());
+}
+
+TEST(DictBlockDirectory, WrongSectionTypeRejected) {
+  // 用 framer 写入非 kDictBlockDirectory 的 section，open 必须拒绝。
+  ByteSink sink;
+  const uint8_t p[] = {0, 1, 2};
+  SectionFramer::write(sink, static_cast<uint8_t>(SectionType::kXFilter),
+                       Slice(p, 3));
+  auto bytes = sink.buffer();
+  DictBlockDirectoryReader reader;
+  EXPECT_EQ(DictBlockDirectoryReader::open(Slice(bytes), &reader).code(),
+            StatusCode::kInvalidArgument);
+}
+
+TEST(DictBlockDirectory, TrailingBytesRejected) {
+  // payload 末尾多出无关字节，应被检出（n_blocks 与实际不符）。
+  ByteSink payload;
+  payload.put_varint32(1);            // n_blocks = 1
+  payload.put_varint64(0);            // offset
+  payload.put_varint64(10);           // length
+  payload.put_varint32(1);            // n_entries
+  payload.put_u8(0);                  // flags
+  payload.put_fixed32(0);            // checksum
+  payload.put_u8(0xEE);               // 多余尾字节
+  ByteSink sink;
+  SectionFramer::write(sink,
+                       static_cast<uint8_t>(SectionType::kDictBlockDirectory),
+                       payload.view());
+  DictBlockDirectoryReader reader;
+  EXPECT_EQ(DictBlockDirectoryReader::open(Slice(sink.buffer()), &reader).code(),
+            StatusCode::kCorruption);
+}
