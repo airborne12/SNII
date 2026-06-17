@@ -1,15 +1,7 @@
 # libsnii —— S3-native 倒排索引核心库。零 bench / 零 clucene 依赖。
-# 源文件清单按任务显式追加（不使用 glob，保证可审计、可控）。
-set(SNII_SOURCES
-  src/common/status.cpp
-  src/encoding/varint.cpp
-  src/encoding/byte_sink.cpp
-  src/encoding/byte_source.cpp
-  src/encoding/crc32c.cpp
-  src/encoding/section_framer.cpp
-  src/encoding/zstd_codec.cpp
-  src/encoding/pfor.cpp
-)
+# 源文件用 GLOB_RECURSE + CONFIGURE_DEPENDS 自动纳入：新增模块只需在 src/ 下加文件，
+# 无需编辑本清单（使并行开发各模块时不冲突于共享 CMakeLists）。git 仍完整追踪可审计。
+file(GLOB_RECURSE SNII_SOURCES CONFIGURE_DEPENDS ${CMAKE_CURRENT_SOURCE_DIR}/src/*.cpp)
 
 add_library(snii STATIC ${SNII_SOURCES})
 target_include_directories(snii PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include)

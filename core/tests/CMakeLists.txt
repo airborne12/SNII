@@ -1,18 +1,8 @@
 find_package(GTestPrebuilt REQUIRED)
 
-# 测试源清单按任务显式追加。
-set(SNII_TEST_SOURCES
-  smoke_test.cpp
-  common/status_test.cpp
-  common/slice_test.cpp
-  encoding/varint_test.cpp
-  encoding/byte_sink_test.cpp
-  encoding/byte_source_test.cpp
-  encoding/crc32c_test.cpp
-  encoding/section_framer_test.cpp
-  encoding/zstd_codec_test.cpp
-  encoding/pfor_test.cpp
-)
+# 测试源用 GLOB_RECURSE + CONFIGURE_DEPENDS 自动纳入：新增 *_test.cpp 即被发现，
+# 无需编辑本清单（并行开发各模块测试时不冲突）。
+file(GLOB_RECURSE SNII_TEST_SOURCES CONFIGURE_DEPENDS ${CMAKE_CURRENT_SOURCE_DIR}/*_test.cpp)
 
 add_executable(snii_core_tests ${SNII_TEST_SOURCES})
 target_link_libraries(snii_core_tests PRIVATE snii snii_gtest)
