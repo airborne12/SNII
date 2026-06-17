@@ -1,5 +1,7 @@
 /build/
 /build-*/
+# Claude Code 会话 / workflow worktree，绝不入库
+.claude/
 *.o
 *.a
 compile_commands.json
