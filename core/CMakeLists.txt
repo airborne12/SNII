@@ -22,6 +22,19 @@ find_library(ZSTD_LIB NAMES zstd libzstd.a PATHS ${_dt_installed_candidates} PAT
 target_include_directories(snii PUBLIC ${ZSTD_INCLUDE_DIR})
 target_link_libraries(snii PUBLIC ${ZSTD_LIB})
 
+# CRoaring (for the null-bitmap POD), from the doris-thirdparty install dir.
+find_path(ROARING_INCLUDE_DIR roaring/roaring.hh PATHS ${_dt_installed_candidates}
+  PATH_SUFFIXES include NO_DEFAULT_PATH REQUIRED)
+find_library(ROARING_LIB NAMES roaring libroaring.a PATHS ${_dt_installed_candidates}
+  PATH_SUFFIXES lib NO_DEFAULT_PATH REQUIRED)
+target_include_directories(snii PUBLIC ${ROARING_INCLUDE_DIR})
+target_link_libraries(snii PUBLIC ${ROARING_LIB})
+
+# xxHash header (used header-only via XXH_INLINE_ALL by the binary-fuse-8 filter).
+find_path(XXHASH_INCLUDE_DIR xxhash.h PATHS ${_dt_installed_candidates}
+  PATH_SUFFIXES include NO_DEFAULT_PATH REQUIRED)
+target_include_directories(snii PUBLIC ${XXHASH_INCLUDE_DIR})
+
 if(SNII_BUILD_TESTS)
   enable_testing()
   add_subdirectory(tests)
