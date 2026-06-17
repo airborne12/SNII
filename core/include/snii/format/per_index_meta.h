@@ -1,0 +1,141 @@
+#pragma once
+
+#include <cstdint>
+#include <string>
+#include <vector>
+
+#include "snii/common/slice.h"
+#include "snii/common/status.h"
+#include "snii/encoding/byte_sink.h"
+#include "snii/format/format_constants.h"
+#include "snii/format/stats_block.h"
+
+// PerIndexMeta -- the per-logical-index metadata block that enters the searcher
+// cache. It COMPOSES already-built sub-sections (StatsBlock, SampledTermIndex,
+// DICT block directory, optional XFilter) plus the physical SectionRefs into a
+// single contiguous block. See design spec "Per-index meta block".
+//
+// On-disk layout:
+//   PerIndexMetaHeader (fixed prefix, self-checksummed):
+//     u16      meta_format_version (== kMetaFormatVersion), little-endian
+//     varint64 index_id
+//     varint32 suffix_len
+//     u8[]     suffix_bytes
+//     u32      flags (fixed32, little-endian)   # feature bits, e.g. kHasXFilter
+//     u32      crc32c (fixed32) over all preceding header bytes
+//   then framed sub-sections (each via SectionFramer, type+len+payload+crc32c):
+//     StatsBlock            (kStatsBlock,        built here)
+//     SampledTermIndex      (kSampledTermIndex,  embedded already-framed bytes)
+//     DICT block directory  (kDictBlockDirectory,embedded already-framed bytes)
+//     optional XFilter      (kXFilter,           embedded; present iff kHasXFilter)
+//     SectionRefs           (kSectionRefs,       built here)
+//     (+ any extra raw framed sections appended by add_raw_section)
+//
+// Design choice: the SampledTermIndex / DICT block directory / XFilter
+// sub-sections are EMBEDDED as their producers' already-framed output (the raw
+// SectionFramer frame), not re-framed. This lets the reader hand the exact frame
+// Slice straight back to each sub-module's open() (which expects a full frame),
+// and reuses the framer instead of re-implementing sub-section parsing.
+namespace snii::format {
+
+// Physical reference to a contiguous region within the container. (0, 0) means
+// the region is absent (e.g. no .prx POD for a docs-only index).
+struct RegionRef {
+  uint64_t offset = 0;
+  uint64_t length = 0;
+};
+
+// Physical references to the data sections / side PODs of one logical index.
+// Each RegionRef is encoded as varint64 offset followed by varint64 length, in
+// the field order below.
+struct SectionRefs {
+  RegionRef dict_region;
+  RegionRef frq_pod;
+  RegionRef prx_pod;
+  RegionRef norms;
+  RegionRef null_bitmap;
+};
+
+// Builds a per-index meta block by composing already-built sub-sections.
+class PerIndexMetaBuilder {
+ public:
+  // Header flags / feature bits.
+  static constexpr uint32_t kHasXFilter = 1u << 0;
+
+  PerIndexMetaBuilder(uint64_t index_id, std::string index_suffix,
+                      uint32_t flags);
+
+  void set_stats(const StatsBlock& stats);
+
+  // Raw output of SampledTermIndexBuilder::finish (a full kSampledTermIndex frame).
+  void set_sampled_term_index(Slice framed_bytes);
+
+  // Raw output of DictBlockDirectoryBuilder::finish (a full kDictBlockDirectory frame).
+  void set_dict_block_directory(Slice framed_bytes);
+
+  // Optional. Raw output of build_xfilter (a full kXFilter frame); sets kHasXFilter.
+  void set_xfilter(Slice framed_bytes);
+
+  void set_section_refs(const SectionRefs& refs);
+
+  // Appends an arbitrary already-framed section verbatim. Used for forward-compat
+  // optional sections; the reader skips unrecognized types.
+  void add_raw_section(Slice framed_bytes);
+
+  // Serializes the header and all sub-sections into sink.
+  // sink == nullptr -> kInvalidArgument.
+  Status finish(ByteSink* sink) const;
+
+ private:
+  uint64_t index_id_;
+  std::string index_suffix_;
+  uint32_t flags_;
+  StatsBlock stats_;
+  std::vector<uint8_t> sampled_term_index_;
+  std::vector<uint8_t> dict_block_directory_;
+  std::vector<uint8_t> xfilter_;
+  SectionRefs section_refs_;
+  std::vector<std::vector<uint8_t>> extra_sections_;
+};
+
+// Parses a per-index meta block: verifies the header crc, then walks the framed
+// sub-sections (each crc-verified by the framer), capturing the full frame Slice
+// of each known sub-section so callers can re-open it with the sub-module reader.
+// Unrecognized optional section types are skipped.
+class PerIndexMetaReader {
+ public:
+  PerIndexMetaReader() = default;
+
+  // block == the full per-index meta block bytes; out must be non-null.
+  // Header crc mismatch / truncation / a sub-section crc mismatch -> kCorruption;
+  // missing a required sub-section -> kCorruption; out == nullptr -> kInvalidArgument.
+  static Status open(Slice block, PerIndexMetaReader* out);
+
+  uint64_t index_id() const { return index_id_; }
+  const std::string& index_suffix() const { return index_suffix_; }
+  uint32_t flags() const { return flags_; }
+
+  const StatsBlock& stats() const { return stats_; }
+  const SectionRefs& section_refs() const { return section_refs_; }
+
+  // Full kSampledTermIndex frame Slice, ready for SampledTermIndexReader::open.
+  Slice sampled_term_index_bytes() const { return sampled_term_index_; }
+  // Full kDictBlockDirectory frame Slice, ready for DictBlockDirectoryReader::open.
+  Slice dict_block_directory_bytes() const { return dict_block_directory_; }
+
+  bool has_xfilter() const { return (flags_ & PerIndexMetaBuilder::kHasXFilter) != 0; }
+  // Full kXFilter frame Slice (empty when no XFilter is present).
+  Slice xfilter_bytes() const { return xfilter_; }
+
+ private:
+  uint64_t index_id_ = 0;
+  std::string index_suffix_;
+  uint32_t flags_ = 0;
+  StatsBlock stats_;
+  SectionRefs section_refs_;
+  Slice sampled_term_index_;
+  Slice dict_block_directory_;
+  Slice xfilter_;
+};
+
+}  // namespace snii::format
