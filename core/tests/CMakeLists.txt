@@ -5,6 +5,7 @@ set(SNII_TEST_SOURCES
   smoke_test.cpp
   common/status_test.cpp
   common/slice_test.cpp
+  encoding/varint_test.cpp
 )
 
 add_executable(snii_core_tests ${SNII_TEST_SOURCES})

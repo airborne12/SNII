@@ -2,6 +2,7 @@
 # 源文件清单按任务显式追加（不使用 glob，保证可审计、可控）。
 set(SNII_SOURCES
   src/common/status.cpp
+  src/encoding/varint.cpp
 )
 
 add_library(snii STATIC ${SNII_SOURCES})
