@@ -1,0 +1,11 @@
+/build/
+/build-*/
+*.o
+*.a
+compile_commands.json
+.cache/
+# 凭证 / 本地配置，绝不入库
+*.oss.env
+.env
+*.local.env
+core/tests/testdata/tmp/
