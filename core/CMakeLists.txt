@@ -3,6 +3,8 @@
 set(SNII_SOURCES
   src/common/status.cpp
   src/encoding/varint.cpp
+  src/encoding/byte_sink.cpp
+  src/encoding/byte_source.cpp
 )
 
 add_library(snii STATIC ${SNII_SOURCES})

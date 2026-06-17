@@ -6,6 +6,8 @@ set(SNII_TEST_SOURCES
   common/status_test.cpp
   common/slice_test.cpp
   encoding/varint_test.cpp
+  encoding/byte_sink_test.cpp
+  encoding/byte_source_test.cpp
 )
 
 add_executable(snii_core_tests ${SNII_TEST_SOURCES})
