@@ -1,7 +1,7 @@
 # libsnii —— S3-native 倒排索引核心库。零 bench / 零 clucene 依赖。
 # 源文件清单按任务显式追加（不使用 glob，保证可审计、可控）。
 set(SNII_SOURCES
-  src/placeholder.cpp
+  src/common/status.cpp
 )
 
 add_library(snii STATIC ${SNII_SOURCES})
