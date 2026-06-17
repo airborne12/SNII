@@ -8,7 +8,7 @@
 
 namespace snii {
 
-// 只读字节视图（不拥有内存）。生命周期由底层缓冲负责。
+// Read-only byte view (does not own memory). Lifetime is managed by the underlying buffer.
 class Slice {
  public:
   Slice() = default;

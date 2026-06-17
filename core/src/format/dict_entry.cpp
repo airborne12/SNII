@@ -8,13 +8,13 @@ namespace snii::format {
 
 namespace {
 
-// flags 位的纯函数装配 / 解析，避免内联 if-else 长链。
+// Pure-function assembly / parsing of flags bits; avoids a long inline if-else chain.
 uint8_t pack_flags(const DictEntry& e) {
   uint8_t f = 0;
   if (e.kind == DictEntryKind::kInline) f |= dict_flags::kKind;
   if (e.enc == DictEntryEnc::kWindowed) f |= dict_flags::kEnc;
   if (e.has_sb) f |= dict_flags::kHasSb;
-  // bit3 has_champion / bit4 offsets_ref 在 v1 恒 0。
+  // bit3 has_champion / bit4 offsets_ref are always 0 in v1.
   return f;
 }
 
@@ -24,7 +24,7 @@ void apply_flags(uint8_t f, DictEntry* e) {
   e->has_sb = (f & dict_flags::kHasSb) != 0;
 }
 
-// term 与 prev_term 的最长公共前缀长度。
+// Length of the longest common prefix between term and prev_term.
 uint32_t common_prefix_len(std::string_view term, std::string_view prev) {
   uint32_t n = 0;
   const uint32_t lim = static_cast<uint32_t>(std::min(term.size(), prev.size()));
@@ -34,7 +34,7 @@ uint32_t common_prefix_len(std::string_view term, std::string_view prev) {
 
 bool tier_has_stats(IndexTier tier) { return tier >= IndexTier::kT2; }
 
-// ---- 编码 entry body（不含 entry_len 与尾部 crc）----
+// ---- Encode entry body (excluding entry_len and trailing crc) ----
 
 void write_term_key(const DictEntry& e, std::string_view prev, ByteSink* sink) {
   const uint32_t prefix = common_prefix_len(e.term, prev);
@@ -79,7 +79,7 @@ void write_body(const DictEntry& e, std::string_view prev, IndexTier tier, ByteS
   }
 }
 
-// ---- 解码 entry body ----
+// ---- Decode entry body ----
 
 Status read_term_key(ByteSource* src, std::string_view prev, DictEntry* out) {
   uint32_t prefix = 0;
@@ -87,7 +87,7 @@ Status read_term_key(ByteSource* src, std::string_view prev, DictEntry* out) {
   SNII_RETURN_IF_ERROR(src->get_varint32(&prefix));
   SNII_RETURN_IF_ERROR(src->get_varint32(&suffix_len));
   if (prefix > prev.size()) {
-    return Status::Corruption("dict_entry: prefix_len 超过 prev_term 长度");
+    return Status::Corruption("dict_entry: prefix_len exceeds prev_term length");
   }
   Slice suffix;
   SNII_RETURN_IF_ERROR(src->get_bytes(suffix_len, &suffix));
@@ -137,11 +137,11 @@ Status read_locator(ByteSource* src, IndexTier tier, DictEntry* out) {
   return read_pod_ref(src, tier, out);
 }
 
-// 读取 entry_len（= body 长度）并校验 src 剩余足够。
+// Read entry_len (= body length) and verify that src has enough remaining bytes.
 Status read_entry_len(ByteSource* src, uint64_t* total) {
   SNII_RETURN_IF_ERROR(src->get_varint64(total));
   if (*total > src->remaining()) {
-    return Status::Corruption("dict_entry: entry_len 越界");
+    return Status::Corruption("dict_entry: entry_len out of range");
   }
   return Status::OK();
 }
@@ -150,11 +150,11 @@ Status read_entry_len(ByteSource* src, uint64_t* total) {
 
 Status encode_dict_entry(const DictEntry& entry, std::string_view prev_term,
                          IndexTier tier, ByteSink* sink) {
-  if (sink == nullptr) return Status::InvalidArgument("dict_entry: sink 为空");
+  if (sink == nullptr) return Status::InvalidArgument("dict_entry: sink is null");
 
-  // 先把 body 序列化到临时缓冲，得知精确长度后写 entry_len + body。
-  // crc 校验在 DICT block 级统一进行（覆盖 block header + 全部 entries + 锚点表），
-  // entry 级不重复 crc，以保持 slim/inline 低频 term 的极致紧凑（规格 §词典块/§词典项）。
+  // Serialize the body into a temporary buffer first to obtain the exact length, then write entry_len + body.
+  // CRC verification is done uniformly at the DICT block level (covering block header + all entries + anchor table);
+  // CRC is not repeated at the entry level, to keep slim/inline low-frequency terms maximally compact (spec §DICT block/§dict entry).
   ByteSink body;
   write_body(entry, prev_term, tier, &body);
   sink->put_varint64(static_cast<uint64_t>(body.size()));
@@ -165,7 +165,7 @@ Status encode_dict_entry(const DictEntry& entry, std::string_view prev_term,
 Status decode_dict_entry(ByteSource* src, std::string_view prev_term,
                          IndexTier tier, DictEntry* out) {
   if (src == nullptr || out == nullptr) {
-    return Status::InvalidArgument("dict_entry: src / out 为空");
+    return Status::InvalidArgument("dict_entry: src / out is null");
   }
   *out = DictEntry{};
 
@@ -180,16 +180,16 @@ Status decode_dict_entry(ByteSource* src, std::string_view prev_term,
   SNII_RETURN_IF_ERROR(read_stats(src, tier, out));
   SNII_RETURN_IF_ERROR(read_locator(src, tier, out));
 
-  // body 必须恰好消费 entry_len 字节，否则结构与 tier 不一致。
+  // The body must consume exactly entry_len bytes; otherwise the structure is inconsistent with the tier.
   const size_t consumed = src->position() - body_start;
   if (consumed != static_cast<size_t>(total)) {
-    return Status::Corruption("dict_entry: body 长度与 entry_len 不一致");
+    return Status::Corruption("dict_entry: body length does not match entry_len");
   }
   return Status::OK();
 }
 
 Status skip_dict_entry(ByteSource* src) {
-  if (src == nullptr) return Status::InvalidArgument("dict_entry: src 为空");
+  if (src == nullptr) return Status::InvalidArgument("dict_entry: src is null");
   uint64_t total = 0;
   SNII_RETURN_IF_ERROR(read_entry_len(src, &total));
   Slice unused;

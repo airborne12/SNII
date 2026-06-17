@@ -15,7 +15,7 @@ using namespace snii::format;
 
 namespace {
 
-// 用 builder 序列化一组 block_ref，返回 framed section 字节。
+// Serialize a list of block_refs using the builder and return the framed section bytes.
 std::vector<uint8_t> Build(const std::vector<BlockRef>& refs) {
   DictBlockDirectoryBuilder builder;
   for (const auto& r : refs) {
@@ -26,7 +26,7 @@ std::vector<uint8_t> Build(const std::vector<BlockRef>& refs) {
   return sink.buffer();
 }
 
-// 断言两个 block_ref 字段逐一相等。
+// Assert that two BlockRef structs are equal field by field.
 void ExpectRefEq(const BlockRef& a, const BlockRef& b) {
   EXPECT_EQ(a.offset, b.offset);
   EXPECT_EQ(a.length, b.length);
@@ -66,7 +66,7 @@ TEST(DictBlockDirectory, GetOrdinalCorrectMapping) {
   DictBlockDirectoryReader reader;
   ASSERT_TRUE(DictBlockDirectoryReader::open(Slice(bytes), &reader).ok());
   ASSERT_EQ(reader.n_blocks(), 50u);
-  // 抽样若干 ordinal，确认映射不串位。
+  // Sample several ordinals and verify the mapping produces no cross-slot errors.
   for (uint32_t ord : {0u, 1u, 17u, 49u}) {
     BlockRef out{};
     ASSERT_TRUE(reader.get(ord, &out).ok());
@@ -82,14 +82,14 @@ TEST(DictBlockDirectory, OutOfRangeOrdinalRejected) {
   ASSERT_TRUE(DictBlockDirectoryReader::open(Slice(bytes), &reader).ok());
   ASSERT_EQ(reader.n_blocks(), 1u);
   BlockRef out{};
-  // ordinal == n_blocks 越界
+  // ordinal == n_blocks is out of range
   EXPECT_EQ(reader.get(1, &out).code(), StatusCode::kNotFound);
-  // 远超界
+  // far beyond range
   EXPECT_EQ(reader.get(1000, &out).code(), StatusCode::kNotFound);
 }
 
 TEST(DictBlockDirectory, EmptyDirectory) {
-  std::vector<BlockRef> refs;  // 0 个 block
+  std::vector<BlockRef> refs;  // 0 blocks
   auto bytes = Build(refs);
 
   DictBlockDirectoryReader reader;
@@ -122,7 +122,7 @@ TEST(DictBlockDirectory, FramedAsDictBlockDirectoryType) {
   std::vector<BlockRef> refs = {{0, 10, 1, 0, 0}};
   auto bytes = Build(refs);
   ASSERT_GE(bytes.size(), 1u);
-  // 首字节为 SectionFramer 的 type，应为 kDictBlockDirectory。
+  // The first byte is the SectionFramer type and must be kDictBlockDirectory.
   EXPECT_EQ(bytes[0], static_cast<uint8_t>(SectionType::kDictBlockDirectory));
 }
 
@@ -133,7 +133,7 @@ TEST(DictBlockDirectory, DetectsCorruption) {
   };
   auto bytes = Build(refs);
   ASSERT_GE(bytes.size(), 4u);
-  // 翻转 payload 区域的一个字节（跳过 type+len 前缀），section crc 必须检出。
+  // Flip one byte in the payload region (skip the type+len prefix); the section CRC must detect the corruption.
   bytes[3] ^= 0xFF;
   DictBlockDirectoryReader reader;
   EXPECT_EQ(DictBlockDirectoryReader::open(Slice(bytes), &reader).code(),
@@ -143,13 +143,13 @@ TEST(DictBlockDirectory, DetectsCorruption) {
 TEST(DictBlockDirectory, DetectsTruncation) {
   std::vector<BlockRef> refs = {{0, 4096, 120, 0x01, 0xDEADBEEFu}};
   auto bytes = Build(refs);
-  bytes.pop_back();  // 截断尾字节
+  bytes.pop_back();  // truncate the last byte
   DictBlockDirectoryReader reader;
   EXPECT_FALSE(DictBlockDirectoryReader::open(Slice(bytes), &reader).ok());
 }
 
 TEST(DictBlockDirectory, WrongSectionTypeRejected) {
-  // 用 framer 写入非 kDictBlockDirectory 的 section，open 必须拒绝。
+  // Write a section with a type other than kDictBlockDirectory via the framer; open must reject it.
   ByteSink sink;
   const uint8_t p[] = {0, 1, 2};
   SectionFramer::write(sink, static_cast<uint8_t>(SectionType::kXFilter),
@@ -161,7 +161,7 @@ TEST(DictBlockDirectory, WrongSectionTypeRejected) {
 }
 
 TEST(DictBlockDirectory, TrailingBytesRejected) {
-  // payload 末尾多出无关字节，应被检出（n_blocks 与实际不符）。
+  // Extra trailing bytes at the end of the payload should be detected (n_blocks does not match actual data).
   ByteSink payload;
   payload.put_varint32(1);            // n_blocks = 1
   payload.put_varint64(0);            // offset
@@ -169,7 +169,7 @@ TEST(DictBlockDirectory, TrailingBytesRejected) {
   payload.put_varint32(1);            // n_entries
   payload.put_u8(0);                  // flags
   payload.put_fixed32(0);            // checksum
-  payload.put_u8(0xEE);               // 多余尾字节
+  payload.put_u8(0xEE);               // extra trailing byte
   ByteSink sink;
   SectionFramer::write(sink,
                        static_cast<uint8_t>(SectionType::kDictBlockDirectory),

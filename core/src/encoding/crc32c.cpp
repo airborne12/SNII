@@ -5,7 +5,7 @@
 namespace snii {
 namespace {
 
-// 反射后的 Castagnoli 多项式。
+// Bit-reflected Castagnoli polynomial.
 constexpr uint32_t kPoly = 0x82F63B78u;
 
 std::array<uint32_t, 256> make_table() {

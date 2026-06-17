@@ -1,7 +1,8 @@
 find_package(GTestPrebuilt REQUIRED)
 
-# 测试源用 GLOB_RECURSE + CONFIGURE_DEPENDS 自动纳入：新增 *_test.cpp 即被发现，
-# 无需编辑本清单（并行开发各模块测试时不冲突）。
+# Test sources are picked up via GLOB_RECURSE + CONFIGURE_DEPENDS: a new *_test.cpp is
+# discovered automatically, with no edits to this list (so parallel module test
+# development does not conflict).
 file(GLOB_RECURSE SNII_TEST_SOURCES CONFIGURE_DEPENDS ${CMAKE_CURRENT_SOURCE_DIR}/*_test.cpp)
 
 add_executable(snii_core_tests ${SNII_TEST_SOURCES})

@@ -31,14 +31,14 @@ TEST(Varint, RoundTrip64) {
 }
 
 TEST(Varint, TruncatedFails) {
-  uint8_t buf[1] = {0x80};  // 续位为 1 但无后续字节
+  uint8_t buf[1] = {0x80};  // continuation bit set but no subsequent byte
   uint32_t out;
   const uint8_t* next;
   EXPECT_FALSE(decode_varint32(buf, buf + 1, &out, &next).ok());
 }
 
 TEST(Varint, Overflow32Fails) {
-  // 编码一个 > 2^32-1 的值，用 decode_varint32 解应失败
+  // encode a value > 2^32-1, decoding with decode_varint32 should fail
   uint8_t buf[10];
   size_t n = encode_varint64((1ull << 33), buf);
   uint32_t out;

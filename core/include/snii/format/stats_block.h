@@ -10,27 +10,27 @@
 
 namespace snii::format {
 
-// per-index meta block 内的统计块。仅承载查询规划与 BM25 所需的计数统计，
-// section 定位信息由 SectionRefs 单独保存（见 design spec 「Per-index meta block」）。
+// Statistics block within the per-index meta block. Carries only the counting stats
+// needed for query planning and BM25; section location info is stored separately in SectionRefs (see design spec "Per-index meta block").
 //
-// on-disk 布局（由 SectionFramer 框定，统一 type+len+crc32c）：
+// On-disk layout (framed by SectionFramer with unified type+len+crc32c):
 //   [u8 type=kStatsBlock][varint64 payload_len][payload][fixed32 crc32c]
 //   payload = varint64{ doc_count, indexed_doc_count, term_count,
 //                       sum_total_term_freq, null_count }
-// 字段语义见 design spec 「Scoring 统计设计」。
+// For field semantics see design spec "Scoring statistics design".
 struct StatsBlock {
-  uint64_t doc_count = 0;             // segment 级 doc 总数（含未索引/NULL）
-  uint64_t indexed_doc_count = 0;     // 实际参与索引的 doc 数（avgdl 分母）
-  uint64_t term_count = 0;            // 该 index 的 unique term 数
-  uint64_t sum_total_term_freq = 0;   // 所有 indexed doc 的 token 总数
-  uint64_t null_count = 0;            // NULL / not-indexed doc 数
+  uint64_t doc_count = 0;             // total doc count at segment level (including unindexed/NULL)
+  uint64_t indexed_doc_count = 0;     // number of docs actually indexed (denominator for avgdl)
+  uint64_t term_count = 0;            // number of unique terms in this index
+  uint64_t sum_total_term_freq = 0;   // total token count across all indexed docs
+  uint64_t null_count = 0;            // number of NULL / not-indexed docs
 };
 
-// 编码为一个 kStatsBlock framed section（自带 crc32c 校验），追加到 sink。
+// Encodes into a kStatsBlock framed section (with built-in crc32c checksum) and appends to sink.
 void encode_stats_block(const StatsBlock& sb, ByteSink* sink);
 
-// 从 src 读取并校验一个 kStatsBlock framed section，填充 out。
-// crc 不匹配 / 截断 → kCorruption；type 非 kStatsBlock → kInvalidArgument。
+// Reads and verifies a kStatsBlock framed section from src, populates out.
+// CRC mismatch / truncation → kCorruption; type is not kStatsBlock → kInvalidArgument.
 Status decode_stats_block(ByteSource* src, StatsBlock* out);
 
 }  // namespace snii::format

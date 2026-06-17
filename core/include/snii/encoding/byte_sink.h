@@ -7,8 +7,8 @@
 
 namespace snii {
 
-// append-only 写游标：所有 section 序列化均经此，禁止各自手拼字节。
-// 多字节定长字段一律小端。
+// append-only write cursor: all section serialization goes through this; manual byte assembly is forbidden.
+// All multi-byte fixed-width fields are little-endian.
 class ByteSink {
  public:
   void put_u8(uint8_t v) { buf_.push_back(v); }

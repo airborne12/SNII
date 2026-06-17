@@ -4,7 +4,7 @@ namespace snii::format {
 
 namespace {
 
-// payload 内字段顺序固定，复用 ByteSink 的 varint 原语，禁止手拼字节。
+// Field order within payload is fixed; reuse ByteSink varint primitives — do not hand-assemble bytes.
 void encode_payload(const StatsBlock& sb, ByteSink* payload) {
   payload->put_varint64(sb.doc_count);
   payload->put_varint64(sb.indexed_doc_count);

@@ -15,7 +15,7 @@ using namespace snii::format;
 
 namespace {
 
-// 用一组有序 first_term 构建一个 SampledTermIndex 字节缓冲。
+// Build a SampledTermIndex byte buffer from an ordered set of first_terms.
 std::vector<uint8_t> BuildIndex(const std::vector<std::string>& first_terms) {
   SampledTermIndexBuilder builder;
   for (const auto& t : first_terms) {
@@ -26,7 +26,7 @@ std::vector<uint8_t> BuildIndex(const std::vector<std::string>& first_terms) {
   return sink.buffer();
 }
 
-// 打开 reader 的便捷封装。
+// Convenience wrapper to open a reader.
 SampledTermIndexReader OpenOrDie(const std::vector<uint8_t>& bytes) {
   SampledTermIndexReader reader;
   Status s = SampledTermIndexReader::open(Slice(bytes), &reader);
@@ -36,7 +36,7 @@ SampledTermIndexReader OpenOrDie(const std::vector<uint8_t>& bytes) {
 
 }  // namespace
 
-// 多 block：locate 命中每个 first_term 的正确 ordinal。
+// Multiple blocks: locate returns the correct ordinal for each first_term.
 TEST(SampledTermIndex, LocateExactFirstTermHitsOrdinal) {
   const std::vector<std::string> terms = {"alpha", "delta", "kappa", "omega"};
   auto bytes = BuildIndex(terms);
@@ -52,7 +52,7 @@ TEST(SampledTermIndex, LocateExactFirstTermHitsOrdinal) {
   }
 }
 
-// target 落在两个 first_term 之间 → 返回较小者的 ordinal。
+// target falls between two first_terms → returns the ordinal of the lower one.
 TEST(SampledTermIndex, LocateBetweenReturnsLowerOrdinal) {
   const std::vector<std::string> terms = {"alpha", "delta", "kappa", "omega"};
   auto bytes = BuildIndex(terms);
@@ -60,22 +60,22 @@ TEST(SampledTermIndex, LocateBetweenReturnsLowerOrdinal) {
 
   bool maybe_present = false;
   uint32_t ord = 0;
-  // "echo" 介于 "delta"(1) 与 "kappa"(2) → 应落在 block 1。
+  // "echo" is between "delta"(1) and "kappa"(2) → should land in block 1.
   ASSERT_TRUE(reader.locate("echo", &maybe_present, &ord).ok());
   EXPECT_TRUE(maybe_present);
   EXPECT_EQ(ord, 1u);
 
-  // "beta" 介于 "alpha"(0) 与 "delta"(1) → block 0。
+  // "beta" is between "alpha"(0) and "delta"(1) → block 0.
   ASSERT_TRUE(reader.locate("beta", &maybe_present, &ord).ok());
   EXPECT_TRUE(maybe_present);
   EXPECT_EQ(ord, 0u);
 
-  // "zzz" > "omega"(3) 仍在 [min,max] 之外（> max_term）→ 越界。
+  // "zzz" > "omega"(3) is outside [min,max] (> max_term) → out of range.
   ASSERT_TRUE(reader.locate("zzz", &maybe_present, &ord).ok());
   EXPECT_FALSE(maybe_present);
 }
 
-// target < min_term → maybe_present=false（不存在信号）。
+// target < min_term → maybe_present=false (not-present signal).
 TEST(SampledTermIndex, LocateBelowMinIsOutOfRange) {
   const std::vector<std::string> terms = {"banana", "cherry", "mango"};
   auto bytes = BuildIndex(terms);
@@ -87,7 +87,7 @@ TEST(SampledTermIndex, LocateBelowMinIsOutOfRange) {
   EXPECT_FALSE(maybe_present);
 }
 
-// target > max_term → maybe_present=false。
+// target > max_term → maybe_present=false.
 TEST(SampledTermIndex, LocateAboveMaxIsOutOfRange) {
   const std::vector<std::string> terms = {"banana", "cherry", "mango"};
   auto bytes = BuildIndex(terms);
@@ -99,7 +99,7 @@ TEST(SampledTermIndex, LocateAboveMaxIsOutOfRange) {
   EXPECT_FALSE(maybe_present);
 }
 
-// target == min_term / == max_term 边界都应命中且 in-range。
+// target == min_term / == max_term boundary cases should both hit and be in-range.
 TEST(SampledTermIndex, LocateBoundaryTermsInRange) {
   const std::vector<std::string> terms = {"banana", "cherry", "mango"};
   auto bytes = BuildIndex(terms);
@@ -116,7 +116,7 @@ TEST(SampledTermIndex, LocateBoundaryTermsInRange) {
   EXPECT_EQ(ord, 2u);
 }
 
-// 单 block：min==max==唯一 first_term。
+// Single block: min==max==the only first_term.
 TEST(SampledTermIndex, SingleBlock) {
   const std::vector<std::string> terms = {"solo"};
   auto bytes = BuildIndex(terms);
@@ -129,16 +129,16 @@ TEST(SampledTermIndex, SingleBlock) {
   EXPECT_TRUE(maybe_present);
   EXPECT_EQ(ord, 0u);
 
-  // "solz" > "solo" → 越界（> max_term）。
+  // "solz" > "solo" → out of range (> max_term).
   ASSERT_TRUE(reader.locate("solz", &maybe_present, &ord).ok());
   EXPECT_FALSE(maybe_present);
 
-  // "sola" < "solo" → 越界（< min_term）。
+  // "sola" < "solo" → out of range (< min_term).
   ASSERT_TRUE(reader.locate("sola", &maybe_present, &ord).ok());
   EXPECT_FALSE(maybe_present);
 }
 
-// 共享长前缀的 term（验证前缀压缩往返正确）。
+// Terms sharing a long common prefix (verify front coding round-trip correctness).
 TEST(SampledTermIndex, SharedPrefixTermsRoundTrip) {
   const std::vector<std::string> terms = {
       "international", "internationalize", "internationalized",
@@ -155,7 +155,7 @@ TEST(SampledTermIndex, SharedPrefixTermsRoundTrip) {
     EXPECT_EQ(ord, i) << "term=" << terms[i];
   }
 
-  // "internationalizes" 介于 idx2 与 idx3 → 较小者 ordinal 2。
+  // "internationalizes" is between idx2 and idx3 → lower ordinal 2.
   bool maybe_present = false;
   uint32_t ord = 0;
   ASSERT_TRUE(reader.locate("internationalizes", &maybe_present, &ord).ok());
@@ -163,7 +163,7 @@ TEST(SampledTermIndex, SharedPrefixTermsRoundTrip) {
   EXPECT_EQ(ord, 2u);
 }
 
-// 含空字节 / 高位字节的 term，按无符号字节序比较。
+// Terms containing null bytes / high-bit bytes, compared by unsigned byte order.
 TEST(SampledTermIndex, BinarySafeTerms) {
   std::vector<std::string> terms;
   terms.push_back(std::string("\x01\x00z", 3));
@@ -180,24 +180,24 @@ TEST(SampledTermIndex, BinarySafeTerms) {
   EXPECT_EQ(ord, 1u);
 }
 
-// 首字节即 SectionFramer 的 type，应为 kSampledTermIndex。
+// The first byte is the SectionFramer type and must be kSampledTermIndex.
 TEST(SampledTermIndex, FramedAsSampledTermIndexType) {
   auto bytes = BuildIndex({"alpha", "beta"});
   ASSERT_GE(bytes.size(), 1u);
   EXPECT_EQ(bytes[0], static_cast<uint8_t>(SectionType::kSampledTermIndex));
 }
 
-// crc 校验：翻转 payload 中一个字节 → open 返回 Corruption。
+// CRC checksum: flipping one byte in the payload → open returns Corruption.
 TEST(SampledTermIndex, DetectsCorruption) {
   auto bytes = BuildIndex({"alpha", "delta", "kappa"});
   ASSERT_GE(bytes.size(), 4u);
-  bytes[3] ^= 0xFF;  // 翻转 payload 区域字节（跳过 type+len 前缀）
+  bytes[3] ^= 0xFF;  // Flip a byte in the payload region (skip the type+len prefix)
   SampledTermIndexReader reader;
   Status s = SampledTermIndexReader::open(Slice(bytes), &reader);
   EXPECT_EQ(s.code(), StatusCode::kCorruption) << s.to_string();
 }
 
-// 截断：丢弃尾字节 → open 失败。
+// Truncation: drop the trailing byte → open fails.
 TEST(SampledTermIndex, DetectsTruncation) {
   auto bytes = BuildIndex({"alpha", "delta", "kappa"});
   bytes.pop_back();
@@ -206,7 +206,7 @@ TEST(SampledTermIndex, DetectsTruncation) {
   EXPECT_FALSE(s.ok());
 }
 
-// 错误 section type 应被拒绝。
+// A wrong section type should be rejected.
 TEST(SampledTermIndex, WrongSectionTypeRejected) {
   ByteSink sink;
   const uint8_t p[] = {0, 0};
@@ -217,7 +217,7 @@ TEST(SampledTermIndex, WrongSectionTypeRejected) {
   EXPECT_FALSE(s.ok());
 }
 
-// 空 builder（n_blocks=0）：合法构建，locate 任何 term 都越界。
+// Empty builder (n_blocks=0): valid build, locate on any term is out of range.
 TEST(SampledTermIndex, EmptyIndexLocateOutOfRange) {
   auto bytes = BuildIndex({});
   auto reader = OpenOrDie(bytes);

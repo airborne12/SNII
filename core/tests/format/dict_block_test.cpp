@@ -17,7 +17,7 @@ using namespace snii::format;  // NOLINT
 
 namespace {
 
-// 构造一个 pod_ref slim 词典项。frq/prx off_delta 已相对 block base 计算。
+// Construct a pod_ref slim dict entry. frq/prx off_delta is already relative to the block base.
 DictEntry MakePodRef(std::string term, uint32_t df, uint64_t frq_off,
                      uint64_t prx_off = 0) {
   DictEntry e;
@@ -25,12 +25,12 @@ DictEntry MakePodRef(std::string term, uint32_t df, uint64_t frq_off,
   e.kind = DictEntryKind::kPodRef;
   e.enc = DictEntryEnc::kSlim;
   e.df = df;
-  e.ttf_delta = df * 2;  // 仅 tier>=T2 写出
-  e.max_freq = 9;        // 仅 tier>=T2 写出
+  e.ttf_delta = df * 2;  // written only when tier>=T2
+  e.max_freq = 9;        // written only when tier>=T2
   e.frq_off_delta = frq_off;
   e.frq_len = 128;
-  e.prx_off_delta = prx_off;  // 仅 positions 写出
-  e.prx_len = 64;             // 仅 positions 写出
+  e.prx_off_delta = prx_off;  // written only when positions are enabled
+  e.prx_len = 64;             // written only when positions are enabled
   return e;
 }
 
@@ -51,7 +51,7 @@ void ExpectCommon(const DictEntry& a, const DictEntry& b) {
   EXPECT_EQ(a.df, b.df);
 }
 
-// 用 builder 序列化一组 entries 到一个 block，返回字节缓冲。
+// Serialize a set of entries into one block using the builder; return the byte buffer.
 std::vector<uint8_t> BuildBlock(const std::vector<DictEntry>& entries,
                                 IndexTier tier, bool has_positions,
                                 uint64_t frq_base, uint64_t prx_base,
@@ -66,7 +66,7 @@ std::vector<uint8_t> BuildBlock(const std::vector<DictEntry>& entries,
 
 }  // namespace
 
-// 空 block：n_entries=0，仍可 open，find_term 任何 target 均未命中。
+// Empty block: n_entries=0, open should still succeed, find_term on any target returns not-found.
 TEST(DictBlock, EmptyBlock) {
   std::vector<uint8_t> bytes =
       BuildBlock({}, IndexTier::kT1, /*has_positions=*/false, 1000, 0, 16);
@@ -83,7 +83,7 @@ TEST(DictBlock, EmptyBlock) {
   EXPECT_FALSE(found);
 }
 
-// 单 entry round-trip。
+// Single-entry round-trip.
 TEST(DictBlock, SingleEntryRoundTrip) {
   DictEntry e = MakePodRef("solo", 7, 0);
   std::vector<uint8_t> bytes =
@@ -103,13 +103,13 @@ TEST(DictBlock, SingleEntryRoundTrip) {
   EXPECT_EQ(out.frq_len, e.frq_len);
 }
 
-// 多 entry round-trip：全部 term 命中，字段保留。
+// Multi-entry round-trip: all terms found, fields preserved.
 TEST(DictBlock, MultiEntryRoundTrip) {
   std::vector<DictEntry> entries = {
       MakePodRef("alpha", 3, 0),  MakePodRef("beta", 5, 100),
       MakeInline("gamma", 2),     MakePodRef("delta", 9, 300),
       MakePodRef("epsilon", 11, 500)};
-  // delta < gamma 字典序不对，重排为有序。
+  // delta < gamma lexicographically, so reorder entries to be sorted.
   entries = {MakePodRef("alpha", 3, 0), MakePodRef("beta", 5, 100),
              MakePodRef("delta", 9, 300), MakePodRef("epsilon", 11, 500),
              MakeInline("gamma", 2)};
@@ -129,10 +129,10 @@ TEST(DictBlock, MultiEntryRoundTrip) {
   }
 }
 
-// 前缀压缩跨锚点：anchor_interval 较小时，跨锚点的 term 仍能正确恢复。
+// Front-coding across anchors: with a small anchor_interval, terms spanning anchor boundaries are decoded correctly.
 TEST(DictBlock, PrefixCompressionAcrossAnchors) {
   std::vector<DictEntry> entries;
-  // 21 个共享长前缀的有序 term，anchor_interval=4 → 多个锚点。
+  // 21 sorted terms sharing a long common prefix, anchor_interval=4 -> multiple anchors.
   std::vector<std::string> terms = {
       "interest",    "interested",  "interesting", "interestingly",
       "interests",   "internal",    "internally",  "international",
@@ -162,7 +162,7 @@ TEST(DictBlock, PrefixCompressionAcrossAnchors) {
   }
 }
 
-// find_term 边界：小于首 term、大于末 term、恰为锚点 term。
+// find_term boundaries: less than first term, greater than last term, exactly an anchor term.
 TEST(DictBlock, FindTermBoundaries) {
   std::vector<std::string> terms;
   for (int i = 0; i < 40; ++i) {
@@ -180,21 +180,21 @@ TEST(DictBlock, FindTermBoundaries) {
   ASSERT_TRUE(
       DictBlockReader::open(Slice(bytes), IndexTier::kT1, false, &reader).ok());
 
-  // 小于首 term。
+  // Less than the first term.
   {
     bool found = true;
     DictEntry out;
     ASSERT_TRUE(reader.find_term("\x01", &found, &out).ok());
     EXPECT_FALSE(found);
   }
-  // 大于末 term。
+  // Greater than the last term.
   {
     bool found = true;
     DictEntry out;
     ASSERT_TRUE(reader.find_term("zzzz", &found, &out).ok());
     EXPECT_FALSE(found);
   }
-  // 命中恰为锚点位置的 term（anchor_interval=8 → t08, t16, t24 ...）。
+  // Hit terms that are exactly at anchor positions (anchor_interval=8 -> t08, t16, t24 ...).
   for (const char* t : {"t00", "t08", "t16", "t24", "t32"}) {
     bool found = false;
     DictEntry out;
@@ -202,7 +202,7 @@ TEST(DictBlock, FindTermBoundaries) {
     ASSERT_TRUE(found) << t;
     EXPECT_EQ(out.term, t);
   }
-  // 命中非锚点位置的 term。
+  // Hit terms that are NOT at anchor positions.
   for (const char* t : {"t03", "t11", "t27"}) {
     bool found = false;
     DictEntry out;
@@ -210,7 +210,7 @@ TEST(DictBlock, FindTermBoundaries) {
     ASSERT_TRUE(found) << t;
     EXPECT_EQ(out.term, t);
   }
-  // 在 term 范围内但不存在的 gap。
+  // A key within the term range that does not exist (gap).
   {
     bool found = true;
     DictEntry out;
@@ -219,14 +219,14 @@ TEST(DictBlock, FindTermBoundaries) {
   }
 }
 
-// crc 损坏检出：篡改任一字节，open 必须报 Corruption。
+// CRC corruption detection: flipping any byte must cause open() to report Corruption.
 TEST(DictBlock, CrcCorruptionDetected) {
   std::vector<DictEntry> entries = {MakePodRef("aaa", 1, 0),
                                     MakePodRef("bbb", 2, 50),
                                     MakePodRef("ccc", 3, 100)};
   std::vector<uint8_t> bytes =
       BuildBlock(entries, IndexTier::kT2, true, 100, 200, 16);
-  // 篡改 entries 区中部一个字节。
+  // Flip one byte in the middle of the entries region.
   bytes[bytes.size() / 2] ^= 0xFF;
   DictBlockReader reader;
   Status s = DictBlockReader::open(Slice(bytes), IndexTier::kT2, true, &reader);
@@ -234,19 +234,19 @@ TEST(DictBlock, CrcCorruptionDetected) {
   EXPECT_EQ(s.code(), StatusCode::kCorruption);
 }
 
-// 截断 block（短于 crc footer）应报 Corruption，而非越界崩溃。
+// A truncated block (shorter than the CRC footer) must report Corruption rather than crash with an out-of-range access.
 TEST(DictBlock, TruncatedBlockDetected) {
   std::vector<DictEntry> entries = {MakePodRef("xxx", 1, 0)};
   std::vector<uint8_t> bytes =
       BuildBlock(entries, IndexTier::kT1, false, 0, 0, 16);
-  bytes.resize(2);  // 只剩 header 开头几字节。
+  bytes.resize(2);  // Only a few bytes of the header remain.
   DictBlockReader reader;
   Status s =
       DictBlockReader::open(Slice(bytes), IndexTier::kT1, false, &reader);
   EXPECT_FALSE(s.ok());
 }
 
-// positions 模式：prx_base 与 prx 字段正确保留。
+// Positions mode: prx_base and prx fields are preserved correctly.
 TEST(DictBlock, PositionsPrxRoundTrip) {
   std::vector<DictEntry> entries = {MakePodRef("phrase", 5, 0, 0),
                                     MakePodRef("query", 6, 200, 80)};
@@ -266,8 +266,8 @@ TEST(DictBlock, PositionsPrxRoundTrip) {
   EXPECT_EQ(out.ttf_delta, 12u);
 }
 
-// estimated_bytes 单调递增：每次 add_entry 后估算值增长，且 finish 后实际字节
-// 不超过估算（估算为上界，供切块决策）。
+// estimated_bytes is monotonically non-decreasing: grows after each add_entry, and the actual byte
+// count after finish() does not exceed the estimate (the estimate is an upper bound for block-splitting decisions).
 TEST(DictBlock, EstimatedBytesMonotonic) {
   DictBlockBuilder builder(IndexTier::kT1, false, 0, 0, 16);
   size_t prev = builder.estimated_bytes();

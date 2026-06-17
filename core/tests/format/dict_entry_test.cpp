@@ -16,7 +16,7 @@ using namespace snii::format;  // NOLINT
 
 namespace {
 
-// 构造一个 pod_ref slim 词典项（tier 决定可选字段）。
+// Construct a pod_ref slim dict entry (tier determines which optional fields are present).
 DictEntry MakePodRefSlim(std::string term, uint32_t df) {
   DictEntry e;
   e.term = std::move(term);
@@ -24,12 +24,12 @@ DictEntry MakePodRefSlim(std::string term, uint32_t df) {
   e.enc = DictEntryEnc::kSlim;
   e.has_sb = false;
   e.df = df;
-  e.ttf_delta = df * 3;       // 仅在 tier>=T2 写出
-  e.max_freq = 7;             // 仅在 tier>=T2 写出
+  e.ttf_delta = df * 3;       // written only when tier>=T2
+  e.max_freq = 7;             // written only when tier>=T2
   e.frq_off_delta = 4096;
   e.frq_len = 333;
-  e.prx_off_delta = 8192;     // 仅在 positions 时写出
-  e.prx_len = 512;            // 仅在 positions 时写出
+  e.prx_off_delta = 8192;     // written only when positions are stored
+  e.prx_len = 512;            // written only when positions are stored
   return e;
 }
 
@@ -37,7 +37,7 @@ DictEntry MakePodRefWindowed(std::string term, uint32_t df) {
   DictEntry e = MakePodRefSlim(std::move(term), df);
   e.enc = DictEntryEnc::kWindowed;
   e.has_sb = true;
-  e.prelude_len = 64;         // 仅在 windowed 时写出
+  e.prelude_len = 64;         // written only for windowed encoding
   return e;
 }
 
@@ -50,11 +50,11 @@ DictEntry MakeInline(std::string term, uint32_t df) {
   e.ttf_delta = df * 2;
   e.max_freq = 5;
   e.frq_bytes = {0x01, 0x02, 0x03, 0x04};
-  e.prx_bytes = {0xAA, 0xBB};  // 仅在 positions 时写出
+  e.prx_bytes = {0xAA, 0xBB};  // written only when positions are stored
   return e;
 }
 
-// round-trip：编码再解码，按 tier 断言保留的字段一致。
+// round-trip: encode then decode, assert that fields retained by the given tier match.
 DictEntry RoundTrip(const DictEntry& in, std::string_view prev, IndexTier tier) {
   ByteSink sink;
   EXPECT_TRUE(encode_dict_entry(in, prev, tier, &sink).ok());
@@ -62,7 +62,7 @@ DictEntry RoundTrip(const DictEntry& in, std::string_view prev, IndexTier tier) 
   DictEntry out;
   Status s = decode_dict_entry(&src, prev, tier, &out);
   EXPECT_TRUE(s.ok()) << s.to_string();
-  EXPECT_EQ(src.remaining(), 0u) << "decode 未消费整个 entry";
+  EXPECT_EQ(src.remaining(), 0u) << "decode did not consume the entire entry";
   return out;
 }
 
@@ -82,7 +82,7 @@ TEST(DictEntry, PodRefSlimTier1RoundTrip) {
   ExpectCommon(in, out);
   EXPECT_EQ(out.frq_off_delta, in.frq_off_delta);
   EXPECT_EQ(out.frq_len, in.frq_len);
-  // tier1：不写 ttf/max_freq/prx，解码恢复为默认 0。
+  // tier1: ttf/max_freq/prx are not written; decode restores them to default 0.
   EXPECT_EQ(out.ttf_delta, 0u);
   EXPECT_EQ(out.max_freq, 0u);
   EXPECT_EQ(out.prx_len, 0u);
@@ -123,7 +123,7 @@ TEST(DictEntry, PodRefWindowedTier1RoundTrip) {
   DictEntry out = RoundTrip(in, "", IndexTier::kT1);
   ExpectCommon(in, out);
   EXPECT_EQ(out.prelude_len, in.prelude_len);
-  EXPECT_EQ(out.prx_len, 0u);  // tier1 无 prx
+  EXPECT_EQ(out.prx_len, 0u);  // tier1 has no prx
 }
 
 TEST(DictEntry, InlineTier1RoundTrip) {
@@ -131,7 +131,7 @@ TEST(DictEntry, InlineTier1RoundTrip) {
   DictEntry out = RoundTrip(in, "", IndexTier::kT1);
   ExpectCommon(in, out);
   EXPECT_EQ(out.frq_bytes, in.frq_bytes);
-  EXPECT_TRUE(out.prx_bytes.empty());  // tier1 无 prx
+  EXPECT_TRUE(out.prx_bytes.empty());  // tier1 has no prx
 }
 
 TEST(DictEntry, InlineTier2RoundTrip) {
@@ -152,9 +152,9 @@ TEST(DictEntry, InlineTier3RoundTrip) {
   EXPECT_EQ(out.prx_bytes, in.prx_bytes);
 }
 
-// 前缀压缩：有序 term 连续编解码，suffix 只存差异部分。
+// Front coding: consecutive encode/decode of sorted terms; suffix stores only the differing part.
 TEST(DictEntry, PrefixCompressionSharedPrefix) {
-  // "interest" 与 "interesting" 共享前缀 "interest"。
+  // "interest" and "interesting" share the prefix "interest".
   DictEntry a = MakePodRefSlim("interest", 10);
   DictEntry b = MakePodRefSlim("interesting", 11);
 
@@ -175,7 +175,7 @@ TEST(DictEntry, PrefixCompressionSharedPrefix) {
   EXPECT_TRUE(src.eof());
 }
 
-// 三个有序 term 连续编解码，验证前缀链路。
+// Encode/decode three sorted terms consecutively to verify the prefix chain.
 TEST(DictEntry, PrefixCompressionChain) {
   std::vector<std::string> terms = {"app", "apple", "application"};
   ByteSink sink;
@@ -196,7 +196,7 @@ TEST(DictEntry, PrefixCompressionChain) {
   EXPECT_TRUE(src.eof());
 }
 
-// entry_len 必须允许 reader 在不解析内部字段的情况下跳过整个 entry。
+// entry_len must allow a reader to skip the entire entry without parsing its internal fields.
 TEST(DictEntry, EntryLenAllowsSkip) {
   DictEntry a = MakePodRefSlim("first", 9);
   DictEntry b = MakeInline("second", 4);
@@ -205,7 +205,7 @@ TEST(DictEntry, EntryLenAllowsSkip) {
   ASSERT_TRUE(encode_dict_entry(b, a.term, IndexTier::kT2, &sink).ok());
 
   ByteSource src(sink.view());
-  // 仅靠 entry_len 跳过第一个 entry。
+  // Skip the first entry using only entry_len.
   ASSERT_TRUE(skip_dict_entry(&src).ok());
   DictEntry out;
   ASSERT_TRUE(decode_dict_entry(&src, a.term, IndexTier::kT2, &out).ok());
@@ -213,36 +213,36 @@ TEST(DictEntry, EntryLenAllowsSkip) {
   EXPECT_TRUE(src.eof());
 }
 
-// 边界：空 suffix（term 完全等于 prev）。
+// Edge case: empty suffix (term is identical to prev).
 TEST(DictEntry, EmptySuffixEqualsPrev) {
   DictEntry in = MakePodRefSlim("same", 1);
   DictEntry out = RoundTrip(in, "same", IndexTier::kT1);
   EXPECT_EQ(out.term, "same");
 }
 
-// 边界：df = 0。
+// Edge case: df = 0.
 TEST(DictEntry, ZeroDf) {
   DictEntry in = MakePodRefSlim("zero", 0);
   DictEntry out = RoundTrip(in, "", IndexTier::kT2);
   EXPECT_EQ(out.df, 0u);
 }
 
-// 边界：空 term（首个 entry，prev 为空，suffix 也为空）。
+// Edge case: empty term (first entry, prev is empty, suffix is also empty).
 TEST(DictEntry, EmptyTerm) {
   DictEntry in = MakePodRefSlim("", 1);
   DictEntry out = RoundTrip(in, "", IndexTier::kT1);
   EXPECT_EQ(out.term, "");
 }
 
-// 结构完整性：entry 级无 crc（crc 在 DICT block 级），但 entry_len 与 body 实际
-// 长度必须一致；篡改 entry_len 使其小于真实 body → decode 必须报 Corruption。
+// Structural integrity: no CRC at the entry level (CRC is at the DICT block level), but entry_len and the actual body
+// length must match; tampering with entry_len to make it smaller than the real body → decode must report Corruption.
 TEST(DictEntry, EntryLenMismatchDetected) {
   DictEntry in = MakePodRefSlim("payload", 99);
   ByteSink sink;
   ASSERT_TRUE(encode_dict_entry(in, "", IndexTier::kT2, &sink).ok());
   std::vector<uint8_t> bytes = sink.buffer();
-  ASSERT_GT(bytes[0], 1u);  // 单字节 entry_len varint
-  bytes[0] -= 1;            // 声称 body 比实际少 1 字节
+  ASSERT_GT(bytes[0], 1u);  // single-byte entry_len varint
+  bytes[0] -= 1;            // claim the body is 1 byte shorter than it actually is
 
   Slice corrupt(bytes);
   ByteSource src(corrupt);
@@ -252,12 +252,12 @@ TEST(DictEntry, EntryLenMismatchDetected) {
   EXPECT_EQ(s.code(), StatusCode::kCorruption);
 }
 
-// prefix_len 超过 prev 长度应被拒绝（防御非法输入）。
+// prefix_len exceeding the length of prev must be rejected (guard against malformed input).
 TEST(DictEntry, RejectPrefixLongerThanPrev) {
   DictEntry in = MakePodRefSlim("abcdef", 1);
   ByteSink sink;
   ASSERT_TRUE(encode_dict_entry(in, "abc", IndexTier::kT1, &sink).ok());
-  // 用一个更短的 prev 解码：prefix_len(=3) > prev.size()(=2) → Corruption。
+  // Decode with a shorter prev: prefix_len(=3) > prev.size()(=2) → Corruption.
   ByteSource src(sink.view());
   DictEntry out;
   Status s = decode_dict_entry(&src, "ab", IndexTier::kT1, &out);

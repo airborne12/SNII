@@ -11,7 +11,7 @@ using namespace snii::format;
 
 namespace {
 
-// 编码后再解码，断言所有字段逐一相等。
+// Encode then decode; assert every field is equal one by one.
 void ExpectRoundTrip(const StatsBlock& in) {
   ByteSink sink;
   encode_stats_block(in, &sink);
@@ -39,16 +39,16 @@ TEST(StatsBlock, RoundTripTypicalValues) {
 }
 
 TEST(StatsBlock, RoundTripZeroes) {
-  StatsBlock sb{};  // 全 0：空 segment 合法
+  StatsBlock sb{};  // All zeros: empty segment is valid
   ExpectRoundTrip(sb);
 }
 
 TEST(StatsBlock, RoundTripNear2Pow63) {
   StatsBlock sb{};
-  const uint64_t kBig = (1ull << 63) - 1;  // 大值边界
+  const uint64_t kBig = (1ull << 63) - 1;  // Large-value boundary
   sb.doc_count = kBig;
   sb.indexed_doc_count = kBig - 1;
-  sb.term_count = (1ull << 63) + 7;  // 高位为 1 也必须可往返
+  sb.term_count = (1ull << 63) + 7;  // High bit set must also round-trip correctly
   sb.sum_total_term_freq = UINT64_MAX;
   sb.null_count = (1ull << 62);
   ExpectRoundTrip(sb);
@@ -59,7 +59,7 @@ TEST(StatsBlock, FramedAsStatsBlockType) {
   sb.doc_count = 7;
   ByteSink sink;
   encode_stats_block(sb, &sink);
-  // 首字节为 SectionFramer 的 type，应为 kStatsBlock。
+  // First byte is the SectionFramer type field and must equal kStatsBlock.
   ASSERT_GE(sink.size(), 1u);
   EXPECT_EQ(sink.buffer()[0],
             static_cast<uint8_t>(SectionType::kStatsBlock));
@@ -76,7 +76,7 @@ TEST(StatsBlock, DetectsCorruption) {
   encode_stats_block(sb, &sink);
 
   auto bytes = sink.buffer();
-  // 翻转 payload 区域的一个字节（跳过 type+len 前缀），crc 必须检出。
+  // Flip one byte in the payload area (skip the type+len prefix); CRC must detect the corruption.
   ASSERT_GE(bytes.size(), 3u);
   bytes[2] ^= 0xFF;
   Slice corrupted(bytes);
@@ -91,7 +91,7 @@ TEST(StatsBlock, DetectsTruncation) {
   ByteSink sink;
   encode_stats_block(sb, &sink);
   auto bytes = sink.buffer();
-  bytes.pop_back();  // 截断尾字节
+  bytes.pop_back();  // Truncate the last byte
   Slice truncated(bytes);
   ByteSource src(truncated);
   StatsBlock out{};
@@ -99,7 +99,7 @@ TEST(StatsBlock, DetectsTruncation) {
 }
 
 TEST(StatsBlock, WrongSectionTypeRejected) {
-  // 用 framer 写入非 StatsBlock 的 section，decode 必须拒绝。
+  // Write a non-StatsBlock section via the framer; decode must reject it.
   ByteSink sink;
   const uint8_t p[] = {1, 2, 3};
   SectionFramer::write(

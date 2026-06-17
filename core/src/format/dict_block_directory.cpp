@@ -8,7 +8,7 @@ namespace snii::format {
 
 namespace {
 
-// 单个 block_ref 的字段顺序固定，复用 ByteSink varint/fixed 原语，禁止手拼字节。
+// Each block_ref has a fixed field order; reuse ByteSink varint/fixed primitives — do not hand-craft bytes manually.
 void encode_ref(const BlockRef& ref, ByteSink* payload) {
   payload->put_varint64(ref.offset);
   payload->put_varint64(ref.length);

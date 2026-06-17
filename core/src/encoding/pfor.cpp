@@ -16,7 +16,7 @@ uint8_t bits_for(uint32_t v) {
   return b;
 }
 
-// 选取使 (packed + 异常) 总字节最小的 bit_width。异常成本按每个约 6 字节估算。
+// Choose the bit_width that minimizes total bytes (packed + exceptions). Exception cost estimated at ~6 bytes each.
 uint8_t choose_width(const uint32_t* v, size_t n) {
   uint8_t maxw = 0;
   for (size_t i = 0; i < n; ++i) maxw = std::max(maxw, bits_for(v[i]));
@@ -83,7 +83,7 @@ void pfor_encode(const uint32_t* values, size_t n, ByteSink* out) {
   for (size_t i = 0; i < n; ++i) {
     if (bits_for(values[i]) > w) {
       exc.emplace_back(static_cast<uint32_t>(i), values[i]);
-      low[i] = 0;  // 异常位置低位写 0 占位，真值在异常表
+      low[i] = 0;  // Write 0 as placeholder at exception position; true value stored in exception table
     }
   }
   out->put_u8(w);

@@ -24,7 +24,7 @@ TEST(SectionFramer, DetectsCorruption) {
   const uint8_t p[] = {1, 2, 3, 4};
   SectionFramer::write(sink, 1, Slice(p, 4));
   auto bytes = sink.buffer();
-  bytes[3] ^= 0xFF;  // 翻转 payload 一个字节
+  bytes[3] ^= 0xFF;  // flip one byte in the payload
   Slice corrupted(bytes);
   ByteSource src(corrupted);
   FramedSection sec;

@@ -15,8 +15,8 @@ enum class StatusCode {
   kInternal,
 };
 
-// 轻量错误类型：成功为 kOk 且无消息；失败携带 code + 人类可读消息。
-// 跨 API 边界一律返回 Status，禁止静默失败。
+// Lightweight error type: success is kOk with no message; failure carries a code + human-readable message.
+// Always return Status across API boundaries; silent failures are not allowed.
 class Status {
  public:
   Status() = default;
@@ -43,7 +43,7 @@ class Status {
 
 }  // namespace snii
 
-// 对返回 Status 的表达式短路返回（错误向上传播）。
+// Short-circuit return for expressions returning Status (propagate errors upward).
 #define SNII_RETURN_IF_ERROR(expr)    \
   do {                                \
     ::snii::Status _s = (expr);       \

@@ -1,5 +1,5 @@
-# 定位 doris-thirdparty 预编译 gtest/gmock，避免联网拉取。
-# 提供 INTERFACE target: snii_gtest
+# Locate the doris-thirdparty prebuilt gtest/gmock to avoid fetching over the network.
+# Provides the INTERFACE target: snii_gtest
 set(_dt_candidates
   "/mnt/disk1/jiangkai/workspace/src/doris-clean/thirdparty/installed"
   "/mnt/disk1/jiangkai/workspace/src/doris-master/thirdparty/installed"

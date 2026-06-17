@@ -16,7 +16,7 @@ using snii::format::NormsPodWriter;
 
 namespace {
 
-// 用 writer 把一串 encoded_norm 写成 framed payload，再返回缓冲区。
+// Use writer to encode a sequence of encoded_norms into a framed payload and return the buffer.
 std::vector<uint8_t> BuildPod(const std::vector<uint8_t>& norms) {
   NormsPodWriter writer;
   for (uint8_t n : norms) {
@@ -29,7 +29,7 @@ std::vector<uint8_t> BuildPod(const std::vector<uint8_t>& norms) {
 
 }  // namespace
 
-// N 个 norm 写入后逐 doc 读回一致。
+// After writing N norms, read them back per-doc and verify they match.
 TEST(NormsPod, RoundTripValues) {
   std::vector<uint8_t> norms = {0, 1, 7, 42, 128, 200, 255};
   NormsPodWriter writer;
@@ -49,7 +49,7 @@ TEST(NormsPod, RoundTripValues) {
   }
 }
 
-// 较大规模，覆盖 varint doc_count 多字节路径。
+// Large-scale round-trip covering the multi-byte varint doc_count path.
 TEST(NormsPod, RoundTripLarge) {
   std::vector<uint8_t> norms;
   norms.reserve(5000);
@@ -66,7 +66,7 @@ TEST(NormsPod, RoundTripLarge) {
   }
 }
 
-// 空 POD：count = 0 合法，可正常 open。
+// Empty POD: count = 0 is valid and open should succeed.
 TEST(NormsPod, EmptyPod) {
   NormsPodWriter writer;
   EXPECT_EQ(writer.count(), 0u);
@@ -79,11 +79,11 @@ TEST(NormsPod, EmptyPod) {
   EXPECT_EQ(reader.doc_count(), 0u);
 }
 
-// crc 损坏可检出：翻转 payload 中一个字节后 open 失败（Corruption）。
+// CRC corruption is detectable: flipping a byte in the payload causes open to fail (Corruption).
 TEST(NormsPod, DetectsCorruption) {
   std::vector<uint8_t> norms = {10, 20, 30, 40, 50};
   auto buf = BuildPod(norms);
-  // 翻转靠后位置（落在 payload 的 norm 字节区，而非 framer 头部）。
+  // Flip a byte near the end (within the norm byte region of the payload, not the framer header).
   buf[buf.size() - 3] ^= 0xFF;
 
   NormsPodReader reader;
@@ -91,27 +91,27 @@ TEST(NormsPod, DetectsCorruption) {
   EXPECT_EQ(s.code(), StatusCode::kCorruption);
 }
 
-// 截断的输入应返回错误而非崩溃。
+// Truncated input should return an error rather than crash.
 TEST(NormsPod, DetectsTruncation) {
   std::vector<uint8_t> norms = {1, 2, 3, 4, 5, 6, 7, 8};
   auto buf = BuildPod(norms);
-  buf.resize(buf.size() - 4);  // 砍掉尾部 crc 区
+  buf.resize(buf.size() - 4);  // Chop off the trailing CRC region.
 
   NormsPodReader reader;
   Status s = NormsPodReader::open(Slice(buf), &reader);
   EXPECT_FALSE(s.ok());
 }
 
-// 声明的 doc_count 与实际 payload 字节数不一致应被检出。
+// A mismatch between the declared doc_count and the actual payload byte count should be detected.
 TEST(NormsPod, DetectsLengthMismatch) {
-  // 手工构造：framer payload = [varint doc_count=4][仅 2 个 norm 字节]。
+  // Manually construct: framer payload = [varint doc_count=4][only 2 norm bytes].
   ByteSink payload;
   payload.put_varint64(4);
   payload.put_u8(11);
   payload.put_u8(22);
 
   ByteSink sink;
-  // 复用 framer 以保证 crc 自洽，专门触发 length-mismatch 分支。
+  // Reuse the framer to ensure a self-consistent CRC, specifically to trigger the length-mismatch branch.
   snii::SectionFramer::write(
       sink, static_cast<uint8_t>(snii::format::SectionType::kStatsBlock),
       payload.view());
@@ -122,7 +122,7 @@ TEST(NormsPod, DetectsLengthMismatch) {
 }
 
 #ifndef NDEBUG
-// debug 构建下越界 docid 触发断言（death test）。
+// In a debug build, an out-of-range docid triggers an assertion (death test).
 TEST(NormsPodDeathTest, OutOfRangeDocidAsserts) {
   std::vector<uint8_t> norms = {3, 6, 9};
   auto buf = BuildPod(norms);
@@ -132,7 +132,7 @@ TEST(NormsPodDeathTest, OutOfRangeDocidAsserts) {
 }
 #endif
 
-// 受检访问：合法 docid 返回值，越界返回 InvalidArgument（Release 下也生效）。
+// Checked access: a valid docid returns the value, an out-of-range docid returns InvalidArgument (also effective in Release builds).
 TEST(NormsPod, TryEncodedNormChecksBounds) {
   std::vector<uint8_t> norms = {3, 6, 9};
   auto buf = BuildPod(norms);

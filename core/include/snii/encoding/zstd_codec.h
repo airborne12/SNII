@@ -9,7 +9,7 @@
 
 namespace snii {
 
-// ZSTD 薄封装。用于 .prx 窗口等大块负载压缩。解压需调用方提供原长（来自块头）。
+// Thin ZSTD wrapper. Used for compressing large payloads such as .prx windows. Decompression requires the caller to supply the original uncompressed length (from the block header).
 Status zstd_compress(Slice input, int level, std::vector<uint8_t>* out);
 Status zstd_decompress(Slice input, size_t expected_uncomp_len, std::vector<uint8_t>* out);
 

@@ -5,7 +5,7 @@
 namespace snii {
 
 void SectionFramer::write(ByteSink& sink, uint8_t section_type, Slice payload) {
-  // 先在临时 sink 拼 type+len+payload，对其整体计算 crc，再一并写出。
+  // Assemble type+len+payload in a temporary sink, compute crc over the whole thing, then write it all out.
   ByteSink framed;
   framed.put_u8(section_type);
   framed.put_varint64(payload.size());

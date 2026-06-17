@@ -4,7 +4,7 @@
 
 using namespace snii::format;
 
-// 锁定 on-disk 契约值，防止意外改动破坏已写文件的可读性。
+// Lock down on-disk contract values to prevent accidental changes from breaking readability of already-written files.
 TEST(FormatConstants, MagicAndVersionStable) {
   EXPECT_EQ(kContainerMagic, 0x49494E53u);
   EXPECT_EQ(kTailMagic, 0x4C494154u);

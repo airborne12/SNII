@@ -10,15 +10,15 @@
 namespace snii::format {
 namespace {
 
-// 自动压缩阈值：payload 小于此字节数时 raw（zstd 收益不足且元数据开销相对偏大）。
+// Auto-compression threshold: use raw when payload is smaller than this (zstd gain is negligible and metadata overhead is relatively large).
 inline constexpr size_t kAutoZstdMinBytes = 512;
-// 自动模式默认 zstd level。
+// Default zstd level in auto mode.
 inline constexpr int kDefaultZstdLevel = 3;
-// 单个 .prx 窗口解压后字节上限。防御从 S3 读到被损坏成大值的 uncomp_len：
-// 在分配/解压前先 sanity check，避免 GB 级分配。窗口按 256-doc 对齐，正常远小于此。
+// Maximum decompressed byte size for a single .prx window. Guards against a corrupted uncomp_len read from S3 inflated to a huge value:
+// sanity-check before allocating/decompressing to avoid GB-scale allocations. Windows are 256-doc aligned and normally far below this limit.
 inline constexpr uint32_t kMaxWindowUncompBytes = 256u * 1024 * 1024;
 
-// 将 per-doc position 列表编码为自描述明文 payload（doc_count + 每 doc 的 delta 流）。
+// Encode per-doc position lists into a self-describing plain payload (doc_count + per-doc delta stream).
 Status encode_payload(const std::vector<std::vector<uint32_t>>& per_doc, ByteSink* out) {
   out->put_varint32(static_cast<uint32_t>(per_doc.size()));
   for (const auto& doc : per_doc) {
@@ -36,7 +36,7 @@ Status encode_payload(const std::vector<std::vector<uint32_t>>& per_doc, ByteSin
   return Status::OK();
 }
 
-// 从明文 payload 解码出 per-doc position 列表。
+// Decode per-doc position lists from a plain payload.
 Status decode_payload(Slice plain, std::vector<std::vector<uint32_t>>* out) {
   ByteSource src(plain);
   uint32_t doc_count = 0;
@@ -61,14 +61,14 @@ Status decode_payload(Slice plain, std::vector<std::vector<uint32_t>>* out) {
   return Status::OK();
 }
 
-// 决策：给定 level 与明文长度，决定是否压缩。
+// Decision: given level and plain length, determine whether to compress.
 bool should_compress(int level, size_t plain_len) {
-  if (level == 0) return false;            // 强制 raw
-  if (level > 0) return true;              // 强制 zstd
+  if (level == 0) return false;            // force raw
+  if (level > 0) return true;              // force zstd
   return plain_len >= kAutoZstdMinBytes;   // auto
 }
 
-// 写一个 raw 窗口：codec=raw, uncomp_len, crc(header+payload), payload。
+// Write a raw window: codec=raw, uncomp_len, crc(header+payload), payload.
 void write_raw(Slice plain, ByteSink* sink) {
   ByteSink framed;
   framed.put_u8(static_cast<uint8_t>(PrxCodec::kRaw));
@@ -78,7 +78,7 @@ void write_raw(Slice plain, ByteSink* sink) {
   sink->put_fixed32(crc32c(framed.view()));
 }
 
-// 写一个 zstd 窗口：codec=zstd, uncomp_len, comp_len, crc(header+payload), payload。
+// Write a zstd window: codec=zstd, uncomp_len, comp_len, crc(header+payload), payload.
 Status write_zstd(Slice plain, int level, ByteSink* sink) {
   std::vector<uint8_t> comp;
   SNII_RETURN_IF_ERROR(zstd_compress(plain, level > 0 ? level : kDefaultZstdLevel, &comp));
@@ -92,7 +92,7 @@ Status write_zstd(Slice plain, int level, ByteSink* sink) {
   return Status::OK();
 }
 
-// 读 header + payload，回溯校验 crc，并把 payload 视图与 uncomp_len 交回调用方。
+// Read header + payload, verify crc in retrospect, and return the payload view and uncomp_len to the caller.
 Status read_framed(ByteSource* src, uint8_t* codec, uint32_t* uncomp_len, Slice* payload) {
   size_t start = src->position();
   SNII_RETURN_IF_ERROR(src->get_u8(codec));

@@ -1,12 +1,12 @@
 /build/
 /build-*/
-# Claude Code 会话 / workflow worktree，绝不入库
+# Claude Code session / workflow worktrees, never committed
 .claude/
 *.o
 *.a
 compile_commands.json
 .cache/
-# 凭证 / 本地配置，绝不入库
+# Credentials / local config, never committed
 *.oss.env
 .env
 *.local.env

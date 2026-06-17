@@ -11,15 +11,15 @@
 namespace snii::format {
 namespace {
 
-// 自动压缩阈值：payload 小于此字节数时 raw（zstd 收益不足且元数据开销相对偏大）。
+// Auto-compression threshold: use raw when payload is smaller than this byte count (zstd gain is negligible and metadata overhead is relatively large).
 inline constexpr size_t kAutoZstdMinBytes = 512;
-// 自动模式默认 zstd level。
+// Default zstd level for auto mode.
 inline constexpr int kDefaultZstdLevel = 3;
-// 单个 .frq 窗口解压后字节上限。防御从 S3 读到被损坏成大值的 uncomp_len：
-// 在分配/解压前先 sanity check，避免 GB 级分配。窗口按 256-doc 对齐，正常远小于此。
+// Maximum decompressed byte size for a single .frq window. Guards against a corrupted uncomp_len read from S3 that inflated to a huge value:
+// sanity-check before allocating/decompressing to avoid GB-scale allocations. Windows are 256-doc aligned and normally far smaller than this.
 inline constexpr uint32_t kMaxWindowUncompBytes = 256u * 1024 * 1024;
-// 单个 .frq 窗口最多 doc 数上限（防御被损坏的 n）。窗口基准 256，实际组合上限 2048，
-// 这里取一个宽松但能拦住天文数字的上界。
+// Maximum doc count per .frq window (guards against a corrupted n). Window baseline is 256, practical combined cap is 2048,
+// so this is a loose but astronomically-large-number-blocking upper bound.
 inline constexpr uint32_t kMaxWindowDocs = 1u << 24;
 
 bool is_valid_win_mode(uint8_t v) {
@@ -27,8 +27,8 @@ bool is_valid_win_mode(uint8_t v) {
          v == static_cast<uint8_t>(FrqWinMode::kZstd);
 }
 
-// 将一个 uint32 数组按 256(kFrqBaseUnit) 一段写成多个 PFOR run。
-// 不写 n / run 数：run 段数由总长度 n 与 kFrqBaseUnit 推导，解码方一致计算。
+// Encode a uint32 array into multiple PFOR runs, each of 256 (kFrqBaseUnit) elements.
+// n / run count is not written: the number of runs is derived from total length n and kFrqBaseUnit, and the decoder computes it the same way.
 void encode_pfor_runs(const std::vector<uint32_t>& values, ByteSink* out) {
   size_t n = values.size();
   for (size_t off = 0; off < n; off += kFrqBaseUnit) {
@@ -37,7 +37,7 @@ void encode_pfor_runs(const std::vector<uint32_t>& values, ByteSink* out) {
   }
 }
 
-// 从 source 解出 n 个 uint32（按 256 一段的多个 PFOR run）。
+// Decode n uint32 values from source (multiple PFOR runs of 256 each).
 Status decode_pfor_runs(ByteSource* src, size_t n, std::vector<uint32_t>* out) {
   out->assign(n, 0);
   for (size_t off = 0; off < n; off += kFrqBaseUnit) {
@@ -47,7 +47,7 @@ Status decode_pfor_runs(ByteSource* src, size_t n, std::vector<uint32_t>* out) {
   return Status::OK();
 }
 
-// 校验 docids 升序、首项不低于 win_base、freq 长度匹配。
+// Verify that docids are ascending, the first entry is not below win_base, and freq length matches.
 Status validate_inputs(const std::vector<uint32_t>& docs, const std::vector<uint32_t>& freqs,
                        uint64_t win_base, bool has_freq) {
   if (has_freq && freqs.size() != docs.size()) {
@@ -65,8 +65,8 @@ Status validate_inputs(const std::vector<uint32_t>& docs, const std::vector<uint
   return Status::OK();
 }
 
-// 编码明文 payload：dd_part(=VInt n ++ PFOR_runs(doc_delta)) ++ freq_part(=PFOR_runs(freq))。
-// 返回 dd_part 字节长度（供 header 的 dd_part_len）。
+// Encode the plaintext payload: dd_part(=VInt n ++ PFOR_runs(doc_delta)) ++ freq_part(=PFOR_runs(freq)).
+// Returns the byte length of dd_part (used as dd_part_len in the header).
 size_t encode_payload(const std::vector<uint32_t>& docs, const std::vector<uint32_t>& freqs,
                       uint64_t win_base, bool has_freq, ByteSink* out) {
   std::vector<uint32_t> dd(docs.size());
@@ -82,14 +82,14 @@ size_t encode_payload(const std::vector<uint32_t>& docs, const std::vector<uint3
   return dd_part_len;
 }
 
-// 决策：给定 level 与明文长度，决定是否压缩。
+// Decision: given level and plaintext length, determine whether to compress.
 bool should_compress(int level, size_t plain_len) {
-  if (level == 0) return false;           // 强制 raw
-  if (level > 0) return true;             // 强制 zstd
+  if (level == 0) return false;           // force raw
+  if (level > 0) return true;             // force zstd
   return plain_len >= kAutoZstdMinBytes;  // auto
 }
 
-// 写一个 raw 窗口：win_mode=raw, uncomp_len, dd_part_len, crc(header+payload), payload。
+// Write a raw window: win_mode=raw, uncomp_len, dd_part_len, crc(header+payload), payload.
 void write_raw(Slice plain, size_t dd_part_len, ByteSink* sink) {
   ByteSink framed;
   framed.put_u8(static_cast<uint8_t>(FrqWinMode::kRaw));
@@ -100,7 +100,7 @@ void write_raw(Slice plain, size_t dd_part_len, ByteSink* sink) {
   sink->put_fixed32(crc32c(framed.view()));
 }
 
-// 写一个 zstd 窗口：win_mode=zstd, uncomp_len, comp_len, dd_part_len, crc(header+payload), payload。
+// Write a zstd window: win_mode=zstd, uncomp_len, comp_len, dd_part_len, crc(header+payload), payload.
 Status write_zstd(Slice plain, size_t dd_part_len, int level, ByteSink* sink) {
   std::vector<uint8_t> comp;
   SNII_RETURN_IF_ERROR(zstd_compress(plain, level > 0 ? level : kDefaultZstdLevel, &comp));
@@ -115,15 +115,15 @@ Status write_zstd(Slice plain, size_t dd_part_len, int level, ByteSink* sink) {
   return Status::OK();
 }
 
-// 已解析的窗口头与 payload 视图。
+// Parsed window header and payload view.
 struct WindowFrame {
   uint8_t win_mode = 0;
   uint32_t uncomp_len = 0;
   uint32_t dd_part_len = 0;
-  Slice payload;  // raw 即明文；zstd 为压缩字节
+  Slice payload;  // plaintext for raw; compressed bytes for zstd
 };
 
-// 读 header + payload，回溯校验 crc，把头字段与 payload 视图交回调用方。
+// Read header + payload, verify crc by rewinding, and return the header fields and payload view to the caller.
 Status read_framed(ByteSource* src, WindowFrame* f) {
   size_t start = src->position();
   SNII_RETURN_IF_ERROR(src->get_u8(&f->win_mode));
@@ -152,7 +152,7 @@ Status read_framed(ByteSource* src, WindowFrame* f) {
   return Status::OK();
 }
 
-// 解 dd 段：从明文 dd_part 读 n 与 doc_delta，重建升序 docids。
+// Decode the dd section: read n and doc_delta from the plaintext dd_part and reconstruct ascending docids.
 Status decode_docs(Slice dd_part, uint64_t win_base, std::vector<uint32_t>* docids) {
   ByteSource src(dd_part);
   uint32_t n = 0;
@@ -169,7 +169,7 @@ Status decode_docs(Slice dd_part, uint64_t win_base, std::vector<uint32_t>* doci
   return Status::OK();
 }
 
-// 解 freq 段：dd_part 之后的明文为 PFOR_runs(freq)，共 doc_count 个。
+// Decode the freq section: the plaintext after dd_part contains PFOR_runs(freq) for doc_count entries.
 Status decode_freqs(Slice freq_part, size_t doc_count, std::vector<uint32_t>* freqs) {
   if (freq_part.empty()) {
     freqs->clear();
@@ -179,7 +179,7 @@ Status decode_freqs(Slice freq_part, size_t doc_count, std::vector<uint32_t>* fr
   return decode_pfor_runs(&src, doc_count, freqs);
 }
 
-// 取得明文 payload（raw 直接借视图，zstd 解压到 holder）。
+// Obtain the plaintext payload (raw borrows the view directly; zstd decompresses into holder).
 Status materialize_plain(const WindowFrame& f, std::vector<uint8_t>* holder, Slice* plain) {
   if (f.win_mode == static_cast<uint8_t>(FrqWinMode::kRaw)) {
     *plain = f.payload;

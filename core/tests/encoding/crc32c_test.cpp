@@ -6,7 +6,7 @@
 
 using namespace snii;
 
-// leveldb/RocksDB 标准 CRC32C(Castagnoli) 测试向量。
+// leveldb/RocksDB standard CRC32C(Castagnoli) test vectors.
 TEST(Crc32c, KnownVectors) {
   std::vector<uint8_t> zeros(32, 0x00);
   EXPECT_EQ(crc32c(Slice(zeros)), 0x8a9136aau);

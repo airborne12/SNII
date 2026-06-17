@@ -6,7 +6,7 @@
 namespace snii {
 namespace {
 
-// 与 StatusCode 枚举同序的名称表，避免 to_string 写 switch 长链。
+// Name table in the same order as the StatusCode enum, to avoid a long switch chain in to_string.
 constexpr std::array<const char*, 7> kCodeNames = {
     "OK", "Corruption", "NotFound", "InvalidArgument", "IoError", "Unsupported", "Internal"};
 

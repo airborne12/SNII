@@ -8,7 +8,7 @@
 
 namespace snii {
 
-// slice 读游标：所有 section 反序列化均经此，越界一律返回 Corruption。
+// Slice read cursor: all section deserialization goes through this; any overrun returns Corruption.
 class ByteSource {
  public:
   explicit ByteSource(Slice s) : s_(s) {}
@@ -25,7 +25,7 @@ class ByteSource {
   size_t position() const { return pos_; }
   bool eof() const { return pos_ == s_.size(); }
 
-  // 返回从绝对位置 start、长度 len 的子视图（供 framer 等回溯 crc 覆盖区）。
+  // Returns a sub-view starting at absolute offset start with length len (used by framer etc. to rewind over the CRC coverage region).
   Slice slice_from(size_t start, size_t len) const { return s_.subslice(start, len); }
 
  private:
