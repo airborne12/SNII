@@ -11,6 +11,7 @@ set(SNII_TEST_SOURCES
   encoding/crc32c_test.cpp
   encoding/section_framer_test.cpp
   encoding/zstd_codec_test.cpp
+  encoding/pfor_test.cpp
 )
 
 add_executable(snii_core_tests ${SNII_TEST_SOURCES})

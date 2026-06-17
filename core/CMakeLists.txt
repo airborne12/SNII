@@ -8,6 +8,7 @@ set(SNII_SOURCES
   src/encoding/crc32c.cpp
   src/encoding/section_framer.cpp
   src/encoding/zstd_codec.cpp
+  src/encoding/pfor.cpp
 )
 
 add_library(snii STATIC ${SNII_SOURCES})
