@@ -1,0 +1,56 @@
+#pragma once
+
+#include <cstddef>
+#include <cstdint>
+#include <unordered_set>
+#include <vector>
+
+#include "snii/common/status.h"
+#include "snii/io/file_reader.h"
+
+namespace snii::io {
+
+// The four object-storage access metrics the SNII design optimizes for.
+struct IoMetrics {
+  uint64_t read_at_calls = 0;       // BE-internal logical read requests issued
+  uint64_t serial_rounds = 0;       // dependent serial I/O rounds (latency driver)
+  uint64_t range_gets = 0;          // remote range GETs after FileCache coalescing
+  uint64_t remote_bytes = 0;        // bytes fetched from remote (missed cache blocks)
+  uint64_t total_request_bytes = 0; // sum of requested lengths (raw, pre-cache)
+};
+
+// A FileReader decorator that models an object-storage FileCache: reads are
+// aligned to fixed (default 1MiB) blocks; only not-yet-resident blocks become
+// remote range GETs (adjacent misses are coalesced). It is the single shared
+// "yardstick" through which both the CLucene reader (single blocking reads) and
+// the SNII reader (batched concurrent reads) are measured.
+//
+//   - read_at(): a single blocking read. Any cache miss => +1 serial round
+//     (the cursor must wait for bytes before the next offset is known).
+//   - read_batch(): all ranges submitted concurrently => the whole batch is at
+//     most one serial round (+1 iff any range misses).
+class MeteredFileReader : public FileReader {
+ public:
+  explicit MeteredFileReader(FileReader* inner, size_t block_size = (1u << 20));
+
+  Status read_at(uint64_t offset, size_t len, std::vector<uint8_t>* out) override;
+  Status read_batch(const std::vector<Range>& ranges,
+                    std::vector<std::vector<uint8_t>>* outs) override;
+  uint64_t size() const override { return inner_->size(); }
+
+  const IoMetrics& metrics() const { return metrics_; }
+  // Clears counters AND the resident block set, modelling a cold (cache-empty) query.
+  void reset_metrics();
+
+ private:
+  // Accounts the cache effect of touching [offset, offset+len): records misses,
+  // coalesced GETs, and remote bytes. Returns true iff at least one block missed.
+  bool account_blocks(uint64_t offset, size_t len);
+
+  FileReader* inner_;
+  size_t block_size_;
+  std::unordered_set<uint64_t> resident_;
+  IoMetrics metrics_;
+};
+
+}  // namespace snii::io
