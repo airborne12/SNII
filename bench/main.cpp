@@ -46,6 +46,7 @@ struct Args {
   uint32_t doclen = 12;
   uint64_t seed = 42;
   bool oss = false;  // run the real-OSS wall-clock comparison instead of local
+  uint32_t repeat = 1;  // --oss: re-measure each query N times for a distribution
 };
 
 Args parse_args(int argc, char** argv) {
@@ -72,6 +73,9 @@ Args parse_args(int argc, char** argv) {
       a.seed = std::strtoull(next("--seed"), nullptr, 10);
     } else if (flag == "--oss") {
       a.oss = true;
+    } else if (flag == "--repeat") {
+      a.repeat =
+          static_cast<uint32_t>(std::strtoul(next("--repeat"), nullptr, 10));
     } else {
       std::fprintf(stderr, "unknown argument: %s\n", flag.c_str());
       std::exit(2);
@@ -213,6 +217,20 @@ void print_oss_metrics_row(const char* engine, double wall_ms,
               static_cast<unsigned long long>(m.remote_bytes));
 }
 
+// Prints min / median / p90 / mean of a wall-clock sample set (ms). Sorts a
+// local copy so callers keep their order. Empty input prints nothing.
+void print_wall_distribution(const char* engine, std::vector<double> samples) {
+  if (samples.empty()) return;
+  std::sort(samples.begin(), samples.end());
+  const size_t n = samples.size();
+  const double med = samples[n / 2];
+  const double p90 = samples[static_cast<size_t>(0.9 * (n - 1) + 0.5)];
+  double sum = 0.0;
+  for (double v : samples) sum += v;
+  std::printf("  %-8s n=%-3zu min=%-7.1f median=%-7.1f p90=%-7.1f mean=%-7.1f\n",
+              engine, n, samples.front(), med, p90, sum / static_cast<double>(n));
+}
+
 // Runs the full real-OSS comparison. Returns the process exit code (0 on success
 // with all docids matching, nonzero otherwise).
 int run_oss_mode(const Args& args, const bench::Corpus& corpus,
@@ -344,6 +362,54 @@ int run_oss_mode(const Args& args, const bench::Corpus& corpus,
                       static_cast<uint64_t>(r.snii_wall_ms)),
                 ratio(r.clucene.serial_rounds, r.snii.serial_rounds),
                 ratio(r.clucene.range_gets, r.snii.range_gets));
+  }
+
+  // Optional distribution pass: re-measure each query args.repeat times. Every
+  // call resets the cost model and re-issues real OSS GETs (cold), so the spread
+  // exposes per-GET OSS latency jitter -- which dominates tiny single-round
+  // queries and explains why a single mid-df sample can land either way.
+  if (args.repeat > 1) {
+    std::printf("\n=== wall-clock distribution over %u cold repeats "
+                "(real-OSS jitter) ===\n",
+                args.repeat);
+    struct Q {
+      const char* label;
+      bool is_phrase;
+      std::string term;
+    };
+    std::vector<Q> queries = {{"TERM high-df", false, high_term},
+                              {"TERM mid-df", false, mid_term},
+                              {"TERM low-df", false, low_term}};
+    if (!phrase.empty()) queries.push_back({"PHRASE", true, std::string()});
+    for (const Q& q : queries) {
+      std::vector<double> snii_ms, cl_ms;
+      std::vector<uint32_t> sdoc, cdoc;
+      snii::io::IoMetrics sm, cm;
+      try {
+        for (uint32_t i = 0; i < args.repeat; ++i) {
+          auto t0 = std::chrono::steady_clock::now();
+          if (q.is_phrase) {
+            snii_idx.phrase_query(phrase, &sdoc, &sm);
+          } else {
+            snii_idx.term_query(q.term, &sdoc, &sm);
+          }
+          snii_ms.push_back(ms_since(t0));
+          t0 = std::chrono::steady_clock::now();
+          if (q.is_phrase) {
+            cl_idx.phrase_query(phrase, &cdoc, &cm);
+          } else {
+            cl_idx.term_query(q.term, &cdoc, &cm);
+          }
+          cl_ms.push_back(ms_since(t0));
+        }
+      } catch (const std::exception& e) {
+        std::fprintf(stderr, "WARNING: repeat measurement failed: %s\n",
+                     e.what());
+      }
+      std::printf("[%s] (hits=%zu)\n", q.label, sdoc.size());
+      print_wall_distribution("CLucene", cl_ms);
+      print_wall_distribution("SNII", snii_ms);
+    }
   }
 
   // Best-effort cleanup of the uploaded OSS objects.

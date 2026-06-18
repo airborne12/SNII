@@ -79,6 +79,15 @@
 - **5-term 短语 SNII 全规模领先**（1M 1.56×、5M **2.01×**）。其中 5M 短语是子块跳读补齐的短板：
   - **跳读前**（读整段 25MB）：SNII 1260ms 反慢于 CLucene 960ms（字节量盖过轮次节省）。
   - **跳读后**：lead term(最小 df) 驱动候选，高频词只读「覆盖候选 doc 的少数窗口」→ SNII **390.7ms / 8 轮 vs CLucene 785.3ms / 16 轮 = 2.01×**。见 `docs/superpowers/specs/2026-06-18-snii-subblock-skipping-design.md`；差分测试证明跳读 == 全读 == oracle。
-- mid-df term 偶现并列/CLucene 微快（5M 17.9 vs 22.7ms）：命中极少、单块读，差异在 OSS 抖动量级（SNII 仍 1 轮 vs CLucene 2 轮）。
+- mid-df term 单发偶现 CLucene 微快（5M 17.9 vs 22.7ms）属**单样本离群**，非负收益。单发 `--oss` 每条查询只测一次，含首次 GET 的 TLS/连接建立 + OSS 尾延迟。`--oss --repeat 20`（上传一次、每条查询冷测 20 次）的稳态分布证明 **SNII mid-df 实际更快**：
+
+  | 5M 查询（20 次冷重复 median / p90，ms）| CLucene | SNII |
+  |---|---|---|
+  | TERM high-df | 493.8 / 523.7 | **197.1 / 267.0** |
+  | TERM mid-df | 8.2 / 8.9 | **6.3 / 6.8** |
+  | TERM low-df | 8.4 / 9.1 | **6.4 / 7.1** |
+  | PHRASE | 651.9 / 707.5 | **227.5 / 247.4** |
+
+  稳态下 SNII 全查询类型 median 更优（mid-df 1.30×、high-df 2.5×、PHRASE 2.87×）且分布更紧。复现：`snii_bench --oss --repeat 20 --docs 5000000`。成本模型（1 轮 vs 2）早已确定性地预测此结论；微查询单发 wall-clock 的几 ms 差由 OSS 抖动主导。
 
 **总结**：串行 I/O 轮次 / 请求数（文档主优化目标）SNII 全规模、全查询类型均更少或持平；真实冷查 wall-clock，TERM 快 ~3×、5-term 短语（含子块跳读）快 ~2×。SNII 通过常驻元数据前置规划 + 两级子块跳读 + 批量并发，在对象存储上把串行轮次、远端请求数、读取字节同时压下来，冷查延迟全面领先。`ALL DOCIDS MATCH` 贯穿全部规模与查询类型。
