@@ -41,10 +41,11 @@ struct WindowPlan {
 };
 
 // Plans (registers) every window's .frq and optional .prx sub-range against the
-// fetcher, validating each range against its section length.
+// fetcher, validating each range against its section length. want_freq selects
+// the full window vs the docs-only prefix for each .frq range.
 Status PlanWindows(const LogicalIndexReader& idx, const DictEntry& entry,
                    uint64_t frq_base, uint64_t prx_base, bool want_positions,
-                   const FrqPreludeReader& prelude,
+                   bool want_freq, const FrqPreludeReader& prelude,
                    snii::io::BatchRangeFetcher* fetcher,
                    std::vector<WindowPlan>* plans) {
   const uint32_t n = prelude.n_windows();
@@ -54,7 +55,8 @@ Status PlanWindows(const LogicalIndexReader& idx, const DictEntry& entry,
     SNII_RETURN_IF_ERROR(prelude.window(w, &p.meta));
     WindowAbsRange r;
     SNII_RETURN_IF_ERROR(windowed_window_range(idx, entry, frq_base, prx_base,
-                                               prelude, w, want_positions, &r));
+                                               prelude, w, want_positions,
+                                               want_freq, &r));
     p.frq_handle = fetcher->add(r.frq_off, static_cast<size_t>(r.frq_len));
     if (want_positions) {
       p.prx_handle = fetcher->add(r.prx_off, static_cast<size_t>(r.prx_len));
@@ -66,13 +68,15 @@ Status PlanWindows(const LogicalIndexReader& idx, const DictEntry& entry,
 
 // Decodes one window's docids/freqs (and positions) and appends to the output.
 Status AppendWindow(const snii::io::BatchRangeFetcher& fetcher,
-                    const WindowPlan& p, bool want_positions, DecodedPosting* out) {
+                    const WindowPlan& p, bool want_positions, bool want_freq,
+                    DecodedPosting* out) {
   std::vector<uint32_t> docids;
   std::vector<uint32_t> freqs;
   std::vector<std::vector<uint32_t>> pos;
   const Slice prx = want_positions ? fetcher.get(p.prx_handle) : Slice();
   SNII_RETURN_IF_ERROR(decode_window_slices(p.meta, fetcher.get(p.frq_handle), prx,
-                                            want_positions, &docids, &freqs, &pos));
+                                            want_positions, want_freq, &docids,
+                                            &freqs, &pos));
   out->docids.insert(out->docids.end(), docids.begin(), docids.end());
   out->freqs.insert(out->freqs.end(), freqs.begin(), freqs.end());
   if (want_positions) {
@@ -101,7 +105,8 @@ Status fetch_windowed_prelude(const LogicalIndexReader& idx, const DictEntry& en
 Status windowed_window_range(const LogicalIndexReader& idx, const DictEntry& entry,
                              uint64_t frq_base, uint64_t prx_base,
                              const FrqPreludeReader& prelude, uint32_t w,
-                             bool want_positions, WindowAbsRange* out) {
+                             bool want_positions, bool want_freq,
+                             WindowAbsRange* out) {
   if (out == nullptr) return Status::InvalidArgument("windowed_posting: null range");
   // Self-defend (the skip path reaches here without the prelude-fetch validation):
   // prelude_len > frq_len would underflow frq_region_len below.
@@ -111,12 +116,20 @@ Status windowed_window_range(const LogicalIndexReader& idx, const DictEntry& ent
   WindowMeta meta;
   SNII_RETURN_IF_ERROR(prelude.window(w, &meta));
 
+  // Anti-DoS: the docs-only prefix must fit inside the full window.
+  if (meta.frq_docs_len > meta.frq_len) {
+    return Status::Corruption("windowed_posting: frq_docs_len exceeds frq_len");
+  }
+  // docid-only / phrase callers fetch only the docs-only prefix (no freq region).
+  const uint64_t frq_fetch_len = want_freq ? meta.frq_len : meta.frq_docs_len;
+
   // .frq windows live after the prelude; validate against the post-prelude span.
   const uint64_t frq_window_start = PreludeAbs(idx, entry, frq_base) + entry.prelude_len;
   const uint64_t frq_region_len = entry.frq_len - entry.prelude_len;
+  // Validate the FULL window first (the prefix is contained within it).
   SNII_RETURN_IF_ERROR(InBounds(meta.frq_off, meta.frq_len, frq_region_len));
   out->frq_off = frq_window_start + meta.frq_off;
-  out->frq_len = meta.frq_len;
+  out->frq_len = frq_fetch_len;
 
   if (!want_positions) {
     out->prx_off = 0;
@@ -135,12 +148,20 @@ Status windowed_window_range(const LogicalIndexReader& idx, const DictEntry& ent
 }
 
 Status decode_window_slices(const WindowMeta& meta, Slice frq_window, Slice prx_window,
-                            bool want_positions, std::vector<uint32_t>* docids,
+                            bool want_positions, bool want_freq,
+                            std::vector<uint32_t>* docids,
                             std::vector<uint32_t>* freqs,
                             std::vector<std::vector<uint32_t>>* positions) {
   ByteSource fsrc(frq_window);
-  SNII_RETURN_IF_ERROR(
-      snii::format::read_frq_window(&fsrc, meta.win_base, docids, freqs));
+  // want_freq=false => the slice is the docs-only prefix (freq region absent):
+  // decode docids only. want_freq=true => full window: decode docids + freqs.
+  if (want_freq) {
+    SNII_RETURN_IF_ERROR(
+        snii::format::read_frq_window(&fsrc, meta.win_base, docids, freqs));
+  } else {
+    SNII_RETURN_IF_ERROR(
+        snii::format::read_frq_window_docs(&fsrc, meta.win_base, docids));
+  }
   if (docids->size() != meta.doc_count) {
     return Status::Corruption("windowed_posting: frq doc_count mismatch");
   }
@@ -156,7 +177,8 @@ Status decode_window_slices(const WindowMeta& meta, Slice frq_window, Slice prx_
 
 Status read_windowed_posting(const LogicalIndexReader& idx, const DictEntry& entry,
                              uint64_t frq_base, uint64_t prx_base,
-                             bool want_positions, DecodedPosting* out) {
+                             bool want_positions, bool want_freq,
+                             DecodedPosting* out) {
   if (out == nullptr) {
     return Status::InvalidArgument("windowed_posting: null out");
   }
@@ -168,14 +190,23 @@ Status read_windowed_posting(const LogicalIndexReader& idx, const DictEntry& ent
     return Status::Corruption("windowed_posting: positions requested but prelude has none");
   }
 
-  snii::io::BatchRangeFetcher fetcher(idx.reader());
+  // All ranges here belong to ONE term's many windows. For full windows
+  // (want_freq=true) the per-window ranges are exactly contiguous, so coalescing
+  // (kSameTermCoalesceGap) folds them into fewer physical GETs at no over-read.
+  // For docs-only tiling (want_freq=false) consecutive docs-prefixes are
+  // separated by the very freq regions we are skipping; coalescing across them
+  // would re-read (and waste) those bytes, so we keep gap=0 to preserve the
+  // wire-level freq-skip. The phrase SKIP path (selected, possibly far-apart
+  // windows) applies the gap itself where it actually saves GETs.
+  const uint64_t gap = want_freq ? kSameTermCoalesceGap : 0;
+  snii::io::BatchRangeFetcher fetcher(idx.reader(), gap);
   std::vector<WindowPlan> plans;
   SNII_RETURN_IF_ERROR(PlanWindows(idx, entry, frq_base, prx_base, want_positions,
-                                   prelude, &fetcher, &plans));
+                                   want_freq, prelude, &fetcher, &plans));
   if (fetcher.pending() > 0) SNII_RETURN_IF_ERROR(fetcher.fetch());
 
   for (const WindowPlan& p : plans) {
-    SNII_RETURN_IF_ERROR(AppendWindow(fetcher, p, want_positions, out));
+    SNII_RETURN_IF_ERROR(AppendWindow(fetcher, p, want_positions, want_freq, out));
   }
   return Status::OK();
 }

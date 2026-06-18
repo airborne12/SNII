@@ -28,14 +28,27 @@ Status DecodeSlimDocs(Slice window, std::vector<uint32_t>* docids) {
 }
 
 // Decodes a windowed term's full docid sequence by tiling all its windows
-// through the two-level prelude.
+// through the two-level prelude. Docid-only: each window fetches ONLY its
+// docs-only prefix (want_freq=false), so the freq region never crosses the wire.
 Status DecodeWindowedDocs(const LogicalIndexReader& idx, const DictEntry& entry,
                           uint64_t frq_base, uint64_t prx_base,
                           std::vector<uint32_t>* docids) {
   snii::reader::DecodedPosting posting;
   SNII_RETURN_IF_ERROR(snii::reader::read_windowed_posting(
-      idx, entry, frq_base, prx_base, /*want_positions=*/false, &posting));
+      idx, entry, frq_base, prx_base, /*want_positions=*/false,
+      /*want_freq=*/false, &posting));
   *docids = std::move(posting.docids);
+  return Status::OK();
+}
+
+// Resolves the docs-only fetch length for a slim pod_ref window: the recorded
+// docs-only prefix (frq_docs_len) when present and valid, else the whole window
+// (defensive fallback for malformed entries). Validates frq_docs_len <= win_len.
+Status SlimDocsFetchLen(const DictEntry& entry, uint64_t win_len, uint64_t* out) {
+  if (entry.frq_docs_len > win_len) {
+    return Status::Corruption("term_query: slim frq_docs_len exceeds frq window");
+  }
+  *out = entry.frq_docs_len > 0 ? entry.frq_docs_len : win_len;
   return Status::OK();
 }
 
@@ -63,12 +76,15 @@ Status term_query(const LogicalIndexReader& idx, std::string_view term,
     return DecodeWindowedDocs(idx, entry, frq_base, prx_base, docids);
   }
 
-  // Slim pod_ref: one .frq window after the (absent) prelude.
+  // Slim pod_ref: one .frq window after the (absent) prelude. Docid-only: fetch
+  // ONLY the docs-only prefix (frq_docs_len) instead of the full window.
   uint64_t win_abs = 0;
   uint64_t win_len = 0;
   SNII_RETURN_IF_ERROR(idx.resolve_frq_window(entry, frq_base, &win_abs, &win_len));
+  uint64_t docs_len = 0;
+  SNII_RETURN_IF_ERROR(SlimDocsFetchLen(entry, win_len, &docs_len));
   snii::io::BatchRangeFetcher fetcher(idx.reader());
-  const size_t h = fetcher.add(win_abs, static_cast<size_t>(win_len));
+  const size_t h = fetcher.add(win_abs, static_cast<size_t>(docs_len));
   SNII_RETURN_IF_ERROR(fetcher.fetch());
   return DecodeSlimDocs(fetcher.get(h), docids);
 }

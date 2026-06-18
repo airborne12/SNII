@@ -163,7 +163,8 @@ bool DecodeFullTerm(const LogicalIndexReader& idx, const std::string& term,
   if (entry.kind == DictEntryKind::kPodRef && entry.enc == DictEntryEnc::kWindowed) {
     DecodedPosting dp;
     EXPECT_TRUE(read_windowed_posting(idx, entry, frq_base, prx_base,
-                                      /*want_positions=*/true, &dp)
+                                      /*want_positions=*/true,
+                                      /*want_freq=*/false, &dp)
                     .ok());
     out->docids = std::move(dp.docids);
     out->positions = std::move(dp.positions);
@@ -185,8 +186,8 @@ bool DecodeFullTerm(const LogicalIndexReader& idx, const std::string& term,
   meta.doc_count = entry.df;
   std::vector<uint32_t> freqs;
   Status st = decode_window_slices(meta, Slice(frq), Slice(prx),
-                                   /*want_positions=*/true, &out->docids, &freqs,
-                                   &out->positions);
+                                   /*want_positions=*/true, /*want_freq=*/false,
+                                   &out->docids, &freqs, &out->positions);
   EXPECT_TRUE(st.ok()) << st.message();
   return true;
 }

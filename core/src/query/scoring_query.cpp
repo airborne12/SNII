@@ -158,8 +158,10 @@ Status BuildWindowedCursor(const LogicalIndexReader& idx,
                            uint64_t frq_base, uint64_t prx_base,
                            const Bm25Params& params, TermCursor* cursor) {
   snii::reader::DecodedPosting posting;
+  // Scoring needs freqs for BM25: fetch the FULL windows (want_freq=true).
   SNII_RETURN_IF_ERROR(snii::reader::read_windowed_posting(
-      idx, entry, frq_base, prx_base, /*want_positions=*/false, &posting));
+      idx, entry, frq_base, prx_base, /*want_positions=*/false,
+      /*want_freq=*/true, &posting));
   SNII_RETURN_IF_ERROR(ScoreDecoded(stats, ctx, params, posting.docids,
                                     posting.freqs, &cursor->postings));
   FrqPreludeReader prelude;
