@@ -15,10 +15,17 @@ namespace snii::writer {
 
 namespace {
 
-// Flush staging once it grows past this; keeps RunWriter RSS tiny and bounded.
-constexpr size_t kWriteFlushBytes = 1u << 16;  // 64 KiB
+// Flush staging once it grows past this. A LARGE write buffer (4 MiB) collapses
+// the per-flush write() syscall count by ~64x: at 64 KiB the 5M build issued
+// ~8800 write()s to ext4 (~9s of syscall overhead) for ~553 MiB of runs, versus
+// a raw dd of the same bytes taking ~1.2s. Runs are PRIVATE temp files, so the
+// on-disk index is unaffected; the only cost is a slightly larger transient
+// RunWriter staging buffer (4 MiB, bounded, freed at close()).
+constexpr size_t kWriteFlushBytes = 1u << 22;  // 4 MiB
 // RunReader reads this much per disk fill; the window slides so a single record
-// never needs the whole run in RAM (only the current term's encoded span).
+// never needs the whole run in RAM (only the current term's encoded span). KEEP
+// this small (64 KiB): a large read chunk x many open runs would inflate the
+// merge-phase peak RSS at low spill thresholds (each reader holds a window).
 constexpr size_t kReadChunkBytes = 1u << 16;  // 64 KiB
 
 void AppendVarint(std::vector<uint8_t>* buf, uint64_t v) {
@@ -81,12 +88,13 @@ Status RunWriter::flush() {
 Status RunWriter::write_term(uint32_t term_id, const TermPostings& tp) {
   AppendVarint(&buf_, term_id);
   AppendVarint(&buf_, tp.docids.size());
-  // Docids stay VInt delta: ascending, so deltas are small and compress well.
-  uint32_t prev = 0;
-  for (size_t i = 0; i < tp.docids.size(); ++i) {
-    AppendVarint(&buf_, static_cast<uint64_t>(tp.docids[i]) - prev);
-    prev = tp.docids[i];
-  }
+  // Docids are a RAW fixed-width u32 block (bulk memcpy), NOT per-value VInt.
+  // Per-value varint over ~60M docids cost ~1.5s of encode CPU on the spill feed
+  // side; raw is a single memcpy and the decode side becomes a memcpy too. Runs
+  // are PRIVATE temp files written then read back from page cache, so the modestly
+  // larger run (no delta packing) costs ~0 extra real I/O. Absolute docids are
+  // stored (the merge concatenates per-term across runs and re-deltas at encode).
+  AppendRawU32(&buf_, tp.docids.data(), tp.docids.size());
   // Freqs + positions are RAW fixed-width u32 blocks (bulk memcpy). The decoder
   // reads them back the same way; n_pos == positions_flat.size() is recoverable
   // from sum(freqs), but is written explicitly so a reader can size the block.
@@ -232,14 +240,8 @@ Status RunReader::advance() {
 
   uint64_t n_docs = 0;
   SNII_RETURN_IF_ERROR(read_varint(&n_docs));
-  current_.docids.resize(static_cast<size_t>(n_docs));
-  uint32_t acc = 0;
-  for (size_t i = 0; i < n_docs; ++i) {
-    uint64_t d = 0;
-    SNII_RETURN_IF_ERROR(read_varint(&d));
-    acc = static_cast<uint32_t>(acc + d);  // delta-decode (wraps validated by writer)
-    current_.docids[i] = acc;
-  }
+  // Docids: RAW absolute u32 block (bulk read), matching the writer's AppendRawU32.
+  SNII_RETURN_IF_ERROR(read_raw_u32(static_cast<size_t>(n_docs), &current_.docids));
   // Freqs: RAW u32 block (bulk read), matching the writer's AppendRawU32.
   SNII_RETURN_IF_ERROR(read_raw_u32(static_cast<size_t>(n_docs), &current_.freqs));
   uint64_t n_pos = 0;
@@ -341,19 +343,40 @@ Status MergeRuns(const std::vector<std::string>& run_paths,
     readers.push_back(std::move(r));
   }
 
+  std::vector<size_t> matching;  // run indices contributing the current term
   while (!heap.empty()) {
     const uint32_t id = heap.top().term_id;
     TermPostings merged;
     merged.term = vocab[id];  // resolve the id -> dictionary string once
-    // Drain every run whose head id maps to the same string, in run order. Equal
-    // strings imply equal ids for a dense vocab, but compare by string so a
-    // (documented-as-absent) duplicate string still groups correctly.
+    // Gather every run whose head id maps to the same string (the heap's run
+    // tie-break keeps them in run order, so concatenated docids stay ascending).
+    // Equal strings imply equal ids for a dense vocab; compare by string so a
+    // duplicate string still groups correctly. The matching runs' current slices
+    // are already loaded in their readers (they were read to seed the heap), so
+    // summing their sizes here costs nothing extra in RAM.
+    matching.clear();
+    uint64_t total_docs = 0, total_pos = 0;
     while (!heap.empty() && vocab[heap.top().term_id] == merged.term) {
       const size_t ri = heap.top().run;
       heap.pop();
+      const TermPostings& cur = readers[ri]->current();
+      total_docs += cur.docids.size();
+      total_pos += cur.positions_flat.size();
+      matching.push_back(ri);
+    }
+    // Reserve EXACTLY the summed sizes (an upper bound -- boundary-doc coalescing
+    // only shrinks the final size). This eliminates std::vector's geometric
+    // over-allocation, which left ~32 MiB of dead capacity on the widest term (df
+    // in the millions split across spills) -- a dominant merge-phase peak-RSS
+    // overhang at 5M. The reserved-but-unwritten pages are not faulted in, so the
+    // empty reservation itself does not raise RSS; only the actual data does.
+    merged.docids.reserve(static_cast<size_t>(total_docs));
+    merged.freqs.reserve(static_cast<size_t>(total_docs));
+    if (has_positions) merged.positions_flat.reserve(static_cast<size_t>(total_pos));
+    for (size_t ri : matching) {
       RunReader* r = readers[ri].get();
       Concat(&merged, r->current(), has_positions);
-      SNII_RETURN_IF_ERROR(r->advance());
+      SNII_RETURN_IF_ERROR(r->advance());  // frees this run's slice, loads next term
       if (!r->exhausted()) {
         if (r->current_id() >= vocab.size()) {
           return Status::Corruption("run term_id out of vocab range");

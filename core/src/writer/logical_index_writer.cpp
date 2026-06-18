@@ -68,6 +68,34 @@ Status EncodeRegions(std::span<const uint32_t> docids,
   return Status::OK();
 }
 
+// Reusable per-window scratch for the windowed builder. Each ByteSink RETAINS its
+// capacity across windows (clear(), not re-construct), so encoding a high-df term
+// split into thousands of windows allocates the scratch ONCE instead of churning
+// thousands of small buffers (which fragment the heap arena and raise peak RSS).
+struct WindowScratch {
+  ByteSink dd_sink;
+  ByteSink freq_sink;
+  ByteSink prx_sink;
+};
+
+// Encodes one window's dd (and freq) region into the scratch sinks and appends the
+// bytes directly to the grouped blocks via LayoutWindowRegions. Reuses the sinks.
+Status EncodeRegionsInto(WindowScratch* sc, std::span<const uint32_t> docids,
+                         std::span<const uint32_t> freqs, uint64_t win_base,
+                         bool has_freq, FrqRegionMeta* dd_meta, FrqRegionMeta* freq_meta) {
+  sc->dd_sink.clear();
+  SNII_RETURN_IF_ERROR(
+      snii::format::build_dd_region(docids, win_base, kRawFrqRegion, &sc->dd_sink, dd_meta));
+  if (has_freq) {
+    sc->freq_sink.clear();
+    SNII_RETURN_IF_ERROR(
+        snii::format::build_freq_region(freqs, kRawFrqRegion, &sc->freq_sink, freq_meta));
+  } else {
+    *freq_meta = FrqRegionMeta{};
+  }
+  return Status::OK();
+}
+
 // Builds a single .prx window directly from a FLAT positions slice + its parallel
 // freqs slice (doc d owns the next freqs[d] entries). Byte-identical to building
 // from per-doc vectors, but with NO vector-of-vectors materialization: the writer
@@ -173,50 +201,72 @@ void LayoutWindowRegions(const FrqRegionMeta& dd_meta, const std::vector<uint8_t
 // df via AdaptiveWindowDocs). Each window's dd/freq regions are encoded separately
 // and grouped: all dd regions into the dd-block, all freq regions into the
 // freq-block. Records per-window region metadata + WAND max_norm.
-Status BuildWindowedPosting(const TermPostings& tp, bool has_freq, bool has_prx,
+//
+// TWO-PASS, MEMORY-AWARE: the widest term (df in the millions) is the dominant
+// merge-phase peak-RSS source -- its flat positions_flat alone is tens of MiB and
+// would otherwise co-exist with the encoded output blocks at the peak moment.
+//   pass 1 (prx): builds every window's .prx bytes, then FREES positions_flat
+//                 (the single largest source array) before any dd/freq block grows.
+//   pass 2 (dd/freq): encodes the dd/freq regions from docids/freqs only.
+// `tp` is taken by mutable reference; positions_flat is freed after pass 1 and
+// docids/freqs are freed by the caller after this returns. Output bytes are
+// byte-identical to the single-pass build (regions/prelude/prx are independent).
+Status BuildWindowedPosting(TermPostings& tp, bool has_freq, bool has_prx,
                             const std::vector<uint8_t>& norms, WindowedPosting* out) {
   const uint32_t unit = AdaptiveWindowDocs(static_cast<uint32_t>(tp.docids.size()));
   const size_t n = tp.docids.size();
-  // Span views over the term's flat arrays: each window is encoded straight from
-  // a subspan, with NO per-window std::vector copy of docs/freqs and NO deep copy
-  // of the per-doc position lists. Output bytes are unchanged.
   const std::span<const uint32_t> all_docs(tp.docids);
   const std::span<const uint32_t> all_freqs(tp.freqs);
-  const std::span<const uint32_t> all_pos(tp.positions_flat);
-  uint64_t win_base = 0;  // absolute last docid of the previous window
-  size_t pos_off = 0;     // running flat-positions offset of the current window
-  for (size_t start = 0; start < n; start += unit) {
+
+  WindowScratch sc;  // reused across all windows (no per-window allocation churn)
+
+  // ---- pass 1: prx + window skeleton (last_docid/win_base/doc_count/max_*) ----
+  {
+    const std::span<const uint32_t> all_pos(tp.positions_flat);
+    uint64_t win_base = 0;
+    size_t pos_off = 0;
+    for (size_t start = 0; start < n; start += unit) {
+      const size_t len = std::min<size_t>(unit, n - start);
+      const auto docs = all_docs.subspan(start, len);
+      const auto freqs = all_freqs.subspan(start, len);
+      WindowMeta m;
+      m.last_docid = docs.back();
+      m.win_base = win_base;
+      m.doc_count = static_cast<uint32_t>(docs.size());
+      m.max_freq = MaxOf(freqs);
+      m.max_norm = WindowMaxNorm(norms, docs);
+      size_t win_pos = 0;
+      for (uint32_t f : freqs) win_pos += f;
+      if (has_prx) {
+        sc.prx_sink.clear();
+        SNII_RETURN_IF_ERROR(snii::format::build_prx_window_flat(
+            all_pos.subspan(pos_off, win_pos), freqs, kAutoZstd, &sc.prx_sink));
+        m.prx_off = static_cast<uint64_t>(out->prx_bytes.size());
+        m.prx_len = static_cast<uint64_t>(sc.prx_sink.size());
+        AppendBytes(&out->prx_bytes, sc.prx_sink.buffer());
+      }
+      pos_off += win_pos;
+      out->windows.push_back(m);
+      win_base = m.last_docid;
+    }
+  }
+  // Positions are fully consumed; free the largest source array before pass 2
+  // grows the dd/freq blocks, so the source positions never co-exist with them.
+  std::vector<uint32_t>().swap(tp.positions_flat);
+
+  // ---- pass 2: dd (and freq) regions from docids/freqs only ----
+  uint64_t win_base = 0;
+  size_t wi = 0;
+  for (size_t start = 0; start < n; start += unit, ++wi) {
     const size_t len = std::min<size_t>(unit, n - start);
     const auto docs = all_docs.subspan(start, len);
     const auto freqs = all_freqs.subspan(start, len);
-
-    std::vector<uint8_t> dd_bytes, freq_bytes;
     FrqRegionMeta dd_meta, freq_meta;
-    SNII_RETURN_IF_ERROR(EncodeRegions(docs, freqs, win_base, has_freq, &dd_bytes,
-                                       &dd_meta, &freq_bytes, &freq_meta));
-
-    WindowMeta m;
-    m.last_docid = docs.back();
-    m.win_base = win_base;
-    m.doc_count = static_cast<uint32_t>(docs.size());
-    m.max_freq = MaxOf(freqs);
-    m.max_norm = WindowMaxNorm(norms, docs);
-    LayoutWindowRegions(dd_meta, dd_bytes, freq_meta, freq_bytes, has_freq, out, &m);
-
-    // This window owns sum(freqs) flat positions starting at pos_off.
-    size_t win_pos = 0;
-    for (uint32_t f : freqs) win_pos += f;
-    if (has_prx) {
-      std::vector<uint8_t> prx_win;
-      SNII_RETURN_IF_ERROR(
-          MakePrxWindow(all_pos.subspan(pos_off, win_pos), freqs, &prx_win));
-      m.prx_off = static_cast<uint64_t>(out->prx_bytes.size());
-      m.prx_len = static_cast<uint64_t>(prx_win.size());
-      AppendBytes(&out->prx_bytes, prx_win);
-    }
-    pos_off += win_pos;
-    out->windows.push_back(m);
-    win_base = m.last_docid;
+    SNII_RETURN_IF_ERROR(
+        EncodeRegionsInto(&sc, docs, freqs, win_base, has_freq, &dd_meta, &freq_meta));
+    LayoutWindowRegions(dd_meta, sc.dd_sink.buffer(), freq_meta, sc.freq_sink.buffer(),
+                        has_freq, out, &out->windows[wi]);
+    win_base = out->windows[wi].last_docid;
   }
   return Status::OK();
 }
@@ -263,10 +313,14 @@ Status LogicalIndexWriter::validate_term(const TermPostings& tp) const {
 // prelude, and lays out [prelude][dd-block][freq-block] in the .frq POD and
 // [win0 prx][win1 prx]... in the .prx POD. Sets enc=windowed + has_sb.
 // frq_docs_len = prelude_len + dd_block_len is the contiguous docs-only prefix.
-Status LogicalIndexWriter::build_windowed_entry(const TermPostings& tp, uint64_t frq_base,
+Status LogicalIndexWriter::build_windowed_entry(TermPostings& tp, uint64_t frq_base,
                                                 uint64_t prx_base, DictEntry* e) {
   WindowedPosting wp;
   SNII_RETURN_IF_ERROR(BuildWindowedPosting(tp, has_freq_, has_prx_, encoded_norms_, &wp));
+  // docids/freqs are now fully encoded into wp; release the source arrays before
+  // the (potentially large) wp blocks are appended to disk.
+  std::vector<uint32_t>().swap(tp.docids);
+  std::vector<uint32_t>().swap(tp.freqs);
   std::vector<uint8_t> prelude;
   SNII_RETURN_IF_ERROR(BuildPrelude(wp.windows, has_freq_, has_prx_, &prelude));
 
@@ -296,7 +350,7 @@ Status LogicalIndexWriter::build_windowed_entry(const TermPostings& tp, uint64_t
 // inline when the encoded bytes are tiny, otherwise a slim pod_ref (no prelude).
 // The dd region is the docs-only prefix; the freq region (when has_freq) is the
 // skippable suffix. Region codecs are recorded in the DictEntry.
-Status LogicalIndexWriter::build_slim_entry(const TermPostings& tp, uint64_t frq_base,
+Status LogicalIndexWriter::build_slim_entry(TermPostings& tp, uint64_t frq_base,
                                             uint64_t prx_base, DictEntry* e) {
   std::vector<uint8_t> dd_bytes, freq_bytes;
   FrqRegionMeta dd_meta, freq_meta;
@@ -339,7 +393,7 @@ Status LogicalIndexWriter::build_slim_entry(const TermPostings& tp, uint64_t frq
 // Builds the DictEntry for one term. Inline entries embed their .frq/.prx bytes;
 // pod_ref entries append posting bytes to the PODs and record off_delta relative
 // to frq_base/prx_base (the POD sizes captured when the block opened).
-Status LogicalIndexWriter::build_entry(const TermPostings& tp, uint64_t frq_base,
+Status LogicalIndexWriter::build_entry(TermPostings& tp, uint64_t frq_base,
                                        uint64_t prx_base, DictEntry* e) {
   e->term = tp.term;
   e->df = static_cast<uint32_t>(tp.docids.size());
@@ -380,7 +434,7 @@ struct LogicalIndexWriter::BlockState {
   uint64_t prx_base = 0;
 };
 
-Status LogicalIndexWriter::process_term(const TermPostings& tp, BlockState* st) {
+Status LogicalIndexWriter::process_term(TermPostings& tp, BlockState* st) {
   SNII_RETURN_IF_ERROR(validate_term(tp));
   // Collect only the 8-byte filter key per term (no whole-vocabulary string copy).
   term_hashes_.push_back(snii::format::hash_term(tp.term));
@@ -422,7 +476,13 @@ Status LogicalIndexWriter::build_blocks() {
     // build does not masquerade as an empty-but-successful index.
     SNII_RETURN_IF_ERROR(term_source_->status());
   } else {
-    for (const auto& tp : terms_) SNII_RETURN_IF_ERROR(process_term(tp, &st));
+    // Materialized fallback (tests / callers holding a vector): process_term frees
+    // the term's arrays, so feed a per-term COPY to keep terms_ intact for the
+    // caller. This path is not the large out-of-core build, so the copy is cheap.
+    for (const auto& tp : terms_) {
+      TermPostings copy = tp;
+      SNII_RETURN_IF_ERROR(process_term(copy, &st));
+    }
   }
   if (st.block) SNII_RETURN_IF_ERROR(flush_block(st.block.get(), st.block_first_term));
   return Status::OK();

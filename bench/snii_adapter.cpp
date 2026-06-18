@@ -64,10 +64,13 @@ void SniiAdapter::build_and_open(const Corpus& c) {
   in.config = IndexConfig::kDocsPositions;
   in.doc_count = c.doc_count;
   in.term_source = &buf;
-  // A small DICT block target yields many blocks and a finer-grained sampled
-  // term index, which keeps the term-dictionary lookup path accurate across the
-  // whole (large) vocabulary.
-  in.target_dict_block_bytes = 512;
+  // A larger DICT block target (64 KiB) yields far fewer blocks: it shrinks the
+  // dict_block_directory (one BlockRef/block) and the sampled_term_index (one
+  // sampled term/block) on disk, AND cuts the writer's per-block accumulation
+  // (blocks_ + sample_first_terms_) -- a meaningful merge-phase RSS line at 5M
+  // (953K terms => ~191K blocks at 512 B vs ~1.6K blocks at 64 KiB). Query lookup
+  // reads a larger dict block per term, but the I/O-metric thesis is unaffected.
+  in.target_dict_block_bytes = 64 * 1024;
 
   // 3. Write the compound container to a temp file.
   path_ = make_temp_path();

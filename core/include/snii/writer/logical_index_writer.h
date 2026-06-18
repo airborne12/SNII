@@ -146,17 +146,20 @@ class LogicalIndexWriter {
   // validates the term, opens a block if needed, builds its DictEntry, and cuts
   // the block once it reaches the target size. Mutates the running block state.
   struct BlockState;
-  Status process_term(const TermPostings& tp, BlockState* st);
+  // `tp` is taken by mutable reference: the encode FREES the term's large flat
+  // arrays (docids/freqs/positions_flat) as soon as they are consumed, so the
+  // widest term's source does not co-exist with its encoded output at peak RSS.
+  Status process_term(TermPostings& tp, BlockState* st);
   // Builds one DictEntry (inline or pod_ref), growing the PODs as needed.
-  Status build_entry(const TermPostings& tp, uint64_t frq_base, uint64_t prx_base,
+  Status build_entry(TermPostings& tp, uint64_t frq_base, uint64_t prx_base,
                      snii::format::DictEntry* e);
   // Builds a windowed (df >= kSlimDfThreshold) entry: multi-window + two-level
   // prelude appended to the .frq/.prx PODs.
-  Status build_windowed_entry(const TermPostings& tp, uint64_t frq_base,
+  Status build_windowed_entry(TermPostings& tp, uint64_t frq_base,
                               uint64_t prx_base, snii::format::DictEntry* e);
   // Builds a slim (df < kSlimDfThreshold) entry: single window, inline or
   // pod_ref, no prelude.
-  Status build_slim_entry(const TermPostings& tp, uint64_t frq_base,
+  Status build_slim_entry(TermPostings& tp, uint64_t frq_base,
                           uint64_t prx_base, snii::format::DictEntry* e);
   // Serializes the current open block, streams its bytes into the dict scratch
   // file, and records a compact directory entry (no block bytes retained).

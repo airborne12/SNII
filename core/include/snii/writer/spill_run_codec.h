@@ -16,10 +16,10 @@ namespace snii::writer {
 // A RUN is a self-describing file holding a sequence of terms keyed by TERM-ID,
 // each followed by its postings, in this exact wire layout. The file is produced
 // and consumed by THIS module only (a private temp file -- the on-disk INDEX is
-// unaffected and stays byte-identical), so the format is chosen for cheap I/O:
-// docids stay VInt-delta (small ascending gaps), but freqs and positions are RAW
-// fixed-width little-endian u32 BLOCKS (bulk memcpy on both ends, ~10x cheaper
-// than per-value varint, which compressed those streams poorly anyway). Decode
+// unaffected), so the format is chosen for cheap I/O: docids, freqs and positions
+// are ALL RAW fixed-width little-endian u32 BLOCKS (bulk memcpy on both ends,
+// ~10x cheaper than per-value varint -- which cost ~1.5s of encode CPU over the
+// 5M build's ~60M docids and compressed those streams poorly anyway). Decode
 // still validates every length against the file size.
 //
 //   run := record*                       (term-ids ordered by vocab string,
@@ -29,9 +29,9 @@ namespace snii::writer {
 //                                          string is NOT stored -- smaller runs,
 //                                          no per-record string IO)
 //     VInt n_docs
-//     VInt docid_delta * n_docs          (first delta is docid-0, then gaps; all
-//                                          docids ascending so deltas are >= 1
-//                                          after the first, which may be 0)
+//     u32  docid   * n_docs              (RAW LE block, memcpy; ABSOLUTE ascending
+//                                          docids -- the merge concatenates across
+//                                          runs and re-deltas at index encode time)
 //     u32  freq    * n_docs              (RAW LE block, memcpy; each >= 1)
 //     VInt n_pos                         (== sum(freqs) when has_positions, else 0)
 //     u32  position * n_pos              (RAW LE block, document-order, partitioned

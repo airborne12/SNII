@@ -23,6 +23,13 @@ class ByteSink {
   const std::vector<uint8_t>& buffer() const { return buf_; }
   Slice view() const { return Slice(buf_); }
 
+  // Resets the cursor to empty while RETAINING the backing capacity, so a sink can
+  // be reused across many small encodes (e.g. per-window region/prx scratch in the
+  // windowed posting builder) without re-allocating each time -- this avoids the
+  // cumulative small-allocation churn that fragments the heap arena and inflates
+  // peak RSS during the merge of a high-df term split into thousands of windows.
+  void clear() { buf_.clear(); }
+
  private:
   std::vector<uint8_t> buf_;
 };

@@ -207,11 +207,29 @@ TermPostings SpimiTermBuffer::to_postings(std::string term, Term&& t) const {
   return tp;
 }
 
-std::vector<uint32_t> SpimiTermBuffer::sorted_ids() const {
-  std::vector<uint32_t> ids = touched_ids_;
+void SpimiTermBuffer::ensure_string_rank() const {
   const std::vector<std::string>& v = vocab();
-  std::sort(ids.begin(), ids.end(),
+  if (string_rank_.size() == v.size()) return;  // already built (or empty vocab)
+  // One full lexicographic sort of the vocabulary, amortized over every spill.
+  std::vector<uint32_t> order(v.size());
+  std::iota(order.begin(), order.end(), 0u);
+  std::sort(order.begin(), order.end(),
             [&](uint32_t a, uint32_t b) { return v[a] < v[b]; });
+  string_rank_.assign(v.size(), 0u);
+  for (uint32_t rank = 0; rank < order.size(); ++rank) {
+    string_rank_[order[rank]] = rank;
+  }
+}
+
+std::vector<uint32_t> SpimiTermBuffer::sorted_ids() const {
+  ensure_string_rank();
+  std::vector<uint32_t> ids = touched_ids_;
+  const std::vector<uint32_t>& rank = string_rank_;
+  // Integer rank compare instead of full std::string compare: equal-string ids
+  // cannot occur for a dense vocab, so a strict rank order matches the original
+  // lexicographic order exactly.
+  std::sort(ids.begin(), ids.end(),
+            [&](uint32_t a, uint32_t b) { return rank[a] < rank[b]; });
   return ids;
 }
 

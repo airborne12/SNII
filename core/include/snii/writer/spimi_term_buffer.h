@@ -185,7 +185,13 @@ class SpimiTermBuffer {
   TermPostings to_postings(std::string term, Term&& t) const;
 
   // Returns the touched term-ids sorted by their vocab string (lexicographic).
+  // Sorts by a PRECOMPUTED integer string-rank (term-id -> lexicographic rank),
+  // not by full std::string compare: a single std::string sort over the whole
+  // vocabulary is amortized across every spill, so each spill's sort is an
+  // integer compare instead of paying a fresh O(touched * strcmp) on every spill.
   std::vector<uint32_t> sorted_ids() const;
+  // Builds string_rank_ (term-id -> lexicographic rank) once, lazily. Idempotent.
+  void ensure_string_rank() const;
   // Streams the in-memory terms in sorted order, draining terms_ (the in-memory
   // single-pass path; used both by the no-spill case and to emit the final run).
   void drain_sorted(const std::function<void(TermPostings&&)>& fn);
@@ -234,6 +240,12 @@ class SpimiTermBuffer {
 
   std::vector<std::string> run_paths_;  // spilled run temp files (deleted in dtor)
   Status spill_status_;                 // first spill / range error, at finalize
+
+  // Lazily-built vocab-sized map: term-id -> its lexicographic rank among all
+  // vocab strings. Computed once (one full std::string sort of the vocabulary)
+  // on the first sorted_ids() call, then reused by every spill's id sort. mutable
+  // so the const sorted_ids() can fill it on demand.
+  mutable std::vector<uint32_t> string_rank_;
 };
 
 }  // namespace snii::writer
