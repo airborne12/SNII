@@ -7,106 +7,134 @@
 #include "snii/common/status.h"
 #include "snii/encoding/byte_sink.h"
 
-// FrqPrelude: columnar window-metadata directory that precedes windowed .frq
-// postings. These bytes belong to the .frq payload domain (see design spec
-// "window meta prelude" section): the windowed .frq payload is
-// [prelude][frq window 0][frq window 1]... and DictEntry records prelude_len so
-// a reader can range-fetch the prelude first.
+// FrqPrelude: a TWO-LEVEL (super-block -> window) skippable directory that
+// precedes a windowed .frq posting. These bytes belong to the .frq payload
+// domain (see design spec section 4): the windowed .frq payload is
+//   [prelude][frq window 0][frq window 1]...
+// and DictEntry records prelude_len so a reader can range-fetch the prelude
+// first, then range-fetch only the windows that cover candidate docids.
 //
-// On-disk layout (strict):
+// On-disk layout (strict; all multi-byte fixed fields little-endian, VInt =
+// LEB128 via snii/encoding):
 //   header:
-//     u8   ver               # format version (kFrqPreludeVersion)
-//     u8   flags             # bit0 has_freq, bit1 has_prx, bit2 reserved (super-block, unused in v1)
-//     VInt N                 # number of .frq windows
-//     VInt M                 # number of .prx windows (present ONLY when has_prx)
-//     VInt col_len[]         # byte length of each column that follows, in order
-//     u32  crc32c            # covers header + all columns (everything before this u32)
-//   columns (in order; col_len[] gives the byte length of each):
-//     B  max_freq[N]         (varint32 stream)
-//     B2 max_norm[N]         (u8 each)
-//     C  last_docid_delta[N] (varint32 stream) — per-window absolute-docid anchor info
-//     D  frq_window_len[N]   (varint32 stream) — per-window doc count; THIS is the
-//                                                doc-count source for frq_pod reads at L3
-//     E  prx_cum_off[M]      (varint64 stream) — present ONLY when has_prx
-//     H  win_crc32c[N]       (fixed32 each)
+//     u8   flags        # bit0 has_freq, bit1 has_prx
+//     VInt N            # number of .frq windows
+//     VInt G            # windows per super-block (group_size; >=1)
+//     VInt n_super      # = ceil(N / G); 0 when N==0
+//     VInt sbdir_len    # byte length of the super_block_dir region
+//     u32  crc32c       # covers header + super_block_dir (NOT the window blocks)
+//   super_block_dir[n_super]:  # small, resident: one row per super-block
+//     VInt sb_last_docid_delta # cumulative across super-blocks => absolute last
+//                              #   docid of the super-block's last window
+//     VInt sb_block_off        # byte offset of this super-block's window block,
+//                              #   measured from the start of the window_dir
+//                              #   region (i.e. relative to the byte right after
+//                              #   the trailing crc of the super_block_dir)
+//     VInt sb_block_len        # byte length of this super-block's window block
+//   window_dir: n_super self-contained blocks, each holding <=G window rows.
+//     per window row:
+//       VInt last_docid_delta  # cumulative WITHIN the block => absolute last
+//                              #   docid; the previous window's absolute last
+//                              #   docid is win_base (first window of first
+//                              #   block: win_base = 0)
+//       VInt doc_count         # number of docs in the window (frq_pod needs it)
+//       VInt frq_off           # byte offset of the window .frq payload within
+//                              #   the .frq region, relative to window_start
+//                              #   (window_start = entry.frq_off + prelude_len)
+//       VInt frq_len           # byte length of the window .frq payload
+//       VInt prx_off           # .prx payload byte offset (present iff has_prx)
+//       VInt prx_len           # .prx payload byte length (present iff has_prx)
+//       VInt max_freq          # window max term frequency (WAND block-max)
+//       u8   max_norm          # window score-max norm (WAND); 0 acceptable
+//       u32  win_crc32c        # crc32c of the window .frq payload bytes
 //
-// Column count is fixed: 5 columns when has_prx=false (B,B2,C,D,H), 6 when
-// has_prx=true (B,B2,C,D,E,H). The trailing crc32c makes any corruption
-// detectable; col_len[] lets the reader split the column region and self-check
-// against the recorded counts (mismatch => Corruption).
+// Reconstructing win_base / absolute last_docid (READER CONTRACT):
+//   The writer computes, for every window in term order, the running absolute
+//   last docid. Within a super-block's window block, each row stores the delta
+//   of its absolute last docid from the PREVIOUS window's absolute last docid
+//   (the previous window may live in the previous block; the first window of the
+//   whole term uses 0 as its previous). super_block_dir.sb_last_docid is that
+//   running value at the super-block boundary, so the reader can seed each
+//   block's cumulative sum from the previous super-block's sb_last_docid. Thus:
+//     win_base(w)      = absolute last_docid(w-1)  (0 for w==0)
+//     last_docid(w)    = win_base(w) + last_docid_delta(w)
+//   This makes super-block binary search (over sb_last_docid) followed by
+//   in-block window binary search (over last_docid) locate the window covering
+//   any docid without decoding the .frq windows.
 //
-// All multi-byte fixed-width fields are little-endian; variable-length integers
-// reuse snii/encoding (ByteSink/ByteSource). Super-block (SB) directory is out
-// of scope for v1: flags bit2 is reserved and never set.
+// The trailing crc32c only covers header + super_block_dir; every window row
+// carries its own win_crc32c, and the .frq window payload carries its own crc.
 namespace snii::format {
-
-inline constexpr uint8_t kFrqPreludeVersion = 1;
 
 namespace frq_prelude_flags {
 inline constexpr uint8_t kHasFreq = 1u << 0;
 inline constexpr uint8_t kHasPrx = 1u << 1;
-inline constexpr uint8_t kHasSb = 1u << 2;  // reserved (super-block), never set in v1
 }  // namespace frq_prelude_flags
 
-// Per-window columns supplied by the writer. All per-frq-window vectors
-// (max_freq, max_norm, last_docid_delta, frq_window_len, win_crc32c) must have
-// the same length N. prx_cum_off has length M and is written only when has_prx.
+// Absolute, decoded metadata for one window (as the reader exposes it).
+struct WindowMeta {
+  uint32_t last_docid = 0;  // absolute last docid in the window
+  uint64_t win_base = 0;    // absolute last docid of the previous window (0 for w==0)
+  uint32_t doc_count = 0;
+  uint64_t frq_off = 0;  // relative to window_start (= entry.frq_off + prelude_len)
+  uint64_t frq_len = 0;
+  uint64_t prx_off = 0;  // valid only when has_prx
+  uint64_t prx_len = 0;  // valid only when has_prx
+  uint32_t max_freq = 0;
+  uint8_t max_norm = 0;
+  uint32_t win_crc = 0;
+};
+
+// Builder input: one fully-computed WindowMeta per window, in term order, plus
+// the super-block grouping factor. The writer fills last_docid (absolute),
+// doc_count, the offsets/lens, max_freq, max_norm and win_crc; win_base is
+// derived during build (so callers may leave it 0). group_size must be >= 1.
 struct FrqPreludeColumns {
   bool has_freq = true;
   bool has_prx = false;
-  std::vector<uint32_t> max_freq;          // B  : per-window max term frequency
-  std::vector<uint8_t> max_norm;           // B2 : per-window encoded norm for BM25 upper bound
-  std::vector<uint32_t> last_docid_delta;  // C  : per-window absolute-docid anchor delta
-  std::vector<uint32_t> frq_window_len;    // D  : per-window doc count
-  std::vector<uint32_t> win_crc32c;        // H  : per-window crc32c
-  std::vector<uint64_t> prx_cum_off;       // E  : per-prx-window cumulative offset
+  uint32_t group_size = 64;  // windows per super-block (G)
+  std::vector<WindowMeta> windows;
 };
 
-// Builds the prelude bytes and appends them to sink.
-// Returns InvalidArgument when sink is null or the per-frq-window vectors have
-// inconsistent lengths (or prx_cum_off is non-empty while has_prx is false).
-Status build_frq_prelude(const FrqPreludeColumns& cols, ByteSink* sink);
+// Builds the prelude bytes and appends them to out.
+// Returns InvalidArgument when out is null, group_size is 0, or the windows are
+// not in non-decreasing last_docid order (a window's absolute last docid must be
+// >= the previous window's).
+Status build_frq_prelude(const FrqPreludeColumns& cols, ByteSink* out);
 
-// Reads and verifies a prelude buffer, then provides random access to every
-// column. The reader copies all column values into owned vectors at open time
-// (the prelude is small), so it does not retain the input Slice.
+// Reads and verifies a prelude buffer, exposing two-level skip access. The
+// reader parses the header + super_block_dir on open (verifying the trailing
+// crc) and eagerly decodes every window block into owned WindowMeta rows (the
+// prelude is small relative to the postings). It does not retain the input.
 class FrqPreludeReader {
  public:
-  // Parses the header, verifies the trailing crc32c, splits the column region by
-  // col_len[], and decodes all columns.
-  // crc mismatch / truncation / col_len inconsistency => kCorruption;
-  // unsupported version => kUnsupported.
+  // Parses + verifies the prelude. crc mismatch / truncation / inconsistent
+  // offsets-or-lengths / oversized counts => kCorruption.
   static Status open(Slice prelude, FrqPreludeReader* out);
 
-  uint32_t n_windows() const { return static_cast<uint32_t>(frq_window_len_.size()); }
-  uint32_t m_prx_windows() const { return static_cast<uint32_t>(prx_cum_off_.size()); }
+  uint32_t n_windows() const { return static_cast<uint32_t>(windows_.size()); }
+  uint32_t n_super_blocks() const { return n_super_; }
   bool has_freq() const { return has_freq_; }
   bool has_prx() const { return has_prx_; }
 
-  // Per-frq-window accessors. An index >= n_windows() returns a defensive 0.
-  uint32_t max_freq(uint32_t w) const { return at(max_freq_, w); }
-  uint8_t max_norm(uint32_t w) const { return at(max_norm_, w); }
-  uint32_t last_docid_delta(uint32_t w) const { return at(last_docid_delta_, w); }
-  uint32_t frq_window_len(uint32_t w) const { return at(frq_window_len_, w); }
-  uint32_t win_crc32c(uint32_t w) const { return at(win_crc32c_, w); }
+  // Returns the absolute WindowMeta for window w. Out-of-range => InvalidArgument.
+  Status window(uint32_t w, WindowMeta* out) const;
 
-  // Per-prx-window accessor. An index >= m_prx_windows() returns a defensive 0.
-  uint64_t prx_cum_off(uint32_t m) const { return at(prx_cum_off_, m); }
+  // Locates the window covering docid via super-block binary search then window
+  // binary search. *found=false (with OK) when docid is past the term's last
+  // docid; otherwise *w is the index of the covering window (the first window
+  // whose absolute last_docid >= docid).
+  Status locate_window(uint32_t docid, bool* found, uint32_t* w) const;
 
  private:
-  template <typename T>
-  static T at(const std::vector<T>& v, uint32_t i) {
-    return i < v.size() ? v[i] : T{};
-  }
-
   bool has_freq_ = false;
   bool has_prx_ = false;
-  std::vector<uint32_t> max_freq_;
-  std::vector<uint8_t> max_norm_;
-  std::vector<uint32_t> last_docid_delta_;
-  std::vector<uint32_t> frq_window_len_;
-  std::vector<uint32_t> win_crc32c_;
-  std::vector<uint64_t> prx_cum_off_;
+  uint32_t group_size_ = 1;
+  uint32_t n_super_ = 0;
+  // Absolute last docid at each super-block boundary (size n_super_).
+  std::vector<uint64_t> sb_last_docid_;
+  // All windows decoded with absolute fields, in term order (size N).
+  std::vector<WindowMeta> windows_;
 };
 
 }  // namespace snii::format

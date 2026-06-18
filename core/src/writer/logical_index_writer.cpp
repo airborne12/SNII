@@ -1,5 +1,6 @@
 #include "snii/writer/logical_index_writer.h"
 
+#include <algorithm>
 #include <memory>
 #include <utility>
 
@@ -24,23 +25,31 @@ using snii::format::FrqPreludeColumns;
 using snii::format::PerIndexMetaBuilder;
 using snii::format::SampledTermIndexBuilder;
 using snii::format::SectionRefs;
+using snii::format::WindowMeta;
 
 namespace {
 
 // Zstd "auto" sentinel for window builders (raw for tiny payloads).
 constexpr int kAutoZstd = -1;
+// Windows per super-block in the two-level prelude directory (design section 5).
+constexpr uint32_t kPreludeGroupSize = 64;
 
-Status MakeFrqWindow(const TermPostings& tp, std::vector<uint8_t>* out) {
+// Builds a single .frq window (docs/freqs slice) with the given win_base.
+Status MakeFrqWindow(const std::vector<uint32_t>& docids,
+                     const std::vector<uint32_t>& freqs, uint64_t win_base,
+                     std::vector<uint8_t>* out) {
   ByteSink sink;
   SNII_RETURN_IF_ERROR(snii::format::build_frq_window(
-      tp.docids, tp.freqs, /*win_base=*/0, /*has_freq=*/true, kAutoZstd, &sink));
+      docids, freqs, win_base, /*has_freq=*/true, kAutoZstd, &sink));
   *out = sink.buffer();
   return Status::OK();
 }
 
-Status MakePrxWindow(const TermPostings& tp, std::vector<uint8_t>* out) {
+// Builds a single .prx window from a slice of per-doc position lists.
+Status MakePrxWindow(const std::vector<std::vector<uint32_t>>& positions,
+                     std::vector<uint8_t>* out) {
   ByteSink sink;
-  SNII_RETURN_IF_ERROR(snii::format::build_prx_window(tp.positions, kAutoZstd, &sink));
+  SNII_RETURN_IF_ERROR(snii::format::build_prx_window(positions, kAutoZstd, &sink));
   *out = sink.buffer();
   return Status::OK();
 }
@@ -59,18 +68,14 @@ uint64_t SumOf(const std::vector<uint32_t>& v) {
   return s;
 }
 
-// Builds a single-window .frq prelude for a windowed term and returns its bytes.
-Status BuildPrelude(const TermPostings& tp, const std::vector<uint8_t>& frq_win,
-                    bool has_prx, std::vector<uint8_t>* out) {
+// Builds the two-level .frq prelude for a windowed term and returns its bytes.
+Status BuildPrelude(const std::vector<WindowMeta>& windows, bool has_prx,
+                    std::vector<uint8_t>* out) {
   FrqPreludeColumns cols;
   cols.has_freq = true;
   cols.has_prx = has_prx;
-  cols.max_freq = {MaxOf(tp.freqs)};
-  cols.max_norm = {0};
-  cols.last_docid_delta = {tp.docids.empty() ? 0u : tp.docids.back()};
-  cols.frq_window_len = {static_cast<uint32_t>(tp.docids.size())};
-  cols.win_crc32c = {snii::crc32c(Slice(frq_win))};
-  if (has_prx) cols.prx_cum_off = {0};
+  cols.group_size = kPreludeGroupSize;
+  cols.windows = windows;
   ByteSink sink;
   SNII_RETURN_IF_ERROR(snii::format::build_frq_prelude(cols, &sink));
   *out = sink.buffer();
@@ -79,6 +84,56 @@ Status BuildPrelude(const TermPostings& tp, const std::vector<uint8_t>& frq_win,
 
 void AppendBytes(std::vector<uint8_t>* dst, const std::vector<uint8_t>& src) {
   dst->insert(dst->end(), src.begin(), src.end());
+}
+
+// One windowed term's serialized windows: the concatenated frq/prx payloads and
+// the per-window metadata (offsets relative to the start of each region).
+struct WindowedPosting {
+  std::vector<uint8_t> frq_bytes;          // [win0 frq][win1 frq]...
+  std::vector<uint8_t> prx_bytes;          // [win0 prx][win1 prx]... (empty if !has_prx)
+  std::vector<WindowMeta> windows;
+};
+
+// Splits a windowed term's postings into kFrqBaseUnit-sized windows, building
+// each window's .frq (and .prx) payload and accumulating per-window metadata
+// with offsets relative to the start of the frq/prx regions (window_start).
+Status BuildWindowedPosting(const TermPostings& tp, bool has_prx,
+                            WindowedPosting* out) {
+  const uint32_t unit = snii::format::kFrqBaseUnit;
+  const size_t n = tp.docids.size();
+  uint64_t win_base = 0;  // absolute last docid of the previous window
+  for (size_t start = 0; start < n; start += unit) {
+    const size_t end = std::min(n, start + unit);
+    const std::vector<uint32_t> docs(tp.docids.begin() + start, tp.docids.begin() + end);
+    const std::vector<uint32_t> freqs(tp.freqs.begin() + start, tp.freqs.begin() + end);
+
+    std::vector<uint8_t> frq_win;
+    SNII_RETURN_IF_ERROR(MakeFrqWindow(docs, freqs, win_base, &frq_win));
+
+    WindowMeta m;
+    m.last_docid = docs.back();
+    m.win_base = win_base;
+    m.doc_count = static_cast<uint32_t>(docs.size());
+    m.frq_off = static_cast<uint64_t>(out->frq_bytes.size());
+    m.frq_len = static_cast<uint64_t>(frq_win.size());
+    m.max_freq = MaxOf(freqs);
+    m.max_norm = 0;
+    m.win_crc = snii::crc32c(Slice(frq_win));
+    AppendBytes(&out->frq_bytes, frq_win);
+
+    if (has_prx) {
+      const std::vector<std::vector<uint32_t>> pos(tp.positions.begin() + start,
+                                                   tp.positions.begin() + end);
+      std::vector<uint8_t> prx_win;
+      SNII_RETURN_IF_ERROR(MakePrxWindow(pos, &prx_win));
+      m.prx_off = static_cast<uint64_t>(out->prx_bytes.size());
+      m.prx_len = static_cast<uint64_t>(prx_win.size());
+      AppendBytes(&out->prx_bytes, prx_win);
+    }
+    out->windows.push_back(m);
+    win_base = m.last_docid;
+  }
+  return Status::OK();
 }
 
 }  // namespace
@@ -116,23 +171,45 @@ Status LogicalIndexWriter::validate() const {
   return Status::OK();
 }
 
-// Builds the DictEntry for one term. Inline entries embed their .frq/.prx bytes;
-// pod_ref entries append posting bytes to the PODs and record off_delta relative
-// to frq_base/prx_base (the POD sizes captured when the block opened).
-Status LogicalIndexWriter::build_entry(const TermPostings& tp, uint64_t frq_base,
-                                       uint64_t prx_base, DictEntry* e) {
-  e->term = tp.term;
-  e->df = static_cast<uint32_t>(tp.docids.size());
-  e->ttf_delta = SumOf(tp.freqs);  // simple: ttf stored directly as ttf_delta
-  e->max_freq = MaxOf(tp.freqs);
+// Emits a windowed term: splits into kFrqBaseUnit windows, builds a two-level
+// prelude, and lays out [prelude][win0 frq][win1 frq]... in the .frq POD and
+// [win0 prx][win1 prx]... in the .prx POD. Sets enc=windowed + has_sb.
+Status LogicalIndexWriter::build_windowed_entry(const TermPostings& tp, uint64_t frq_base,
+                                                uint64_t prx_base, DictEntry* e) {
+  WindowedPosting wp;
+  SNII_RETURN_IF_ERROR(BuildWindowedPosting(tp, has_prx_, &wp));
+  std::vector<uint8_t> prelude;
+  SNII_RETURN_IF_ERROR(BuildPrelude(wp.windows, has_prx_, &prelude));
 
+  e->kind = DictEntryKind::kPodRef;
+  e->enc = DictEntryEnc::kWindowed;
+  e->has_sb = true;  // prelude is always a two-level skip directory.
+  e->prelude_len = static_cast<uint64_t>(prelude.size());
+
+  const uint64_t frq_off = static_cast<uint64_t>(frq_pod_.size());
+  AppendBytes(&frq_pod_, prelude);
+  AppendBytes(&frq_pod_, wp.frq_bytes);
+  e->frq_off_delta = frq_off - frq_base;
+  e->frq_len = static_cast<uint64_t>(frq_pod_.size()) - frq_off;
+  if (has_prx_) {
+    const uint64_t prx_off = static_cast<uint64_t>(prx_pod_.size());
+    AppendBytes(&prx_pod_, wp.prx_bytes);
+    e->prx_off_delta = prx_off - prx_base;
+    e->prx_len = static_cast<uint64_t>(prx_pod_.size()) - prx_off;
+  }
+  return Status::OK();
+}
+
+// Emits a slim term as a single .frq window (win_base=0): inline when the
+// encoded bytes are tiny, otherwise a slim pod_ref (no prelude).
+Status LogicalIndexWriter::build_slim_entry(const TermPostings& tp, uint64_t frq_base,
+                                            uint64_t prx_base, DictEntry* e) {
   std::vector<uint8_t> frq_win;
-  SNII_RETURN_IF_ERROR(MakeFrqWindow(tp, &frq_win));
+  SNII_RETURN_IF_ERROR(MakeFrqWindow(tp.docids, tp.freqs, /*win_base=*/0, &frq_win));
   std::vector<uint8_t> prx_win;
-  if (has_prx_) SNII_RETURN_IF_ERROR(MakePrxWindow(tp, &prx_win));
+  if (has_prx_) SNII_RETURN_IF_ERROR(MakePrxWindow(tp.positions, &prx_win));
 
-  const bool windowed = e->df >= snii::format::kSlimDfThreshold;
-  if (!windowed && frq_win.size() <= snii::format::kDefaultInlineThreshold) {
+  if (frq_win.size() <= snii::format::kDefaultInlineThreshold) {
     e->kind = DictEntryKind::kInline;
     e->enc = DictEntryEnc::kSlim;
     e->frq_bytes = std::move(frq_win);
@@ -141,14 +218,8 @@ Status LogicalIndexWriter::build_entry(const TermPostings& tp, uint64_t frq_base
   }
 
   e->kind = DictEntryKind::kPodRef;
-  e->enc = windowed ? DictEntryEnc::kWindowed : DictEntryEnc::kSlim;
+  e->enc = DictEntryEnc::kSlim;
   const uint64_t frq_off = static_cast<uint64_t>(frq_pod_.size());
-  if (windowed) {
-    std::vector<uint8_t> prelude;
-    SNII_RETURN_IF_ERROR(BuildPrelude(tp, frq_win, has_prx_, &prelude));
-    e->prelude_len = static_cast<uint64_t>(prelude.size());
-    AppendBytes(&frq_pod_, prelude);
-  }
   AppendBytes(&frq_pod_, frq_win);
   e->frq_off_delta = frq_off - frq_base;
   e->frq_len = static_cast<uint64_t>(frq_pod_.size()) - frq_off;
@@ -159,6 +230,22 @@ Status LogicalIndexWriter::build_entry(const TermPostings& tp, uint64_t frq_base
     e->prx_len = static_cast<uint64_t>(prx_pod_.size()) - prx_off;
   }
   return Status::OK();
+}
+
+// Builds the DictEntry for one term. Inline entries embed their .frq/.prx bytes;
+// pod_ref entries append posting bytes to the PODs and record off_delta relative
+// to frq_base/prx_base (the POD sizes captured when the block opened).
+Status LogicalIndexWriter::build_entry(const TermPostings& tp, uint64_t frq_base,
+                                       uint64_t prx_base, DictEntry* e) {
+  e->term = tp.term;
+  e->df = static_cast<uint32_t>(tp.docids.size());
+  e->ttf_delta = SumOf(tp.freqs);  // simple: ttf stored directly as ttf_delta
+  e->max_freq = MaxOf(tp.freqs);
+
+  if (e->df >= snii::format::kSlimDfThreshold) {
+    return build_windowed_entry(tp, frq_base, prx_base, e);
+  }
+  return build_slim_entry(tp, frq_base, prx_base, e);
 }
 
 void LogicalIndexWriter::flush_block(DictBlockBuilder* block, std::string first_term) {

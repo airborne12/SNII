@@ -14,6 +14,7 @@
 #include "snii/format/frq_pod.h"
 #include "snii/format/frq_prelude.h"
 #include "snii/io/batch_range_fetcher.h"
+#include "snii/reader/windowed_posting.h"
 
 namespace snii::query {
 
@@ -21,6 +22,7 @@ using snii::format::DictEntry;
 using snii::format::DictEntryEnc;
 using snii::format::DictEntryKind;
 using snii::format::FrqPreludeReader;
+using snii::format::WindowMeta;
 using snii::reader::LogicalIndexReader;
 
 namespace {
@@ -53,10 +55,11 @@ uint32_t CurrentDoc(const TermCursor& c) {
                                    : std::numeric_limits<uint32_t>::max();
 }
 
-// Reads one .frq window's bytes (prelude stripped) for a pod_ref/inline entry.
-Status FetchWindowBytes(const LogicalIndexReader& idx, const DictEntry& entry,
-                        uint64_t frq_base, std::vector<uint8_t>* window_owned,
-                        Slice* window) {
+// Reads one slim .frq window's bytes for a slim pod_ref/inline entry (prelude
+// stripped). Windowed entries are handled separately via the prelude decode.
+Status FetchSlimWindowBytes(const LogicalIndexReader& idx, const DictEntry& entry,
+                            uint64_t frq_base, std::vector<uint8_t>* window_owned,
+                            Slice* window) {
   if (entry.kind == DictEntryKind::kInline) {
     *window = Slice(entry.frq_bytes);
     return Status::OK();
@@ -85,27 +88,25 @@ Status FetchPrelude(const LogicalIndexReader& idx, const DictEntry& entry,
   return FrqPreludeReader::open(fetcher.get(h), out);
 }
 
-// Builds per-window block-max bounds from a windowed entry's prelude. Falls back
-// to block_max=false windows when the prelude is unusable.
-void BuildWindowBounds(const FrqPreludeReader& prelude, const ScorerContext& ctx,
-                       double avgdl, const Bm25Params& params,
-                       const std::vector<TermPosting>& postings,
-                       std::vector<WindowBound>* windows) {
+// Builds per-window block-max bounds from a windowed entry's prelude. Each
+// WindowMeta carries the window's max_freq / max_norm and its covered docid
+// range (win_base+1 .. last_docid), so bounds come straight from the directory.
+Status BuildWindowBounds(const FrqPreludeReader& prelude, const ScorerContext& ctx,
+                         double avgdl, const Bm25Params& params,
+                         std::vector<WindowBound>* windows) {
   const uint32_t n = prelude.n_windows();
-  size_t idx = 0;
   for (uint32_t w = 0; w < n; ++w) {
-    const uint32_t len = prelude.frq_window_len(w);
-    if (len == 0 || idx >= postings.size()) continue;
-    const size_t end = std::min(postings.size(), idx + len);
+    WindowMeta m;
+    SNII_RETURN_IF_ERROR(prelude.window(w, &m));
+    if (m.doc_count == 0) continue;
     WindowBound wb;
-    wb.first_docid = postings[idx].docid;
-    wb.last_docid = postings[end - 1].docid;
-    wb.max_score = ctx.max_score(prelude.max_freq(w), prelude.max_norm(w), avgdl,
-                                 params);
+    wb.first_docid = static_cast<uint32_t>(m.win_base) + (w == 0 ? 0u : 1u);
+    wb.last_docid = m.last_docid;
+    wb.max_score = ctx.max_score(m.max_freq, m.max_norm, avgdl, params);
     wb.block_max = true;
     windows->push_back(wb);
-    idx = end;
   }
+  return Status::OK();
 }
 
 // Fallback single window covering all postings, bounded by the exact max score
@@ -121,15 +122,12 @@ void SingleWindowFallback(const std::vector<TermPosting>& postings,
   windows->push_back(wb);
 }
 
-// Decodes (docid, freq) postings and computes exact per-doc BM25 scores.
-Status ScorePostings(const snii::stats::SniiStatsProvider& stats,
-                     const ScorerContext& ctx, const Bm25Params& params,
-                     Slice window, std::vector<TermPosting>* out) {
-  ByteSource src(window);
-  std::vector<uint32_t> docids;
-  std::vector<uint32_t> freqs;
-  SNII_RETURN_IF_ERROR(
-      snii::format::read_frq_window(&src, /*win_base=*/0, &docids, &freqs));
+// Computes exact per-doc BM25 scores from decoded (docid, freq) vectors.
+Status ScoreDecoded(const snii::stats::SniiStatsProvider& stats,
+                    const ScorerContext& ctx, const Bm25Params& params,
+                    const std::vector<uint32_t>& docids,
+                    const std::vector<uint32_t>& freqs,
+                    std::vector<TermPosting>* out) {
   const double avgdl = stats.avgdl();
   out->reserve(docids.size());
   for (size_t i = 0; i < docids.size(); ++i) {
@@ -137,6 +135,37 @@ Status ScorePostings(const snii::stats::SniiStatsProvider& stats,
     SNII_RETURN_IF_ERROR(stats.encoded_norm(docids[i], &norm));
     const uint32_t tf = i < freqs.size() ? freqs[i] : 1;
     out->push_back({docids[i], ctx.score(tf, norm, avgdl, params)});
+  }
+  return Status::OK();
+}
+
+// Decodes a slim/inline term's single .frq window into docids/freqs.
+Status DecodeSlim(const LogicalIndexReader& idx, const DictEntry& entry,
+                  uint64_t frq_base, std::vector<uint32_t>* docids,
+                  std::vector<uint32_t>* freqs) {
+  std::vector<uint8_t> owned;
+  Slice window;
+  SNII_RETURN_IF_ERROR(FetchSlimWindowBytes(idx, entry, frq_base, &owned, &window));
+  ByteSource src(window);
+  return snii::format::read_frq_window(&src, /*win_base=*/0, docids, freqs);
+}
+
+// Builds the cursor for a windowed term: tiles all windows for exact scores and
+// reads the prelude once for true per-window block-max bounds.
+Status BuildWindowedCursor(const LogicalIndexReader& idx,
+                           const snii::stats::SniiStatsProvider& stats,
+                           const ScorerContext& ctx, const DictEntry& entry,
+                           uint64_t frq_base, uint64_t prx_base,
+                           const Bm25Params& params, TermCursor* cursor) {
+  snii::reader::DecodedPosting posting;
+  SNII_RETURN_IF_ERROR(snii::reader::read_windowed_posting(
+      idx, entry, frq_base, prx_base, /*want_positions=*/false, &posting));
+  SNII_RETURN_IF_ERROR(ScoreDecoded(stats, ctx, params, posting.docids,
+                                    posting.freqs, &cursor->postings));
+  FrqPreludeReader prelude;
+  if (FetchPrelude(idx, entry, frq_base, &prelude).ok()) {
+    SNII_RETURN_IF_ERROR(BuildWindowBounds(prelude, ctx, stats.avgdl(), params,
+                                           &cursor->windows));
   }
   return Status::OK();
 }
@@ -155,21 +184,17 @@ Status BuildCursor(const LogicalIndexReader& idx,
   const ScorerContext ctx =
       ScorerContext::make(stats.indexed_doc_count(), entry.df);
 
-  std::vector<uint8_t> owned;
-  Slice window;
-  SNII_RETURN_IF_ERROR(FetchWindowBytes(idx, entry, frq_base, &owned, &window));
-  SNII_RETURN_IF_ERROR(
-      ScorePostings(stats, ctx, params, window, &cursor->postings));
-
   const bool windowed = entry.kind == DictEntryKind::kPodRef &&
-                        entry.enc == DictEntryEnc::kWindowed &&
-                        entry.prelude_len > 0;
+                        entry.enc == DictEntryEnc::kWindowed;
   if (windowed) {
-    FrqPreludeReader prelude;
-    if (FetchPrelude(idx, entry, frq_base, &prelude).ok()) {
-      BuildWindowBounds(prelude, ctx, stats.avgdl(), params, cursor->postings,
-                        &cursor->windows);
-    }
+    SNII_RETURN_IF_ERROR(BuildWindowedCursor(idx, stats, ctx, entry, frq_base,
+                                             prx_base, params, cursor));
+  } else {
+    std::vector<uint32_t> docids;
+    std::vector<uint32_t> freqs;
+    SNII_RETURN_IF_ERROR(DecodeSlim(idx, entry, frq_base, &docids, &freqs));
+    SNII_RETURN_IF_ERROR(
+        ScoreDecoded(stats, ctx, params, docids, freqs, &cursor->postings));
   }
   if (cursor->windows.empty()) {
     SingleWindowFallback(cursor->postings, &cursor->windows);

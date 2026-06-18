@@ -111,6 +111,14 @@ class LogicalIndexWriter {
   // Builds one DictEntry (inline or pod_ref), growing the PODs as needed.
   Status build_entry(const TermPostings& tp, uint64_t frq_base, uint64_t prx_base,
                      snii::format::DictEntry* e);
+  // Builds a windowed (df >= kSlimDfThreshold) entry: multi-window + two-level
+  // prelude appended to the .frq/.prx PODs.
+  Status build_windowed_entry(const TermPostings& tp, uint64_t frq_base,
+                              uint64_t prx_base, snii::format::DictEntry* e);
+  // Builds a slim (df < kSlimDfThreshold) entry: single window, inline or
+  // pod_ref, no prelude.
+  Status build_slim_entry(const TermPostings& tp, uint64_t frq_base,
+                          uint64_t prx_base, snii::format::DictEntry* e);
   // Serializes the current open block into a finished BlockOut.
   void flush_block(snii::format::DictBlockBuilder* block, std::string first_term);
 

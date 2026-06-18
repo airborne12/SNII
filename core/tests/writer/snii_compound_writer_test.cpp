@@ -16,6 +16,7 @@
 #include "snii/format/dict_entry.h"
 #include "snii/format/format_constants.h"
 #include "snii/format/frq_pod.h"
+#include "snii/format/frq_prelude.h"
 #include "snii/format/per_index_meta.h"
 #include "snii/format/prx_pod.h"
 #include "snii/format/sampled_term_index.h"
@@ -23,6 +24,11 @@
 #include "snii/format/tail_pointer.h"
 #include "snii/format/xfilter.h"
 #include "snii/io/local_file.h"
+#include "snii/io/metered_file_reader.h"
+#include "snii/query/phrase_query.h"
+#include "snii/query/term_query.h"
+#include "snii/reader/logical_index_reader.h"
+#include "snii/reader/snii_segment_reader.h"
 #include "snii/writer/logical_index_writer.h"
 
 using namespace snii;
@@ -225,15 +231,29 @@ TEST(SniiCompoundWriter, ReadBackSelfValidation) {
     DictBlockReader br;
     ASSERT_TRUE(DictBlockReader::open(block, IndexTier::kT2, true, &br).ok());
 
-    // Absolute .frq offset = frq_pod.offset + frq_base + frq_off_delta.
-    // Windowed payload = [prelude][window]; skip prelude_len to reach the window.
+    // Absolute .frq offset = frq_pod.offset + frq_base + frq_off_delta. The
+    // windowed payload is [prelude][win0 frq][win1 frq]...; parse the two-level
+    // prelude, then tile every window (each decoded with its prelude win_base)
+    // to reconstruct the full posting.
     uint64_t frq_abs = refs.frq_pod.offset + br.frq_base() + common_entry.frq_off_delta;
-    uint64_t win_abs = frq_abs + common_entry.prelude_len;
-    Slice frq_win(file.data() + win_abs,
-                  common_entry.frq_len - common_entry.prelude_len);
-    ByteSource fsrc(frq_win);
+    Slice prelude_bytes(file.data() + frq_abs, common_entry.prelude_len);
+    FrqPreludeReader prelude;
+    ASSERT_TRUE(FrqPreludeReader::open(prelude_bytes, &prelude).ok());
+    const uint64_t window_start = frq_abs + common_entry.prelude_len;
     std::vector<uint32_t> got_docs;
-    ASSERT_TRUE(read_frq_window_docs(&fsrc, 0, &got_docs).ok());
+    uint32_t summed = 0;
+    for (uint32_t w = 0; w < prelude.n_windows(); ++w) {
+      WindowMeta m;
+      ASSERT_TRUE(prelude.window(w, &m).ok());
+      Slice win(file.data() + window_start + m.frq_off, m.frq_len);
+      ByteSource fsrc(win);
+      std::vector<uint32_t> wdocs;
+      ASSERT_TRUE(read_frq_window_docs(&fsrc, m.win_base, &wdocs).ok());
+      ASSERT_EQ(wdocs.size(), m.doc_count);
+      summed += m.doc_count;
+      got_docs.insert(got_docs.end(), wdocs.begin(), wdocs.end());
+    }
+    EXPECT_EQ(summed, 600u);  // window doc_counts sum to df.
     ASSERT_EQ(got_docs.size(), 600u);
     EXPECT_EQ(got_docs.front(), 0u);
     EXPECT_EQ(got_docs.back(), 599u);
@@ -264,6 +284,175 @@ TEST(SniiCompoundWriter, ReadBackSelfValidation) {
         LocateEntry(file, meta, "zzz-not-here", &found_absent, &absent_entry).ok());
     EXPECT_FALSE(found_absent);
   }
+
+  std::remove(path.c_str());
+}
+
+namespace {
+
+// Oracle for the multi-super-block read-back test. "hot" is a very high-df term
+// (df=20000 -> ~79 windows of 256 -> >1 super-block at group_size=64). "spark"
+// appears at position 1 immediately after "hot" in docs where d % 9 == 0, so the
+// phrase "hot spark" holds exactly in those docs. "rare" is a tiny low-df term.
+struct BigCorpus {
+  uint32_t doc_count = 20000;
+  std::vector<uint32_t> hot_docs;     // every doc
+  std::vector<uint32_t> spark_docs;   // d % 9 == 0
+  std::vector<uint32_t> rare_docs = {3, 17, 99, 1000, 19999};
+  std::vector<uint32_t> phrase_oracle;  // docs where "hot spark" is consecutive
+};
+
+BigCorpus MakeBigCorpus() {
+  BigCorpus c;
+  for (uint32_t d = 0; d < c.doc_count; ++d) {
+    c.hot_docs.push_back(d);
+    if (d % 9 == 0) {
+      c.spark_docs.push_back(d);
+      c.phrase_oracle.push_back(d);  // "hot"@0 then "spark"@1 -> phrase hit
+    }
+  }
+  return c;
+}
+
+// Builds a TermPostings with all freq=1 and a single position per doc.
+TermPostings MakePosTerm(const std::string& term, const std::vector<uint32_t>& docs,
+                         uint32_t pos) {
+  TermPostings tp;
+  tp.term = term;
+  tp.docids = docs;
+  tp.freqs.assign(docs.size(), 1);
+  tp.positions.resize(docs.size());
+  for (size_t i = 0; i < docs.size(); ++i) tp.positions[i].push_back(pos);
+  return tp;
+}
+
+SniiIndexInput MakeBigIndex(const BigCorpus& c) {
+  SniiIndexInput in;
+  in.index_id = 1;
+  in.index_suffix = "body";
+  in.config = IndexConfig::kDocsPositions;
+  in.doc_count = c.doc_count;
+  // One DICT block per term so every term is a block first-term (covered by the
+  // sampled-term index regardless of order), mirroring the other read tests.
+  in.target_dict_block_bytes = 1;
+  // Terms must be lexicographically sorted.
+  in.terms.push_back(MakePosTerm("hot", c.hot_docs, /*pos=*/0));    // huge -> windowed
+  in.terms.push_back(MakePosTerm("rare", c.rare_docs, /*pos=*/0));  // tiny -> inline
+  in.terms.push_back(MakePosTerm("spark", c.spark_docs, /*pos=*/1));  // -> windowed
+  return in;
+}
+
+}  // namespace
+
+// PHASE A read-back self-validation: a high-df term spanning MANY windows across
+// MULTIPLE super-blocks. Asserts (a) sum of window doc_counts == df, (b) the
+// windows tile the posting in order, (c) locate_window resolves the covering
+// window, and (d) term_query / phrase_query agree with the oracle.
+TEST(SniiCompoundWriter, MultiSuperBlockReadBack) {
+  const BigCorpus c = MakeBigCorpus();
+  const std::string path = TempPath();
+  {
+    io::LocalFileWriter w;
+    ASSERT_TRUE(w.open(path).ok());
+    SniiCompoundWriter cw(&w);
+    ASSERT_TRUE(cw.add_logical_index(MakeBigIndex(c)).ok());
+    ASSERT_TRUE(cw.finish().ok());
+  }
+
+  io::LocalFileReader local;
+  ASSERT_TRUE(local.open(path).ok());
+  io::MeteredFileReader metered(&local);
+  reader::SniiSegmentReader seg;
+  ASSERT_TRUE(reader::SniiSegmentReader::open(&metered, &seg).ok());
+  reader::LogicalIndexReader idx;
+  ASSERT_TRUE(seg.open_index(1, "body", &idx).ok());
+
+  // Resolve "hot" to its DictEntry + the block's frq_base.
+  bool found = false;
+  DictEntry hot;
+  uint64_t frq_base = 0, prx_base = 0;
+  ASSERT_TRUE(idx.lookup("hot", &found, &hot, &frq_base, &prx_base).ok());
+  ASSERT_TRUE(found);
+  EXPECT_EQ(hot.df, c.doc_count);
+  EXPECT_EQ(hot.enc, DictEntryEnc::kWindowed);
+  EXPECT_TRUE(hot.has_sb);
+
+  // Fetch + parse the two-level prelude.
+  const uint64_t prelude_abs =
+      idx.section_refs().frq_pod.offset + frq_base + hot.frq_off_delta;
+  std::vector<uint8_t> prelude_bytes;
+  ASSERT_TRUE(local.read_at(prelude_abs, hot.prelude_len, &prelude_bytes).ok());
+  FrqPreludeReader prelude;
+  ASSERT_TRUE(FrqPreludeReader::open(Slice(prelude_bytes), &prelude).ok());
+  EXPECT_GT(prelude.n_super_blocks(), 1u) << "expected >1 super-block";
+
+  // (a)+(b): tile every window via the prelude; doc_counts sum to df and the
+  // concatenated docids equal the full ascending posting [0, doc_count).
+  const uint64_t window_start = prelude_abs + hot.prelude_len;
+  std::vector<uint32_t> tiled;
+  uint64_t summed = 0;
+  uint64_t expect_win_base = 0;
+  for (uint32_t w = 0; w < prelude.n_windows(); ++w) {
+    WindowMeta m;
+    ASSERT_TRUE(prelude.window(w, &m).ok());
+    EXPECT_EQ(m.win_base, expect_win_base) << "win_base w=" << w;
+    std::vector<uint8_t> wbytes;
+    ASSERT_TRUE(local.read_at(window_start + m.frq_off, m.frq_len, &wbytes).ok());
+    Slice wslice(wbytes);
+    ByteSource fsrc(wslice);
+    std::vector<uint32_t> wdocs;
+    ASSERT_TRUE(read_frq_window_docs(&fsrc, m.win_base, &wdocs).ok());
+    ASSERT_EQ(wdocs.size(), m.doc_count) << "w=" << w;
+    summed += m.doc_count;
+    expect_win_base = m.last_docid;
+    tiled.insert(tiled.end(), wdocs.begin(), wdocs.end());
+  }
+  EXPECT_EQ(summed, c.doc_count);
+  ASSERT_EQ(tiled.size(), c.doc_count);
+  EXPECT_EQ(tiled, c.hot_docs);
+
+  // (c): locate_window returns the window actually containing the docid.
+  const uint32_t probes[] = {0, 255, 256, 257, 5000, 16383, 16384, 19999};
+  for (uint32_t docid : probes) {
+    bool lfound = false;
+    uint32_t w = 0;
+    ASSERT_TRUE(prelude.locate_window(docid, &lfound, &w).ok());
+    ASSERT_TRUE(lfound) << "docid=" << docid;
+    WindowMeta m;
+    ASSERT_TRUE(prelude.window(w, &m).ok());
+    EXPECT_GE(static_cast<uint64_t>(docid), m.win_base + (w == 0 ? 0 : 1))
+        << "docid=" << docid;
+    EXPECT_LE(docid, m.last_docid) << "docid=" << docid;
+  }
+  // past-end -> not found.
+  {
+    bool lfound = true;
+    uint32_t w = 0;
+    ASSERT_TRUE(prelude.locate_window(c.doc_count, &lfound, &w).ok());
+    EXPECT_FALSE(lfound);
+  }
+
+  // (d): term_query / phrase_query agree with the oracle (full-read path).
+  std::vector<uint32_t> hot_docs;
+  ASSERT_TRUE(query::term_query(idx, "hot", &hot_docs).ok());
+  EXPECT_EQ(hot_docs, c.hot_docs);
+
+  std::vector<uint32_t> spark_docs;
+  ASSERT_TRUE(query::term_query(idx, "spark", &spark_docs).ok());
+  EXPECT_EQ(spark_docs, c.spark_docs);
+
+  std::vector<uint32_t> rare_docs;
+  ASSERT_TRUE(query::term_query(idx, "rare", &rare_docs).ok());
+  EXPECT_EQ(rare_docs, c.rare_docs);
+
+  std::vector<uint32_t> phrase_docs;
+  ASSERT_TRUE(query::phrase_query(idx, {"hot", "spark"}, &phrase_docs).ok());
+  EXPECT_EQ(phrase_docs, c.phrase_oracle);
+
+  // reversed phrase must be absent ("spark"@1 never precedes "hot"@0).
+  std::vector<uint32_t> reversed;
+  ASSERT_TRUE(query::phrase_query(idx, {"spark", "hot"}, &reversed).ok());
+  EXPECT_TRUE(reversed.empty());
 
   std::remove(path.c_str());
 }

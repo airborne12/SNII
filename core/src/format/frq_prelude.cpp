@@ -1,5 +1,6 @@
 #include "snii/format/frq_prelude.h"
 
+#include <algorithm>
 #include <cstddef>
 
 #include "snii/encoding/byte_source.h"
@@ -9,65 +10,12 @@ namespace snii::format {
 
 namespace {
 
-// Encodes a varint32 column into its own sink.
-void encode_varint32_column(const std::vector<uint32_t>& values, ByteSink* out) {
-  for (uint32_t v : values) {
-    out->put_varint32(v);
-  }
-}
+// Anti-DoS: a segment holds at most ~15M docs (>=1 doc/window), so 1<<24
+// windows is a generous ceiling that still prevents multi-GB allocations from a
+// crafted N. (crc32c is not a MAC and cannot defend a re-stamped inflated count.)
+constexpr uint64_t kMaxWindows = 1ull << 24;
 
-// Validates that every per-frq-window vector shares length N and that prx data
-// is only present when has_prx is set.
-Status validate_columns(const FrqPreludeColumns& cols) {
-  const size_t n = cols.max_freq.size();
-  const bool consistent = cols.max_norm.size() == n &&
-                          cols.last_docid_delta.size() == n &&
-                          cols.frq_window_len.size() == n &&
-                          cols.win_crc32c.size() == n;
-  if (!consistent) {
-    return Status::InvalidArgument("frq_prelude: per-window column length mismatch");
-  }
-  if (!cols.has_prx && !cols.prx_cum_off.empty()) {
-    return Status::InvalidArgument("frq_prelude: prx_cum_off set while has_prx is false");
-  }
-  return Status::OK();
-}
-
-// Serializes the six (or five) columns, each into its own buffer, in spec order.
-// E is appended only when has_prx; the result preserves writing order so col_len[]
-// aligns with the on-disk column region.
-std::vector<ByteSink> encode_columns(const FrqPreludeColumns& cols) {
-  std::vector<ByteSink> columns;
-  columns.reserve(6);
-  auto push = [&columns](ByteSink&& s) { columns.emplace_back(std::move(s)); };
-
-  ByteSink b;
-  encode_varint32_column(cols.max_freq, &b);
-  push(std::move(b));
-
-  ByteSink b2;
-  for (uint8_t v : cols.max_norm) b2.put_u8(v);
-  push(std::move(b2));
-
-  ByteSink c;
-  encode_varint32_column(cols.last_docid_delta, &c);
-  push(std::move(c));
-
-  ByteSink d;
-  encode_varint32_column(cols.frq_window_len, &d);
-  push(std::move(d));
-
-  if (cols.has_prx) {
-    ByteSink e;
-    for (uint64_t v : cols.prx_cum_off) e.put_varint64(v);
-    push(std::move(e));
-  }
-
-  ByteSink h;
-  for (uint32_t v : cols.win_crc32c) h.put_fixed32(v);
-  push(std::move(h));
-  return columns;
-}
+uint64_t ceil_div(uint64_t a, uint64_t b) { return (a + b - 1) / b; }
 
 uint8_t make_flags(const FrqPreludeColumns& cols) {
   uint8_t flags = 0;
@@ -76,67 +24,125 @@ uint8_t make_flags(const FrqPreludeColumns& cols) {
   return flags;
 }
 
-// Writes the header (ver, flags, N, [M], col_len[]) into header_sink.
-void encode_header(const FrqPreludeColumns& cols, const std::vector<ByteSink>& columns,
-                   ByteSink* header_sink) {
-  header_sink->put_u8(kFrqPreludeVersion);
-  header_sink->put_u8(make_flags(cols));
-  header_sink->put_varint64(cols.max_freq.size());
-  if (cols.has_prx) {
-    header_sink->put_varint64(cols.prx_cum_off.size());
+// Validates builder input: non-null sink, group_size>=1, sane count, and
+// non-decreasing absolute last_docid across windows.
+Status validate_input(const FrqPreludeColumns& cols, ByteSink* out) {
+  if (out == nullptr) return Status::InvalidArgument("frq_prelude: null sink");
+  if (cols.group_size == 0) {
+    return Status::InvalidArgument("frq_prelude: group_size must be >= 1");
   }
-  for (const ByteSink& col : columns) {
-    header_sink->put_varint64(col.size());
+  if (cols.windows.size() > kMaxWindows) {
+    return Status::InvalidArgument("frq_prelude: window count exceeds cap");
   }
-}
-
-// Decoded header fields shared between the parse and column-decode phases.
-struct Header {
-  uint8_t ver = 0;
-  bool has_freq = false;
-  bool has_prx = false;
-  uint64_t n = 0;
-  uint64_t m = 0;
-  std::vector<uint64_t> col_len;  // 5 entries (no prx) or 6 entries (with prx)
-};
-
-size_t expected_column_count(bool has_prx) { return has_prx ? 6 : 5; }
-
-Status parse_header(ByteSource* src, Header* h) {
-  SNII_RETURN_IF_ERROR(src->get_u8(&h->ver));
-  if (h->ver != kFrqPreludeVersion) {
-    return Status::Unsupported("frq_prelude: unsupported version");
-  }
-  uint8_t flags = 0;
-  SNII_RETURN_IF_ERROR(src->get_u8(&flags));
-  h->has_freq = (flags & frq_prelude_flags::kHasFreq) != 0;
-  h->has_prx = (flags & frq_prelude_flags::kHasPrx) != 0;
-  SNII_RETURN_IF_ERROR(src->get_varint64(&h->n));
-  if (h->has_prx) {
-    SNII_RETURN_IF_ERROR(src->get_varint64(&h->m));
-  }
-  // Anti-DoS: cap window counts from untrusted bytes before any reserve(count).
-  // A segment holds at most ~15M docs (>=1 doc/window), so 1<<24 windows is a
-  // generous ceiling that still prevents multi-GB allocations on a crafted N/M.
-  // (crc32c is not a MAC and cannot defend against a re-stamped inflated count.)
-  constexpr uint64_t kMaxWindows = 1ull << 24;
-  if (h->n > kMaxWindows || h->m > kMaxWindows) {
-    return Status::Corruption("frq_prelude: window count exceeds sane cap");
-  }
-  const size_t cols = expected_column_count(h->has_prx);
-  h->col_len.resize(cols);
-  for (size_t i = 0; i < cols; ++i) {
-    SNII_RETURN_IF_ERROR(src->get_varint64(&h->col_len[i]));
+  for (size_t w = 1; w < cols.windows.size(); ++w) {
+    if (cols.windows[w].last_docid < cols.windows[w - 1].last_docid) {
+      return Status::InvalidArgument("frq_prelude: last_docid not monotonic");
+    }
   }
   return Status::OK();
 }
 
-// Verifies the trailing crc32c covering everything before the final fixed32.
-Status verify_crc(Slice prelude) {
-  if (prelude.size() < sizeof(uint32_t)) {
-    return Status::Corruption("frq_prelude: buffer too short for crc");
+// Encodes one window row into a per-block sink. last_docid_delta is the row's
+// absolute last_docid minus prev_last (the previous window's absolute last).
+void encode_window_row(const WindowMeta& m, bool has_prx, uint64_t prev_last,
+                       ByteSink* block) {
+  block->put_varint64(static_cast<uint64_t>(m.last_docid) - prev_last);
+  block->put_varint64(m.doc_count);
+  block->put_varint64(m.frq_off);
+  block->put_varint64(m.frq_len);
+  if (has_prx) {
+    block->put_varint64(m.prx_off);
+    block->put_varint64(m.prx_len);
   }
-  const size_t covered = prelude.size() - sizeof(uint32_t);
+  block->put_varint64(m.max_freq);
+  block->put_u8(m.max_norm);
+  block->put_fixed32(m.win_crc);
+}
+
+// One super-block's serialized window block plus its directory fields.
+struct SuperBlock {
+  ByteSink block;
+  uint64_t last_docid = 0;  // absolute last docid of this super-block's last window
+};
+
+// Builds every super-block's window block (row-encoded) and records the running
+// absolute last docid at each super-block boundary.
+std::vector<SuperBlock> encode_super_blocks(const FrqPreludeColumns& cols) {
+  const uint32_t g = cols.group_size;
+  const size_t n = cols.windows.size();
+  std::vector<SuperBlock> blocks;
+  blocks.reserve(static_cast<size_t>(ceil_div(n, g)));
+  uint64_t prev_last = 0;  // previous window's absolute last docid (chains across blocks)
+  for (size_t start = 0; start < n; start += g) {
+    const size_t end = std::min(n, start + g);
+    SuperBlock sb;
+    for (size_t w = start; w < end; ++w) {
+      encode_window_row(cols.windows[w], cols.has_prx, prev_last, &sb.block);
+      prev_last = cols.windows[w].last_docid;
+    }
+    sb.last_docid = prev_last;
+    blocks.push_back(std::move(sb));
+  }
+  return blocks;
+}
+
+// Serializes the super_block_dir (one row per super-block) into dir_sink, using
+// each block's byte length to compute its offset within the window_dir region.
+void encode_super_block_dir(const std::vector<SuperBlock>& blocks, ByteSink* dir_sink) {
+  uint64_t prev_last = 0;
+  uint64_t block_off = 0;
+  for (const SuperBlock& sb : blocks) {
+    dir_sink->put_varint64(sb.last_docid - prev_last);
+    dir_sink->put_varint64(block_off);
+    dir_sink->put_varint64(sb.block.size());
+    prev_last = sb.last_docid;
+    block_off += sb.block.size();
+  }
+}
+
+}  // namespace
+
+Status build_frq_prelude(const FrqPreludeColumns& cols, ByteSink* out) {
+  SNII_RETURN_IF_ERROR(validate_input(cols, out));
+
+  const std::vector<SuperBlock> blocks = encode_super_blocks(cols);
+  ByteSink dir_sink;
+  encode_super_block_dir(blocks, &dir_sink);
+
+  // covered = header + super_block_dir (the crc covers exactly this region).
+  ByteSink covered;
+  covered.put_u8(make_flags(cols));
+  covered.put_varint64(cols.windows.size());
+  covered.put_varint64(cols.group_size);
+  covered.put_varint64(blocks.size());
+  covered.put_varint64(dir_sink.size());
+  covered.put_bytes(dir_sink.view());
+
+  out->put_bytes(covered.view());
+  out->put_fixed32(crc32c(covered.view()));
+  for (const SuperBlock& sb : blocks) out->put_bytes(sb.block.view());
+  return Status::OK();
+}
+
+namespace {
+
+// Decoded header fields shared between parse phases.
+struct Header {
+  bool has_freq = false;
+  bool has_prx = false;
+  uint64_t n = 0;
+  uint64_t group_size = 0;
+  uint64_t n_super = 0;
+  uint64_t sbdir_len = 0;
+};
+
+// Verifies the trailing crc covers [start of buffer .. end of super_block_dir].
+// covered_len = header bytes (up to and including sbdir_len) + sbdir_len.
+Status verify_covered_crc(Slice prelude, size_t header_end, uint64_t sbdir_len) {
+  const size_t covered = header_end + static_cast<size_t>(sbdir_len);
+  if (covered + sizeof(uint32_t) > prelude.size()) {
+    return Status::Corruption("frq_prelude: buffer too short for crc region");
+  }
   uint32_t stored = 0;
   ByteSource crc_src(prelude.subslice(covered, sizeof(uint32_t)));
   SNII_RETURN_IF_ERROR(crc_src.get_fixed32(&stored));
@@ -146,141 +152,206 @@ Status verify_crc(Slice prelude) {
   return Status::OK();
 }
 
-// Decodes a varint32 column expected to hold exactly count entries, and verifies
-// it consumed exactly col_len bytes (self-consistency check).
-Status decode_varint32_column(Slice col, uint64_t count, std::vector<uint32_t>* out) {
-  ByteSource src(col);
-  out->clear();
-  out->reserve(count);
-  for (uint64_t i = 0; i < count; ++i) {
-    uint32_t v = 0;
-    SNII_RETURN_IF_ERROR(src.get_varint32(&v));
-    out->push_back(v);
+// Parses + validates the header (counts capped before any later reserve).
+Status parse_header(ByteSource* src, Header* h) {
+  uint8_t flags = 0;
+  SNII_RETURN_IF_ERROR(src->get_u8(&flags));
+  h->has_freq = (flags & frq_prelude_flags::kHasFreq) != 0;
+  h->has_prx = (flags & frq_prelude_flags::kHasPrx) != 0;
+  SNII_RETURN_IF_ERROR(src->get_varint64(&h->n));
+  SNII_RETURN_IF_ERROR(src->get_varint64(&h->group_size));
+  SNII_RETURN_IF_ERROR(src->get_varint64(&h->n_super));
+  SNII_RETURN_IF_ERROR(src->get_varint64(&h->sbdir_len));
+  if (h->n > kMaxWindows || h->n_super > kMaxWindows) {
+    return Status::Corruption("frq_prelude: window count exceeds sane cap");
   }
-  if (!src.eof()) {
-    return Status::Corruption("frq_prelude: varint32 column has trailing bytes");
+  if (h->group_size == 0) {
+    return Status::Corruption("frq_prelude: group_size is zero");
   }
-  return Status::OK();
-}
-
-Status decode_u8_column(Slice col, uint64_t count, std::vector<uint8_t>* out) {
-  if (col.size() != count) {
-    return Status::Corruption("frq_prelude: u8 column length mismatch");
-  }
-  out->assign(col.data(), col.data() + col.size());
-  return Status::OK();
-}
-
-Status decode_fixed32_column(Slice col, uint64_t count, std::vector<uint32_t>* out) {
-  if (col.size() != count * sizeof(uint32_t)) {
-    return Status::Corruption("frq_prelude: fixed32 column length mismatch");
-  }
-  ByteSource src(col);
-  out->clear();
-  out->reserve(count);
-  for (uint64_t i = 0; i < count; ++i) {
-    uint32_t v = 0;
-    SNII_RETURN_IF_ERROR(src.get_fixed32(&v));
-    out->push_back(v);
+  if (h->n_super != ceil_div(h->n, h->group_size)) {
+    return Status::Corruption("frq_prelude: n_super inconsistent with N/G");
   }
   return Status::OK();
 }
 
-Status decode_varint64_column(Slice col, uint64_t count, std::vector<uint64_t>* out) {
-  ByteSource src(col);
-  out->clear();
-  out->reserve(count);
-  for (uint64_t i = 0; i < count; ++i) {
-    uint64_t v = 0;
-    SNII_RETURN_IF_ERROR(src.get_varint64(&v));
-    out->push_back(v);
-  }
-  if (!src.eof()) {
-    return Status::Corruption("frq_prelude: varint64 column has trailing bytes");
-  }
-  return Status::OK();
-}
+// One super-block directory row.
+struct SbDirRow {
+  uint64_t last_docid = 0;
+  uint64_t block_off = 0;
+  uint64_t block_len = 0;
+};
 
-}  // namespace
-
-Status build_frq_prelude(const FrqPreludeColumns& cols, ByteSink* sink) {
-  if (sink == nullptr) {
-    return Status::InvalidArgument("frq_prelude: null sink");
-  }
-  SNII_RETURN_IF_ERROR(validate_columns(cols));
-
-  const std::vector<ByteSink> columns = encode_columns(cols);
-  ByteSink body;
-  encode_header(cols, columns, &body);
-  for (const ByteSink& col : columns) {
-    body.put_bytes(col.view());
-  }
-
-  sink->put_bytes(body.view());
-  sink->put_fixed32(crc32c(body.view()));
-  return Status::OK();
-}
-
-namespace {
-
-// Splits the column region (immediately after the header, before the crc) into
-// per-column slices using col_len[], verifying the total matches exactly.
-Status split_columns(Slice prelude, size_t region_start, const std::vector<uint64_t>& col_len,
-                     std::vector<Slice>* out) {
-  const size_t region_end = prelude.size() - sizeof(uint32_t);  // exclude trailing crc
-  size_t cursor = region_start;
-  out->clear();
-  out->reserve(col_len.size());
-  for (uint64_t len : col_len) {
-    if (cursor + len > region_end || cursor + len < cursor) {
-      return Status::Corruption("frq_prelude: col_len exceeds column region");
+// Decodes the super_block_dir region into absolute-last-docid rows, validating
+// monotonic last docids and contiguous, in-bounds block offsets.
+Status decode_super_block_dir(Slice dir, const Header& h,
+                              std::vector<SbDirRow>* rows, uint64_t* window_region_len) {
+  ByteSource src(dir);
+  rows->clear();
+  rows->reserve(static_cast<size_t>(h.n_super));
+  uint64_t prev_last = 0;
+  uint64_t expect_off = 0;
+  for (uint64_t s = 0; s < h.n_super; ++s) {
+    SbDirRow r;
+    uint64_t ldd = 0;
+    SNII_RETURN_IF_ERROR(src.get_varint64(&ldd));
+    SNII_RETURN_IF_ERROR(src.get_varint64(&r.block_off));
+    SNII_RETURN_IF_ERROR(src.get_varint64(&r.block_len));
+    r.last_docid = prev_last + ldd;
+    if (r.last_docid < prev_last || r.block_off != expect_off) {
+      return Status::Corruption("frq_prelude: super-block dir inconsistent");
     }
-    out->push_back(prelude.subslice(cursor, len));
-    cursor += len;
+    expect_off += r.block_len;
+    prev_last = r.last_docid;
+    rows->push_back(r);
   }
-  if (cursor != region_end) {
-    return Status::Corruption("frq_prelude: col_len sum does not cover column region");
+  if (!src.eof()) {
+    return Status::Corruption("frq_prelude: super-block dir has trailing bytes");
+  }
+  *window_region_len = expect_off;
+  return Status::OK();
+}
+
+// Decodes one window row, advancing prev_last to this window's absolute last.
+Status decode_window_row(ByteSource* src, bool has_prx, uint64_t* prev_last,
+                         WindowMeta* m) {
+  uint64_t ldd = 0;
+  SNII_RETURN_IF_ERROR(src->get_varint64(&ldd));
+  uint64_t doc_count = 0, frq_off = 0, frq_len = 0, max_freq = 0;
+  SNII_RETURN_IF_ERROR(src->get_varint64(&doc_count));
+  SNII_RETURN_IF_ERROR(src->get_varint64(&frq_off));
+  SNII_RETURN_IF_ERROR(src->get_varint64(&frq_len));
+  if (has_prx) {
+    SNII_RETURN_IF_ERROR(src->get_varint64(&m->prx_off));
+    SNII_RETURN_IF_ERROR(src->get_varint64(&m->prx_len));
+  }
+  SNII_RETURN_IF_ERROR(src->get_varint64(&max_freq));
+  SNII_RETURN_IF_ERROR(src->get_u8(&m->max_norm));
+  SNII_RETURN_IF_ERROR(src->get_fixed32(&m->win_crc));
+  m->win_base = *prev_last;
+  m->last_docid = static_cast<uint32_t>(*prev_last + ldd);
+  m->doc_count = static_cast<uint32_t>(doc_count);
+  m->frq_off = frq_off;
+  m->frq_len = frq_len;
+  m->max_freq = static_cast<uint32_t>(max_freq);
+  *prev_last = m->last_docid;
+  return Status::OK();
+}
+
+// Decodes one super-block's window block (<=G rows) into the global window list,
+// seeding win_base from prev_last and re-checking the recorded sb last docid.
+Status decode_one_block(Slice block, const Header& h, uint64_t sb_last_docid,
+                        size_t row_count, uint64_t* prev_last,
+                        std::vector<WindowMeta>* windows) {
+  ByteSource src(block);
+  for (size_t i = 0; i < row_count; ++i) {
+    WindowMeta m;
+    SNII_RETURN_IF_ERROR(decode_window_row(&src, h.has_prx, prev_last, &m));
+    windows->push_back(m);
+  }
+  if (!src.eof()) {
+    return Status::Corruption("frq_prelude: window block has trailing bytes");
+  }
+  if (*prev_last != sb_last_docid) {
+    return Status::Corruption("frq_prelude: window block last docid mismatch");
   }
   return Status::OK();
 }
 
-// Decodes all columns from their slices into the supplied output vectors, in
-// spec order. The E (prx) column is decoded only when has_prx is set.
-Status decode_all_columns(const Header& h, const std::vector<Slice>& cols,
-                          std::vector<uint32_t>* max_freq, std::vector<uint8_t>* max_norm,
-                          std::vector<uint32_t>* last_docid_delta,
-                          std::vector<uint32_t>* frq_window_len, std::vector<uint32_t>* win_crc32c,
-                          std::vector<uint64_t>* prx_cum_off) {
-  size_t idx = 0;
-  SNII_RETURN_IF_ERROR(decode_varint32_column(cols[idx++], h.n, max_freq));
-  SNII_RETURN_IF_ERROR(decode_u8_column(cols[idx++], h.n, max_norm));
-  SNII_RETURN_IF_ERROR(decode_varint32_column(cols[idx++], h.n, last_docid_delta));
-  SNII_RETURN_IF_ERROR(decode_varint32_column(cols[idx++], h.n, frq_window_len));
-  if (h.has_prx) {
-    SNII_RETURN_IF_ERROR(decode_varint64_column(cols[idx++], h.m, prx_cum_off));
+// Decodes all window blocks pointed to by the super_block_dir.
+Status decode_all_blocks(Slice window_region, const Header& h,
+                         const std::vector<SbDirRow>& dir,
+                         std::vector<WindowMeta>* windows) {
+  windows->clear();
+  windows->reserve(static_cast<size_t>(h.n));
+  uint64_t prev_last = 0;
+  for (size_t s = 0; s < dir.size(); ++s) {
+    const SbDirRow& r = dir[s];
+    if (r.block_off + r.block_len > window_region.size() ||
+        r.block_off + r.block_len < r.block_off) {
+      return Status::Corruption("frq_prelude: window block out of region");
+    }
+    const uint64_t already = static_cast<uint64_t>(windows->size());
+    const uint64_t rows = std::min<uint64_t>(h.group_size, h.n - already);
+    Slice block = window_region.subslice(static_cast<size_t>(r.block_off),
+                                         static_cast<size_t>(r.block_len));
+    SNII_RETURN_IF_ERROR(decode_one_block(block, h, r.last_docid,
+                                          static_cast<size_t>(rows), &prev_last,
+                                          windows));
   }
-  SNII_RETURN_IF_ERROR(decode_fixed32_column(cols[idx++], h.n, win_crc32c));
+  if (windows->size() != h.n) {
+    return Status::Corruption("frq_prelude: decoded window count mismatch");
+  }
   return Status::OK();
 }
 
 }  // namespace
 
 Status FrqPreludeReader::open(Slice prelude, FrqPreludeReader* out) {
-  SNII_RETURN_IF_ERROR(verify_crc(prelude));
-
   ByteSource src(prelude);
   Header h;
   SNII_RETURN_IF_ERROR(parse_header(&src, &h));
+  const size_t header_end = src.position();
+  SNII_RETURN_IF_ERROR(verify_covered_crc(prelude, header_end, h.sbdir_len));
 
-  std::vector<Slice> cols;
-  SNII_RETURN_IF_ERROR(split_columns(prelude, src.position(), h.col_len, &cols));
+  if (header_end + static_cast<size_t>(h.sbdir_len) > prelude.size()) {
+    return Status::Corruption("frq_prelude: sbdir_len past buffer");
+  }
+  Slice dir = prelude.subslice(header_end, static_cast<size_t>(h.sbdir_len));
+  std::vector<SbDirRow> rows;
+  uint64_t window_region_len = 0;
+  SNII_RETURN_IF_ERROR(decode_super_block_dir(dir, h, &rows, &window_region_len));
+
+  const size_t region_start = header_end + static_cast<size_t>(h.sbdir_len) +
+                              sizeof(uint32_t);
+  if (region_start + static_cast<size_t>(window_region_len) > prelude.size()) {
+    return Status::Corruption("frq_prelude: window region past buffer");
+  }
+  Slice window_region =
+      prelude.subslice(region_start, static_cast<size_t>(window_region_len));
 
   out->has_freq_ = h.has_freq;
   out->has_prx_ = h.has_prx;
-  SNII_RETURN_IF_ERROR(decode_all_columns(h, cols, &out->max_freq_, &out->max_norm_,
-                                          &out->last_docid_delta_, &out->frq_window_len_,
-                                          &out->win_crc32c_, &out->prx_cum_off_));
+  out->group_size_ = static_cast<uint32_t>(h.group_size);
+  out->n_super_ = static_cast<uint32_t>(h.n_super);
+  out->sb_last_docid_.clear();
+  out->sb_last_docid_.reserve(rows.size());
+  for (const SbDirRow& r : rows) out->sb_last_docid_.push_back(r.last_docid);
+  return decode_all_blocks(window_region, h, rows, &out->windows_);
+}
+
+Status FrqPreludeReader::window(uint32_t w, WindowMeta* out) const {
+  if (out == nullptr) return Status::InvalidArgument("frq_prelude: null window out");
+  if (w >= windows_.size()) {
+    return Status::InvalidArgument("frq_prelude: window index out of range");
+  }
+  *out = windows_[w];
   return Status::OK();
+}
+
+Status FrqPreludeReader::locate_window(uint32_t docid, bool* found,
+                                       uint32_t* w) const {
+  if (found == nullptr || w == nullptr) {
+    return Status::InvalidArgument("frq_prelude: null locate out");
+  }
+  *found = false;
+  if (windows_.empty()) return Status::OK();
+  if (docid > windows_.back().last_docid) return Status::OK();
+
+  // Level 1: first super-block whose absolute last docid >= docid.
+  const auto sb_it = std::lower_bound(sb_last_docid_.begin(), sb_last_docid_.end(),
+                                      static_cast<uint64_t>(docid));
+  const size_t sb = static_cast<size_t>(sb_it - sb_last_docid_.begin());
+  // Level 2: window binary search within [sb*G, min((sb+1)*G, N)).
+  const size_t lo = sb * group_size_;
+  const size_t hi = std::min<size_t>(lo + group_size_, windows_.size());
+  for (size_t i = lo; i < hi; ++i) {
+    if (docid <= windows_[i].last_docid) {
+      *found = true;
+      *w = static_cast<uint32_t>(i);
+      return Status::OK();
+    }
+  }
+  return Status::OK();  // unreachable when invariants hold; defensive miss.
 }
 
 }  // namespace snii::format

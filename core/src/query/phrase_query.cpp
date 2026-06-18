@@ -3,6 +3,7 @@
 #include <algorithm>
 #include <cstdint>
 #include <iterator>
+#include <utility>
 #include <vector>
 
 #include "snii/common/slice.h"
@@ -11,10 +12,12 @@
 #include "snii/format/frq_pod.h"
 #include "snii/format/prx_pod.h"
 #include "snii/io/batch_range_fetcher.h"
+#include "snii/reader/windowed_posting.h"
 
 namespace snii::query {
 
 using snii::format::DictEntry;
+using snii::format::DictEntryEnc;
 using snii::format::DictEntryKind;
 using snii::reader::LogicalIndexReader;
 
@@ -26,11 +29,12 @@ struct TermPlan {
   DictEntry entry;
   uint64_t frq_base = 0;
   uint64_t prx_base = 0;
-  // For pod_ref terms: batch handles into the shared fetcher. For inline terms
-  // the bytes are taken from the DictEntry directly (handles unused).
+  // For slim pod_ref terms: batch handles into the shared fetcher. For inline
+  // terms the bytes are taken from the DictEntry directly (handles unused).
   size_t frq_handle = 0;
   size_t prx_handle = 0;
   bool pod_ref = false;
+  bool windowed = false;  // multi-window: decoded via the two-level prelude
 };
 
 // Decoded postings for one term: docid -> position list (the window's per-doc
@@ -126,7 +130,10 @@ Status PlanTerms(const LogicalIndexReader& idx,
       return Status::OK();
     }
     p.pod_ref = (p.entry.kind == DictEntryKind::kPodRef);
-    if (p.pod_ref) {
+    p.windowed = p.pod_ref && p.entry.enc == DictEntryEnc::kWindowed;
+    // Windowed terms are decoded later through their two-level prelude (their
+    // own batched sub-range fetch); only slim pod_ref terms join this batch.
+    if (p.pod_ref && !p.windowed) {
       uint64_t foff = 0, flen = 0, poff = 0, plen = 0;
       SNII_RETURN_IF_ERROR(FrqWindowRange(idx, p, &foff, &flen));
       SNII_RETURN_IF_ERROR(PrxWindowRange(idx, p, &poff, &plen));
@@ -137,14 +144,32 @@ Status PlanTerms(const LogicalIndexReader& idx,
   return Status::OK();
 }
 
-// Materializes per-term postings from inline bytes or batched fetch results.
-Status MaterializePostings(const snii::io::BatchRangeFetcher& fetcher,
+// Decodes a windowed term's full posting (docids + positions) via its prelude.
+Status MaterializeWindowed(const LogicalIndexReader& idx, const TermPlan& p,
+                           TermPostings* out) {
+  snii::reader::DecodedPosting posting;
+  SNII_RETURN_IF_ERROR(snii::reader::read_windowed_posting(
+      idx, p.entry, p.frq_base, p.prx_base, /*want_positions=*/true, &posting));
+  out->docids = std::move(posting.docids);
+  out->positions = std::move(posting.positions);
+  if (out->positions.size() != out->docids.size()) {
+    return Status::Corruption("phrase_query: windowed prx/frq doc-count mismatch");
+  }
+  return Status::OK();
+}
+
+// Materializes per-term postings from inline bytes, batched slim fetch results,
+// or (for windowed terms) the two-level prelude decode.
+Status MaterializePostings(const LogicalIndexReader& idx,
+                           const snii::io::BatchRangeFetcher& fetcher,
                            const std::vector<TermPlan>& plans,
                            std::vector<TermPostings>* posts) {
   posts->resize(plans.size());
   for (size_t i = 0; i < plans.size(); ++i) {
     const TermPlan& p = plans[i];
-    if (p.pod_ref) {
+    if (p.windowed) {
+      SNII_RETURN_IF_ERROR(MaterializeWindowed(idx, p, &(*posts)[i]));
+    } else if (p.pod_ref) {
       SNII_RETURN_IF_ERROR(DecodePostings(fetcher.get(p.frq_handle),
                                           fetcher.get(p.prx_handle),
                                           &(*posts)[i]));
@@ -179,9 +204,9 @@ Status phrase_query(const LogicalIndexReader& idx,
   // 2. One batched read for all pod_ref windows (one serial round).
   if (fetcher.pending() > 0) SNII_RETURN_IF_ERROR(fetcher.fetch());
 
-  // 3. Decode every term's postings.
+  // 3. Decode every term's postings (windowed terms tile their windows here).
   std::vector<TermPostings> posts;
-  SNII_RETURN_IF_ERROR(MaterializePostings(fetcher, plans, &posts));
+  SNII_RETURN_IF_ERROR(MaterializePostings(idx, fetcher, plans, &posts));
 
   // 4. Positional merge: intersect docids, then verify consecutive positions.
   std::vector<uint32_t> candidates = IntersectDocids(posts);
