@@ -44,13 +44,11 @@ Status term_query(const LogicalIndexReader& idx, std::string_view term,
     return DecodeFrqDocs(Slice(entry.frq_bytes), docids);
   }
 
-  // pod_ref entry: abs frq offset = frq_pod.offset + frq_base + frq_off_delta.
-  // The windowed payload is [prelude][window]; skip prelude_len to reach the
-  // window. Slim pod_ref has no prelude (prelude_len == 0).
-  const uint64_t frq_abs =
-      idx.section_refs().frq_pod.offset + frq_base + entry.frq_off_delta;
-  const uint64_t win_abs = frq_abs + entry.prelude_len;
-  const uint64_t win_len = entry.frq_len - entry.prelude_len;
+  // pod_ref entry: resolve the absolute .frq window range, validated against the
+  // POD section to reject corrupt locators (prelude_len > frq_len, out-of-section).
+  uint64_t win_abs = 0;
+  uint64_t win_len = 0;
+  SNII_RETURN_IF_ERROR(idx.resolve_frq_window(entry, frq_base, &win_abs, &win_len));
 
   snii::io::BatchRangeFetcher fetcher(idx.reader());
   const size_t h = fetcher.add(win_abs, static_cast<size_t>(win_len));

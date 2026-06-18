@@ -40,20 +40,17 @@ struct TermPostings {
   std::vector<std::vector<uint32_t>> positions;  // positions[i] for docids[i]
 };
 
-// Computes the absolute .frq window byte range (prelude stripped) for a pod_ref.
-void FrqWindowRange(const LogicalIndexReader& idx, const TermPlan& p,
-                    uint64_t* off, uint64_t* len) {
-  const uint64_t frq_abs =
-      idx.section_refs().frq_pod.offset + p.frq_base + p.entry.frq_off_delta;
-  *off = frq_abs + p.entry.prelude_len;
-  *len = p.entry.frq_len - p.entry.prelude_len;
+// Computes the absolute .frq window byte range (prelude stripped) for a pod_ref,
+// validated against the POD section.
+Status FrqWindowRange(const LogicalIndexReader& idx, const TermPlan& p,
+                      uint64_t* off, uint64_t* len) {
+  return idx.resolve_frq_window(p.entry, p.frq_base, off, len);
 }
 
-// Computes the absolute .prx window byte range for a pod_ref.
-void PrxWindowRange(const LogicalIndexReader& idx, const TermPlan& p,
-                    uint64_t* off, uint64_t* len) {
-  *off = idx.section_refs().prx_pod.offset + p.prx_base + p.entry.prx_off_delta;
-  *len = p.entry.prx_len;
+// Computes the absolute .prx window byte range for a pod_ref, validated.
+Status PrxWindowRange(const LogicalIndexReader& idx, const TermPlan& p,
+                      uint64_t* off, uint64_t* len) {
+  return idx.resolve_prx_window(p.entry, p.prx_base, off, len);
 }
 
 // Decodes a term's frq docids and prx positions from the given byte slices.
@@ -131,8 +128,8 @@ Status PlanTerms(const LogicalIndexReader& idx,
     p.pod_ref = (p.entry.kind == DictEntryKind::kPodRef);
     if (p.pod_ref) {
       uint64_t foff = 0, flen = 0, poff = 0, plen = 0;
-      FrqWindowRange(idx, p, &foff, &flen);
-      PrxWindowRange(idx, p, &poff, &plen);
+      SNII_RETURN_IF_ERROR(FrqWindowRange(idx, p, &foff, &flen));
+      SNII_RETURN_IF_ERROR(PrxWindowRange(idx, p, &poff, &plen));
       p.frq_handle = fetcher->add(foff, static_cast<size_t>(flen));
       p.prx_handle = fetcher->add(poff, static_cast<size_t>(plen));
     }

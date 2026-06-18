@@ -77,4 +77,42 @@ Status LogicalIndexReader::lookup(std::string_view term, bool* found,
   return Status::OK();
 }
 
+namespace {
+
+// Validates a pod_ref window locator against its POD section and returns the
+// absolute window range (after the prelude). Rejects corrupt locators rather
+// than letting size_t underflow / uint64 overflow reach read_at.
+Status resolve_window(const snii::format::RegionRef& section, uint64_t base,
+                      uint64_t off_delta, uint64_t total_len, uint64_t prelude_len,
+                      uint64_t* abs_off, uint64_t* len) {
+  if (prelude_len > total_len) {
+    return Status::Corruption("logical_index: prelude_len exceeds window len");
+  }
+  const uint64_t in_pod = base + off_delta;
+  if (in_pod < base) return Status::Corruption("logical_index: locator overflow");
+  if (in_pod > section.length || total_len > section.length - in_pod) {
+    return Status::Corruption("logical_index: window past POD section");
+  }
+  *abs_off = section.offset + in_pod + prelude_len;
+  *len = total_len - prelude_len;
+  return Status::OK();
+}
+
+}  // namespace
+
+Status LogicalIndexReader::resolve_frq_window(const snii::format::DictEntry& entry,
+                                              uint64_t frq_base, uint64_t* abs_off,
+                                              uint64_t* len) const {
+  return resolve_window(section_refs().frq_pod, frq_base, entry.frq_off_delta,
+                        entry.frq_len, entry.prelude_len, abs_off, len);
+}
+
+Status LogicalIndexReader::resolve_prx_window(const snii::format::DictEntry& entry,
+                                              uint64_t prx_base, uint64_t* abs_off,
+                                              uint64_t* len) const {
+  // .prx windows carry no prelude (prelude_len = 0).
+  return resolve_window(section_refs().prx_pod, prx_base, entry.prx_off_delta,
+                        entry.prx_len, 0, abs_off, len);
+}
+
 }  // namespace snii::reader

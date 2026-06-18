@@ -50,6 +50,15 @@ class LogicalIndexReader {
   Status lookup(std::string_view term, bool* found, snii::format::DictEntry* entry,
                 uint64_t* frq_base, uint64_t* prx_base) const;
 
+  // Resolves a pod_ref entry's absolute .frq / .prx window byte range, validating
+  // the locator against the section length (defends against corrupt entries:
+  // prelude_len > frq_len underflow, or off_delta+len past the POD). *abs_off is
+  // the absolute file offset of the window (after prelude); *len its byte length.
+  Status resolve_frq_window(const snii::format::DictEntry& entry, uint64_t frq_base,
+                            uint64_t* abs_off, uint64_t* len) const;
+  Status resolve_prx_window(const snii::format::DictEntry& entry, uint64_t prx_base,
+                            uint64_t* abs_off, uint64_t* len) const;
+
   const snii::format::SectionRefs& section_refs() const {
     return meta_.section_refs();
   }
