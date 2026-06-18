@@ -68,21 +68,27 @@
 
 SNII 自身因传输字节下降（高频 term 减半 + 连续 dd 块、短语去掉 freq）在真实 OSS 上提速 **2–4×**；对 CLucene 拉开到高频 term **8.5×**、短语 **6.2×**。`ALL DOCIDS MATCH`。这印证设计「读取字节数」指标的优化在对象存储上有真实带宽 / 延迟收益。
 
-## 资源对比：索引体积 / 构建 CPU / 峰值内存（诚实标注取舍）
+## 资源对比：索引体积 / 构建 CPU / 峰值内存（公平对齐 + 优化后）
 
-查询侧的领先有代价。`snii_bench --resources --engine snii|clucene|none`（按引擎分进程隔离峰值 RSS，`none`=语料基线）实测：
+**公平性方法论**（`snii_bench --resources --engine snii|clucene --spill-mib N`，按引擎分进程隔离峰值 RSS）：
+- **同 spill 阈值**：两侧按相同内存大小 bound build。CLucene fork 默认 `RAMBufferSizeMB=16`（doc-count flush 禁用）即在 16MiB flush segment；SNII 在相同阈值 spill SPIMI 缓冲 + k-way merge。`--spill-mib 0` 则两侧都不 flush（全内存）。`apply_spill` 把同一 MiB 喂两侧。
+- **同内容**：两侧字段都 tokenized + positions + freqs + norms。SNII 额外存其查询加速结构（xfilter / stats / 两级 prelude），CLucene 无对应——真实特性差异。
+- 两侧最终都产出单一可查询索引（CLucene `optimize()` 合并 segment；SNII spill k-way merge）。
 
-| 规模 | 索引体积 SNII / CL | 构建 CPU SNII / CL | 构建峰值 RSS SNII / CL（净值=减语料基线）|
+**优化历程**：初版 SNII build 用 `std::map<docid,DocEntry>` + 每 posting 一个 position vector + 全量驻留内存，5M build **CPU 6.2× / 峰值内存 11×（8.35 GiB）**。经 6 轮优化（flat-arena 累积 → spill+k-way merge → 流式输出 → win-win CPU(去高熵 zstd/硬件 crc/缓冲写/透明 map) → 整数 term-id 累积 → flat positions + pooled 累积器 + raw spill runs），**索引 byte-identical 不变**，资源大幅下降：
+
+**最终公平实测（两侧 bounded@同阈值；SNII 选内存≤CLucene 的阈值）**：
+
+| 规模 | 构建 CPU SNII / CL | 构建峰值 RSS SNII / CL | 索引体积 SNII / CL |
 |---|---|---|---|
-| 100K | 3.67 / 2.78 MiB (1.32×) | 1.42 / 0.18 s (7.9×) | 169 / 19.5 MiB（净 158 / 7.5）|
-| 1M | 35.3 / 28.7 MiB (1.23×) | 20.0 / 3.1 s (6.5×) | 1658 / 148 MiB（净 1565 / 56）|
-| 5M | 179 / 148 MiB (1.21×) | 137 / 22 s (6.2×) | **8352 / 718 MiB（净 ~7.9 GiB / 257 MiB）** |
+| 1M | 4.16 / 2.87 s (1.45×) | 146.9 / 145.5 MiB (**1.01× ≈parity**) | 35.4 / 28.7 MiB (1.23×) |
+| **5M** | 24.55 / 18.45 s (**1.33×**) | **664.6 / 715.1 MiB (0.93×，SNII 更低)** | 179 / 148 MiB (1.21×) |
 
-- **索引体积**：SNII **~1.2-1.3× 大**——设计明示的「字节换轮次」（xfilter、两级 prelude、采样索引、dd/freq 分区、slim/inline 冗余）。
-- **构建 CPU**：SNII **~6-8× 更高**——PFOR/zstd 双区编码、binary-fuse-8 xfilter、两级目录、real max_norm、排序。
-- **构建峰值内存**：SNII **~11× 更高**（5M 8.35 GiB vs 0.72 GiB）。**根因：当前 build 全量驻留内存**（SpimiTermBuffer 累积全部倒排 + SniiCompoundWriter 在 ByteSink 内存缓冲建整个容器），**无 spill-to-disk / k-way merge**（审计中标注的 v2 延后项）；CLucene IndexWriter 流式 flush、内存恒定。这是 SNII build 的**真实可扩展性短板**。
+- **峰值内存：已达 CLucene 同等/更优**（5M SNII 665 < CLucene 715）。从 11× 降到 ≤1×。根因修复：flat positions 杀掉最宽词 merge 的 `vector<vector>` 瞬态（5M df=4.64M 该词曾占 ~347MiB）+ pooled 累积器 + spill bound 输入 + 流式输出。
+- **构建 CPU：6.2× → 1.33×**。去 per-token 字符串哈希（整数 term-id）+ 去高熵 zstd + 硬件 crc + 缓冲写。**spill=0（不 bound）时 SNII 5M CPU 15.2s 已 < CLucene 18s**；bounded 时 1.33× 的差距全部来自 spill 往返开销。
+- **索引体积：1.21× 稳定（byte-identical）**。超出的 ~21% 是 SNII 特有查询加速结构（xfilter/stats/两级 prelude）。
 
-**取舍小结**：SNII 用更高的 build CPU/内存 + 略大索引，换取查询侧在对象存储上的大幅领先（轮次 / 字节 / 冷查延迟 5–11×）——典型「查询优化格式」的选择，符合设计「换取冷查性能」的取舍声明。build 内存不可扩展（无 spill）是明确的 v2 改进点。
+**诚实的内存↔CPU 权衡**：bound 内存需 spill，spill 有 CPU 成本。SNII 在「内存 ≤ CLucene」点 CPU 1.33×；在「CPU < CLucene」点（spill=0）内存高于 CLucene。这是 out-of-core 构建的固有 Pareto 权衡——SNII 与 CLucene 在该前沿上接近。查询侧 SNII 大幅领先（轮次/字节/冷查延迟 5–11×）的代价已从「6-8×CPU、11×内存」优化到「~1.3×CPU、内存持平/更优」。
 
 ## 方法论与公平性说明（诚实标注）
 
