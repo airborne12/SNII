@@ -12,6 +12,7 @@
 // For every query the runner asserts SNII docids == CLucene docids == oracle
 // docids (all sorted). Any mismatch exits nonzero.
 
+#include <sys/resource.h>
 #include <unistd.h>
 
 #include <algorithm>
@@ -47,6 +48,8 @@ struct Args {
   uint64_t seed = 42;
   bool oss = false;  // run the real-OSS wall-clock comparison instead of local
   uint32_t repeat = 1;  // --oss: re-measure each query N times for a distribution
+  bool resources = false;     // measure index size / build CPU / peak RSS
+  std::string engine = "both";  // --resources scope: snii | clucene | none | both
 };
 
 Args parse_args(int argc, char** argv) {
@@ -76,6 +79,10 @@ Args parse_args(int argc, char** argv) {
     } else if (flag == "--repeat") {
       a.repeat =
           static_cast<uint32_t>(std::strtoul(next("--repeat"), nullptr, 10));
+    } else if (flag == "--resources") {
+      a.resources = true;
+    } else if (flag == "--engine") {
+      a.engine = next("--engine");
     } else {
       std::fprintf(stderr, "unknown argument: %s\n", flag.c_str());
       std::exit(2);
@@ -430,6 +437,63 @@ int run_oss_mode(const Args& args, const bench::Corpus& corpus,
 }
 #endif  // SNII_WITH_S3
 
+// Cumulative process CPU (user+sys) seconds via getrusage(RUSAGE_SELF).
+double cpu_seconds() {
+  rusage ru{};
+  getrusage(RUSAGE_SELF, &ru);
+  const auto tv = [](const timeval& t) {
+    return static_cast<double>(t.tv_sec) + static_cast<double>(t.tv_usec) / 1e6;
+  };
+  return tv(ru.ru_utime) + tv(ru.ru_stime);
+}
+
+// Process peak resident set size (high-water mark) in MiB. ru_maxrss is KiB on Linux.
+double peak_rss_mib() {
+  rusage ru{};
+  getrusage(RUSAGE_SELF, &ru);
+  return static_cast<double>(ru.ru_maxrss) / 1024.0;
+}
+
+double mib(uint64_t bytes) { return static_cast<double>(bytes) / (1024.0 * 1024.0); }
+
+// Builds one engine over the corpus, reporting its on-disk index size and the
+// CPU it took. Returns nothing; peak RSS is read at process exit by the caller.
+template <typename Adapter>
+void build_and_report(const char* name, const bench::Corpus& corpus) {
+  Adapter idx;
+  const double c0 = cpu_seconds();
+  const auto w0 = std::chrono::steady_clock::now();
+  idx.build_and_open(corpus);
+  const double build_cpu = cpu_seconds() - c0;
+  const double build_wall =
+      std::chrono::duration<double>(std::chrono::steady_clock::now() - w0).count();
+  std::printf("  %-8s index_bytes=%-12llu (%7.2f MiB)  build_cpu_s=%-7.2f "
+              "build_wall_s=%-7.2f\n",
+              name, static_cast<unsigned long long>(idx.index_bytes()),
+              mib(idx.index_bytes()), build_cpu, build_wall);
+}
+
+// --resources mode: index size, build CPU, and peak RSS for the selected engine.
+// Run with --engine snii|clucene|none in SEPARATE processes to isolate peak RSS
+// (each process holds the SAME corpus, so engine RSS == peak - none-baseline).
+int run_resources_mode(const Args& args, const bench::Corpus& corpus) {
+  std::printf("=== resource comparison (engine=%s) ===\n", args.engine.c_str());
+  std::printf("  corpus held in memory; peak RSS includes it (use --engine none "
+              "for the baseline)\n");
+  const bool snii = args.engine == "snii" || args.engine == "both";
+  const bool clu = args.engine == "clucene" || args.engine == "both";
+  try {
+    if (snii) build_and_report<bench::SniiAdapter>("SNII", corpus);
+    if (clu) build_and_report<bench::CluceneAdapter>("CLucene", corpus);
+  } catch (const std::exception& e) {
+    std::fprintf(stderr, "FATAL: resource build failed: %s\n", e.what());
+    return 1;
+  }
+  std::printf("  peak_rss=%.1f MiB (process high-water; engine=%s)\n",
+              peak_rss_mib(), args.engine.c_str());
+  return 0;
+}
+
 }  // namespace
 
 int main(int argc, char** argv) {
@@ -440,9 +504,15 @@ int main(int argc, char** argv) {
               args.docs, args.vocab, args.zipf, args.doclen,
               static_cast<unsigned long long>(args.seed));
 
-  // 1. Generate the deterministic corpus and the oracle.
+  // 1. Generate the deterministic corpus.
   const bench::Corpus corpus =
       bench::generate(args.docs, args.vocab, args.zipf, args.doclen, args.seed);
+
+  // 1a. Resource mode: index size / build CPU / peak RSS (no oracle needed).
+  if (args.resources) {
+    return run_resources_mode(args, corpus);
+  }
+
   const Oracle oracle(corpus);
 
   // 1b. Real-OSS mode: build + upload both indexes to OSS and run the SAME

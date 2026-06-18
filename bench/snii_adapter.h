@@ -37,6 +37,9 @@ class SniiAdapter {
   void phrase_query(const std::vector<std::string>& words,
                     std::vector<uint32_t>* docids, snii::io::IoMetrics* metrics);
 
+  // On-disk byte size of the built .idx container (0 if not built).
+  uint64_t index_bytes() const;
+
  private:
   std::string path_;
   std::unique_ptr<snii::io::LocalFileReader> local_;

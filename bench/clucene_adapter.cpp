@@ -7,9 +7,11 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <filesystem>
 #include <memory>
 #include <stdexcept>
 #include <string>
+#include <system_error>
 #include <vector>
 
 #include "CLucene.h"
@@ -332,6 +334,17 @@ void CluceneAdapter::phrase_query(const std::vector<std::string>& words,
   std::sort(collector.docids.begin(), collector.docids.end());
   *docids = std::move(collector.docids);
   *metrics = impl_->directory->aggregate_metrics();
+}
+
+uint64_t CluceneAdapter::index_bytes() const {
+  if (impl_ == nullptr || impl_->dir_path.empty()) return 0;
+  std::error_code ec;
+  uint64_t total = 0;
+  for (const auto& e :
+       std::filesystem::directory_iterator(impl_->dir_path, ec)) {
+    if (e.is_regular_file(ec)) total += e.file_size(ec);
+  }
+  return total;
 }
 
 }  // namespace bench

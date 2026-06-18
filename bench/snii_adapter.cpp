@@ -3,7 +3,9 @@
 #include <unistd.h>
 
 #include <cstdio>
+#include <filesystem>
 #include <stdexcept>
+#include <system_error>
 #include <utility>
 
 #include "snii/format/format_constants.h"
@@ -106,6 +108,13 @@ void SniiAdapter::phrase_query(const std::vector<std::string>& words,
     fail("phrase_query", s);
   }
   *metrics = metered_->metrics();
+}
+
+uint64_t SniiAdapter::index_bytes() const {
+  if (path_.empty()) return 0;
+  std::error_code ec;
+  const auto sz = std::filesystem::file_size(path_, ec);
+  return ec ? 0 : static_cast<uint64_t>(sz);
 }
 
 }  // namespace bench

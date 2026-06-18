@@ -41,6 +41,9 @@ class CluceneAdapter {
   void phrase_query(const std::vector<std::string>& words,
                     std::vector<uint32_t>* docids, snii::io::IoMetrics* metrics);
 
+  // Total on-disk byte size of all index segment files (0 if not built).
+  uint64_t index_bytes() const;
+
  private:
   // Opaque handles; concrete CLucene types live in the .cpp to keep this header
   // free of CLucene includes.
