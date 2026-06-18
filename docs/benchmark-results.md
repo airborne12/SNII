@@ -88,6 +88,8 @@
   | TERM low-df | 8.4 / 9.1 | **6.4 / 7.1** |
   | PHRASE | 651.9 / 707.5 | **227.5 / 247.4** |
 
-  稳态下 SNII 全查询类型 median 更优（mid-df 1.30×、high-df 2.5×、PHRASE 2.87×）且分布更紧。复现：`snii_bench --oss --repeat 20 --docs 5000000`。成本模型（1 轮 vs 2）早已确定性地预测此结论；微查询单发 wall-clock 的几 ms 差由 OSS 抖动主导。
+  稳态下 SNII 全查询类型 median 更优（mid-df 1.30×、high-df 2.5×、PHRASE 2.87×）且分布更紧。复现：`snii_bench --oss --repeat 20 --docs 5000000`。
+
+  **1M 的 20 次重复分布交叉验证一致**（median，ms）：high-df 82.2→**30.0**、mid-df 5.8→**5.6**、low-df 5.8→6.0、PHRASE 308.0→**156.0**。关键：**稳态 wall-clock 精确跟随成本模型轮次**——mid/low-df 在 1M 是 1 轮 vs 1 轮 → wall-clock 持平（~5.8ms）；在 5M 是 SNII 1 轮 vs CLucene 2 轮 → SNII 胜（6.3 vs 8.2ms）。SNII 自身 mid/low-df 两规模都 1 轮、稳定 ~6ms；CLucene 因 5M 多一轮而升到 8.2ms。那个 22.7ms 单发离群在 1M / 5M 重复中均未再现（SNII p90：1M 6.4、5M 6.8），坐实为一次性连接/尾延迟尖峰。微查询单发 wall-clock 的几 ms 差由 OSS 抖动主导；成本模型是该量级的可靠信号。
 
 **总结**：串行 I/O 轮次 / 请求数（文档主优化目标）SNII 全规模、全查询类型均更少或持平；真实冷查 wall-clock，TERM 快 ~3×、5-term 短语（含子块跳读）快 ~2×。SNII 通过常驻元数据前置规划 + 两级子块跳读 + 批量并发，在对象存储上把串行轮次、远端请求数、读取字节同时压下来，冷查延迟全面领先。`ALL DOCIDS MATCH` 贯穿全部规模与查询类型。
