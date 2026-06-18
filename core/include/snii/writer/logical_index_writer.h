@@ -58,8 +58,17 @@ struct SniiIndexInput {
   // Per-doc 1-byte encoded norm (length doc_count); only consumed when the
   // config has scoring. May be empty otherwise.
   std::vector<uint8_t> encoded_norms;
-  // Lexicographically sorted terms with ascending-docid postings.
+  // Lexicographically sorted terms with ascending-docid postings. Used when
+  // `term_source` is null (callers that already hold a materialized vector,
+  // e.g. unit tests). The writer reads but does not retain these.
   std::vector<TermPostings> terms;
+  // Optional streaming term source. When non-null, the writer DRAINS it via
+  // SpimiTermBuffer::for_each_term_sorted so that only one term's postings is
+  // materialized at a time (avoiding the full TermPostings vector and its
+  // second-copy peak). `terms` is ignored when this is set. The buffer is
+  // consumed (emptied) by build(); the caller must keep it alive until build()
+  // returns and must not reuse it afterwards.
+  SpimiTermBuffer* term_source = nullptr;
   // Target DICT block size in bytes; a block is cut once its estimate reaches
   // this. 0 uses kDefaultTargetDictBlockBytes. Smaller values yield more blocks
   // (and a finer-grained sampled-term index).
@@ -105,9 +114,16 @@ class LogicalIndexWriter {
     std::string first_term;
   };
 
-  Status validate() const;
-  // Iterates terms, splits DICT blocks by target size, fills PODs + blocks_.
+  // Validates one term's shape (parallel lengths, strictly ascending docids).
+  Status validate_term(const TermPostings& tp) const;
+  // Iterates terms (from the streaming source or the materialized vector),
+  // splitting DICT blocks by target size and filling PODs + blocks_.
   Status build_blocks();
+  // Per-term driver shared by both the streaming and materialized paths:
+  // validates the term, opens a block if needed, builds its DictEntry, and cuts
+  // the block once it reaches the target size. Mutates the running block state.
+  struct BlockState;
+  Status process_term(const TermPostings& tp, BlockState* st);
   // Builds one DictEntry (inline or pod_ref), growing the PODs as needed.
   Status build_entry(const TermPostings& tp, uint64_t frq_base, uint64_t prx_base,
                      snii::format::DictEntry* e);
@@ -129,7 +145,9 @@ class LogicalIndexWriter {
   bool has_freq_;  // tier >= T2: a freq region is encoded per window
   bool has_norms_;
   uint32_t doc_count_;
-  const std::vector<TermPostings>& terms_;
+  const std::vector<TermPostings>& terms_;  // materialized fallback (may be empty)
+  SpimiTermBuffer* term_source_;            // streaming source (null => use terms_)
+  uint64_t term_count_ = 0;                 // distinct terms actually consumed
   const std::vector<uint8_t>& encoded_norms_;
 
   uint32_t target_dict_block_bytes_;

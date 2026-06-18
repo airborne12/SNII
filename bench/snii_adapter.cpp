@@ -49,15 +49,16 @@ void SniiAdapter::build_and_open(const Corpus& c) {
       buf.add_token(c.vocab[toks[pos]], d, pos);
     }
   }
-  std::vector<TermPostings> terms = buf.finalize_sorted();
 
-  // 2. Describe the single logical index (docid + freq + positions).
+  // 2. Describe the single logical index (docid + freq + positions). Feed terms
+  // by STREAMING the SPIMI buffer so the writer materializes only one term's
+  // postings at a time (low peak memory) instead of a full TermPostings vector.
   SniiIndexInput in;
   in.index_id = 1;
   in.index_suffix = "body";
   in.config = IndexConfig::kDocsPositions;
   in.doc_count = c.doc_count;
-  in.terms = std::move(terms);
+  in.term_source = &buf;
   // A small DICT block target yields many blocks and a finer-grained sampled
   // term index, which keeps the term-dictionary lookup path accurate across the
   // whole (large) vocabulary.

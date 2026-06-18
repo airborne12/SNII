@@ -211,26 +211,22 @@ LogicalIndexWriter::LogicalIndexWriter(const SniiIndexInput& in)
       has_norms_(snii::format::has_scoring(in.config)),
       doc_count_(in.doc_count),
       terms_(in.terms),
+      term_source_(in.term_source),
       encoded_norms_(in.encoded_norms),
       target_dict_block_bytes_(in.target_dict_block_bytes != 0
                                    ? in.target_dict_block_bytes
                                    : snii::format::kDefaultTargetDictBlockBytes) {}
 
-Status LogicalIndexWriter::validate() const {
-  if (has_norms_ && encoded_norms_.size() != doc_count_) {
-    return Status::InvalidArgument("logical_index: norms length must equal doc_count");
+Status LogicalIndexWriter::validate_term(const TermPostings& tp) const {
+  if (tp.freqs.size() != tp.docids.size()) {
+    return Status::InvalidArgument("logical_index: freqs length must equal docids");
   }
-  for (const auto& tp : terms_) {
-    if (tp.freqs.size() != tp.docids.size()) {
-      return Status::InvalidArgument("logical_index: freqs length must equal docids");
-    }
-    if (has_prx_ && tp.positions.size() != tp.docids.size()) {
-      return Status::InvalidArgument("logical_index: positions length must equal docids");
-    }
-    for (size_t i = 1; i < tp.docids.size(); ++i) {
-      if (tp.docids[i] <= tp.docids[i - 1]) {
-        return Status::InvalidArgument("logical_index: docids must be strictly ascending");
-      }
+  if (has_prx_ && tp.positions.size() != tp.docids.size()) {
+    return Status::InvalidArgument("logical_index: positions length must equal docids");
+  }
+  for (size_t i = 1; i < tp.docids.size(); ++i) {
+    if (tp.docids[i] <= tp.docids[i - 1]) {
+      return Status::InvalidArgument("logical_index: docids must be strictly ascending");
     }
   }
   return Status::OK();
@@ -340,45 +336,68 @@ void LogicalIndexWriter::flush_block(DictBlockBuilder* block, std::string first_
   blocks_.push_back(std::move(out));
 }
 
-Status LogicalIndexWriter::build_blocks() {
+// Running state for the in-flight DICT block while terms stream past.
+struct LogicalIndexWriter::BlockState {
   std::unique_ptr<DictBlockBuilder> block;
   std::string block_first_term;
   uint64_t frq_base = 0;
   uint64_t prx_base = 0;
+};
 
-  for (const auto& tp : terms_) {
-    all_terms_.push_back(tp.term);
-    stats_.sum_total_term_freq += SumOf(tp.freqs);
+Status LogicalIndexWriter::process_term(const TermPostings& tp, BlockState* st) {
+  SNII_RETURN_IF_ERROR(validate_term(tp));
+  all_terms_.push_back(tp.term);
+  ++term_count_;
+  stats_.sum_total_term_freq += SumOf(tp.freqs);
 
-    if (!block) {
-      frq_base = static_cast<uint64_t>(frq_pod_.size());
-      prx_base = static_cast<uint64_t>(prx_pod_.size());
-      block = std::make_unique<DictBlockBuilder>(tier_, has_prx_, frq_base, prx_base);
-      block_first_term = tp.term;
-    }
-
-    DictEntry e;
-    SNII_RETURN_IF_ERROR(build_entry(tp, frq_base, prx_base, &e));
-    block->add_entry(e);
-
-    if (block->estimated_bytes() >= target_dict_block_bytes_) {
-      flush_block(block.get(), block_first_term);
-      block.reset();
-    }
+  if (!st->block) {
+    st->frq_base = static_cast<uint64_t>(frq_pod_.size());
+    st->prx_base = static_cast<uint64_t>(prx_pod_.size());
+    st->block =
+        std::make_unique<DictBlockBuilder>(tier_, has_prx_, st->frq_base, st->prx_base);
+    st->block_first_term = tp.term;
   }
-  if (block) flush_block(block.get(), block_first_term);
+
+  DictEntry e;
+  SNII_RETURN_IF_ERROR(build_entry(tp, st->frq_base, st->prx_base, &e));
+  st->block->add_entry(e);
+
+  if (st->block->estimated_bytes() >= target_dict_block_bytes_) {
+    flush_block(st->block.get(), st->block_first_term);
+    st->block.reset();
+  }
+  return Status::OK();
+}
+
+Status LogicalIndexWriter::build_blocks() {
+  BlockState st;
+  if (term_source_ != nullptr) {
+    Status streamed = Status::OK();
+    // Drain the SPIMI buffer term-by-term; only one TermPostings is alive at a
+    // time, so the input+output never fully coexist. Errors are latched and the
+    // drain continues so the source is fully consumed (no partial state reuse).
+    term_source_->for_each_term_sorted([&](TermPostings&& tp) {
+      if (streamed.ok()) streamed = process_term(tp, &st);
+    });
+    SNII_RETURN_IF_ERROR(streamed);
+  } else {
+    for (const auto& tp : terms_) SNII_RETURN_IF_ERROR(process_term(tp, &st));
+  }
+  if (st.block) flush_block(st.block.get(), st.block_first_term);
   return Status::OK();
 }
 
 Status LogicalIndexWriter::build() {
-  SNII_RETURN_IF_ERROR(validate());
+  if (has_norms_ && encoded_norms_.size() != doc_count_) {
+    return Status::InvalidArgument("logical_index: norms length must equal doc_count");
+  }
   SNII_RETURN_IF_ERROR(build_blocks());
 
   for (const auto& b : blocks_) AppendBytes(&dict_region_, b.bytes);
 
   stats_.doc_count = doc_count_;
   stats_.indexed_doc_count = doc_count_;
-  stats_.term_count = static_cast<uint64_t>(terms_.size());
+  stats_.term_count = term_count_;
   stats_.null_count = 0;
 
   if (has_norms_) {
