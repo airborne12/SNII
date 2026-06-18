@@ -56,12 +56,14 @@ void SniiOssAdapter::build_upload_and_open(const Corpus& c,
   using snii::writer::SpimiTermBuffer;
   using snii::writer::TermPostings;
 
-  // 1. Accumulate every (term, doc, position) into the SPIMI buffer.
-  SpimiTermBuffer buf(/*has_positions=*/true);
+  // 1. Accumulate every (term-id, doc, position) into the SPIMI buffer. Corpus
+  // tokens are dense ids into c.vocab; feed the raw id (buf borrows c.vocab) so
+  // there is no per-token string work.
+  SpimiTermBuffer buf(&c.vocab, /*has_positions=*/true);
   for (uint32_t d = 0; d < c.doc_count; ++d) {
     const auto& toks = c.docs[d];
     for (uint32_t pos = 0; pos < toks.size(); ++pos) {
-      buf.add_token(c.vocab[toks[pos]], d, pos);
+      buf.add_token(toks[pos], d, pos);
     }
   }
   std::vector<TermPostings> terms = buf.finalize_sorted();

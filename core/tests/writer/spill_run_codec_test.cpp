@@ -30,37 +30,43 @@ struct TempRun {
   ~TempRun() { std::remove(path.c_str()); }
 };
 
-TermPostings MakeTerm(const std::string& term, std::vector<uint32_t> docids,
-                      std::vector<uint32_t> freqs,
+// A run record is keyed by term-id; this pairs the id with the postings so the
+// test can both write (by id) and assert (the resolved string round-trips).
+struct IdTerm {
+  uint32_t id;
+  TermPostings tp;
+};
+
+TermPostings MakeTerm(std::vector<uint32_t> docids, std::vector<uint32_t> freqs,
                       std::vector<std::vector<uint32_t>> positions = {}) {
   TermPostings tp;
-  tp.term = term;
   tp.docids = std::move(docids);
   tp.freqs = std::move(freqs);
   tp.positions = std::move(positions);
   return tp;
 }
 
-// Writes a single run from `terms` and reads it back, asserting an exact
-// round-trip of every field.
-void RoundTrip(const std::vector<TermPostings>& terms, bool has_positions) {
+// Writes a single run from `terms` (by id) and reads it back, asserting an exact
+// round-trip of every field. The reader leaves current().term empty (runs store
+// only the id), so the term-id is checked via current_id().
+void RoundTrip(const std::vector<IdTerm>& terms, bool has_positions) {
   TempRun run;
   {
     RunWriter w;
     ASSERT_TRUE(w.open(run.path).ok());
-    for (const auto& t : terms) ASSERT_TRUE(w.write_term(t).ok());
+    for (const auto& t : terms) ASSERT_TRUE(w.write_term(t.id, t.tp).ok());
     ASSERT_TRUE(w.close().ok());
   }
   RunReader r;
   ASSERT_TRUE(r.open(run.path, has_positions).ok());
   for (const auto& expect : terms) {
     ASSERT_FALSE(r.exhausted());
+    EXPECT_EQ(r.current_id(), expect.id);
     const TermPostings& got = r.current();
-    EXPECT_EQ(got.term, expect.term);
-    EXPECT_EQ(got.docids, expect.docids);
-    EXPECT_EQ(got.freqs, expect.freqs);
+    EXPECT_EQ(got.docids, expect.tp.docids);
+    EXPECT_EQ(got.freqs, expect.tp.freqs);
     if (has_positions) {
-      EXPECT_EQ(got.positions, expect.positions);
+      EXPECT_EQ(got.positions, expect.tp.positions);
     }
     ASSERT_TRUE(r.advance().ok());
   }
@@ -82,55 +88,60 @@ TEST(SpillRunCodec, EmptyRun) {
 
 // Single doc, with positions: smallest non-trivial record round-trips.
 TEST(SpillRunCodec, SingleDocWithPositions) {
-  RoundTrip({MakeTerm("solo", {7}, {3}, {{0, 4, 9}})}, /*has_positions=*/true);
+  RoundTrip({{7, MakeTerm({7}, {3}, {{0, 4, 9}})}}, /*has_positions=*/true);
 }
 
 // Docs-only run (no positions): positions field is zero and decode skips it.
 TEST(SpillRunCodec, NoPositions) {
-  RoundTrip({MakeTerm("a", {0, 5, 99}, {1, 2, 1}),
-             MakeTerm("b", {3}, {4})},
+  RoundTrip({{0, MakeTerm({0, 5, 99}, {1, 2, 1})},
+             {1, MakeTerm({3}, {4})}},
             /*has_positions=*/false);
 }
 
-// Several terms with varied widths round-trip in ascending term order.
+// Several terms with varied widths round-trip in ascending id order.
 TEST(SpillRunCodec, MultiTermRoundTrip) {
   RoundTrip(
       {
-          MakeTerm("alpha", {0, 1, 2}, {1, 1, 1}, {{0}, {1}, {2}}),
-          MakeTerm("beta", {10}, {2}, {{3, 8}}),
-          MakeTerm("gamma", {4, 100}, {2, 1}, {{0, 1}, {7}}),
+          {0, MakeTerm({0, 1, 2}, {1, 1, 1}, {{0}, {1}, {2}})},
+          {1, MakeTerm({10}, {2}, {{3, 8}})},
+          {2, MakeTerm({4, 100}, {2, 1}, {{0, 1}, {7}})},
       },
       /*has_positions=*/true);
 }
 
-// K-way merge: a term present in EVERY run is concatenated in ascending run
-// order; a term present in only ONE run passes through unchanged.
+// K-way merge: a term-id present in EVERY run is concatenated in ascending run
+// order; an id present in only ONE run passes through unchanged. The merged
+// stream is ordered by each id's VOCAB STRING and the string is resolved onto
+// the emitted TermPostings.
 TEST(SpillRunCodec, MergeConcatenatesAcrossRuns) {
+  // Vocab: id 0 -> "common", 1 -> "only0", 2 -> "zzz". Ordered by string:
+  // "common" < "only0" < "zzz", which happens to match id order here.
+  const std::vector<std::string> vocab = {"common", "only0", "zzz"};
   TempRun r0, r1, r2;
-  // Each run covers a strictly later docid range for the shared term "common".
+  // Each run covers a strictly later docid range for the shared id 0.
   {
     RunWriter w;
     ASSERT_TRUE(w.open(r0.path).ok());
-    ASSERT_TRUE(w.write_term(MakeTerm("common", {0, 1}, {1, 2}, {{0}, {1, 2}})).ok());
-    ASSERT_TRUE(w.write_term(MakeTerm("only0", {3}, {1}, {{5}})).ok());
+    ASSERT_TRUE(w.write_term(0, MakeTerm({0, 1}, {1, 2}, {{0}, {1, 2}})).ok());
+    ASSERT_TRUE(w.write_term(1, MakeTerm({3}, {1}, {{5}})).ok());
     ASSERT_TRUE(w.close().ok());
   }
   {
     RunWriter w;
     ASSERT_TRUE(w.open(r1.path).ok());
-    ASSERT_TRUE(w.write_term(MakeTerm("common", {5}, {1}, {{0}})).ok());
+    ASSERT_TRUE(w.write_term(0, MakeTerm({5}, {1}, {{0}})).ok());
     ASSERT_TRUE(w.close().ok());
   }
   {
     RunWriter w;
     ASSERT_TRUE(w.open(r2.path).ok());
-    ASSERT_TRUE(w.write_term(MakeTerm("common", {8, 9}, {1, 1}, {{0}, {0}})).ok());
-    ASSERT_TRUE(w.write_term(MakeTerm("zzz", {2}, {1}, {{4}})).ok());
+    ASSERT_TRUE(w.write_term(0, MakeTerm({8, 9}, {1, 1}, {{0}, {0}})).ok());
+    ASSERT_TRUE(w.write_term(2, MakeTerm({2}, {1}, {{4}})).ok());
     ASSERT_TRUE(w.close().ok());
   }
 
   std::vector<TermPostings> merged;
-  ASSERT_TRUE(MergeRuns({r0.path, r1.path, r2.path}, /*has_positions=*/true,
+  ASSERT_TRUE(MergeRuns({r0.path, r1.path, r2.path}, vocab, /*has_positions=*/true,
                         [&](TermPostings&& tp) { merged.push_back(std::move(tp)); })
                   .ok());
 
@@ -145,18 +156,42 @@ TEST(SpillRunCodec, MergeConcatenatesAcrossRuns) {
   EXPECT_EQ(merged[2].docids, (std::vector<uint32_t>{2}));
 }
 
+// The merge order follows the VOCAB STRING, not the numeric id: ids whose
+// strings sort in the opposite order are emitted lexicographically.
+TEST(SpillRunCodec, MergeOrdersByVocabStringNotId) {
+  // id 0 -> "zebra", id 1 -> "apple": string order is apple(1) < zebra(0).
+  const std::vector<std::string> vocab = {"zebra", "apple"};
+  TempRun r0;
+  {
+    RunWriter w;
+    ASSERT_TRUE(w.open(r0.path).ok());
+    // Written in run order by string: apple(1) before zebra(0).
+    ASSERT_TRUE(w.write_term(1, MakeTerm({2}, {1})).ok());
+    ASSERT_TRUE(w.write_term(0, MakeTerm({5}, {1})).ok());
+    ASSERT_TRUE(w.close().ok());
+  }
+  std::vector<std::string> order;
+  ASSERT_TRUE(MergeRuns({r0.path}, vocab, /*has_positions=*/false,
+                        [&](TermPostings&& tp) { order.push_back(tp.term); })
+                  .ok());
+  EXPECT_EQ(order, (std::vector<std::string>{"apple", "zebra"}));
+}
+
 // A truncated run file is rejected by decode (anti-corruption on bytes we read).
 TEST(SpillRunCodec, TruncatedRunIsCorruption) {
   TempRun run;
   {
     RunWriter w;
     ASSERT_TRUE(w.open(run.path).ok());
-    ASSERT_TRUE(w.write_term(MakeTerm("term", {0, 1, 2}, {1, 1, 1}, {{0}, {0}, {0}})).ok());
+    ASSERT_TRUE(
+        w.write_term(0, MakeTerm({0, 1, 2}, {1, 1, 1}, {{0}, {0}, {0}})).ok());
+    ASSERT_TRUE(w.write_term(1, MakeTerm({4}, {1}, {{0}})).ok());
     ASSERT_TRUE(w.close().ok());
   }
-  // Chop the file to its first byte (a term_len that promises more than exists).
-  ASSERT_EQ(::truncate(run.path.c_str(), 1), 0);
+  // Chop the file so the second record promises more bytes than remain.
+  ASSERT_EQ(::truncate(run.path.c_str(), 4), 0);
   RunReader r;
-  const Status s = r.open(run.path, /*has_positions=*/true);
+  Status s = r.open(run.path, /*has_positions=*/true);
+  while (s.ok() && !r.exhausted()) s = r.advance();
   EXPECT_FALSE(s.ok());
 }

@@ -67,9 +67,8 @@ Status RunWriter::flush() {
   return Status::OK();
 }
 
-Status RunWriter::write_term(const TermPostings& tp) {
-  AppendVarint(&buf_, tp.term.size());
-  buf_.insert(buf_.end(), tp.term.begin(), tp.term.end());
+Status RunWriter::write_term(uint32_t term_id, const TermPostings& tp) {
+  AppendVarint(&buf_, term_id);
   AppendVarint(&buf_, tp.docids.size());
   uint32_t prev = 0;
   for (size_t i = 0; i < tp.docids.size(); ++i) {
@@ -154,13 +153,6 @@ Status RunReader::ensure(size_t n) {
   return Status::OK();
 }
 
-Status RunReader::read_raw(size_t n, const uint8_t** p) {
-  SNII_RETURN_IF_ERROR(ensure(n));
-  *p = window_.data() + pos_;
-  pos_ += n;
-  return Status::OK();
-}
-
 // Streamed varint: decode from the current window; if it straddles the buffered
 // boundary, top up from disk and retry. A varint is at most 10 bytes, so this
 // loops at most a couple of times. Bounds-safe: decode_varint64 never reads past
@@ -193,11 +185,11 @@ Status RunReader::advance() {
       return Status::OK();
     }
   }
-  uint64_t term_len = 0;
-  SNII_RETURN_IF_ERROR(read_varint(&term_len));
-  const uint8_t* tp = nullptr;
-  SNII_RETURN_IF_ERROR(read_raw(static_cast<size_t>(term_len), &tp));
-  current_.term.assign(reinterpret_cast<const char*>(tp), static_cast<size_t>(term_len));
+  uint64_t term_id = 0;
+  SNII_RETURN_IF_ERROR(read_varint(&term_id));
+  if (term_id > UINT32_MAX) return Status::Corruption("run term_id exceeds uint32");
+  current_id_ = static_cast<uint32_t>(term_id);
+  current_.term.clear();  // runs store only the id; owner resolves the string
 
   uint64_t n_docs = 0;
   SNII_RETURN_IF_ERROR(read_varint(&n_docs));
@@ -244,15 +236,20 @@ Status RunReader::advance() {
 
 namespace {
 
-// Min-heap entry: orders by the run's current term, tie-broken by run index so
-// equal terms are gathered run-order (keeping concatenated docids ascending).
+// Min-heap entry: orders by the run's current term-id's VOCAB STRING, tie-broken
+// by run index so equal terms are gathered run-order (keeping concatenated
+// docids ascending). The comparator resolves id -> string via the shared vocab,
+// so the merged stream is lexicographic (the dictionary order the writer needs).
 struct HeapItem {
-  std::string term;
+  uint32_t term_id;
   size_t run;
 };
 struct HeapGreater {
+  const std::vector<std::string>* vocab;
   bool operator()(const HeapItem& a, const HeapItem& b) const {
-    if (a.term != b.term) return a.term > b.term;
+    const std::string& sa = (*vocab)[a.term_id];
+    const std::string& sb = (*vocab)[b.term_id];
+    if (sa != sb) return sa > sb;
     return a.run > b.run;
   }
 };
@@ -284,29 +281,44 @@ void Concat(TermPostings* dst, const TermPostings& src, bool has_positions) {
 
 }  // namespace
 
-Status MergeRuns(const std::vector<std::string>& run_paths, bool has_positions,
+Status MergeRuns(const std::vector<std::string>& run_paths,
+                 const std::vector<std::string>& vocab, bool has_positions,
                  const std::function<void(TermPostings&&)>& fn) {
   std::vector<std::unique_ptr<RunReader>> readers;
   readers.reserve(run_paths.size());
-  std::priority_queue<HeapItem, std::vector<HeapItem>, HeapGreater> heap;
+  std::priority_queue<HeapItem, std::vector<HeapItem>, HeapGreater> heap(
+      HeapGreater{&vocab});
   for (size_t i = 0; i < run_paths.size(); ++i) {
     auto r = std::make_unique<RunReader>();
     SNII_RETURN_IF_ERROR(r->open(run_paths[i], has_positions));
-    if (!r->exhausted()) heap.push({r->current().term, i});
+    if (!r->exhausted()) {
+      if (r->current_id() >= vocab.size()) {
+        return Status::Corruption("run term_id out of vocab range");
+      }
+      heap.push({r->current_id(), i});
+    }
     readers.push_back(std::move(r));
   }
 
   while (!heap.empty()) {
+    const uint32_t id = heap.top().term_id;
     TermPostings merged;
-    merged.term = heap.top().term;
-    // Drain every run whose head equals this term, in ascending run order.
-    while (!heap.empty() && heap.top().term == merged.term) {
+    merged.term = vocab[id];  // resolve the id -> dictionary string once
+    // Drain every run whose head id maps to the same string, in run order. Equal
+    // strings imply equal ids for a dense vocab, but compare by string so a
+    // (documented-as-absent) duplicate string still groups correctly.
+    while (!heap.empty() && vocab[heap.top().term_id] == merged.term) {
       const size_t ri = heap.top().run;
       heap.pop();
       RunReader* r = readers[ri].get();
       Concat(&merged, r->current(), has_positions);
       SNII_RETURN_IF_ERROR(r->advance());
-      if (!r->exhausted()) heap.push({r->current().term, ri});
+      if (!r->exhausted()) {
+        if (r->current_id() >= vocab.size()) {
+          return Status::Corruption("run term_id out of vocab range");
+        }
+        heap.push({r->current_id(), ri});
+      }
     }
     fn(std::move(merged));
   }

@@ -52,10 +52,10 @@ int main(int argc, char** argv) {
 
   // 1. Corpus + SNII index to a local file.
   const bench::Corpus corpus = bench::generate(docs, docs / 4, 1.1, 12, 42);
-  writer::SpimiTermBuffer buf(true);
+  writer::SpimiTermBuffer buf(&corpus.vocab, true);
   for (uint32_t d = 0; d < corpus.doc_count; ++d)
     for (uint32_t k = 0; k < corpus.docs[d].size(); ++k)
-      buf.add_token(corpus.vocab[corpus.docs[d][k]], d, k);
+      buf.add_token(corpus.docs[d][k], d, k);
   writer::SniiIndexInput in;
   in.index_id = 1; in.index_suffix = "body";
   in.config = format::IndexConfig::kDocsPositions;

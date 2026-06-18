@@ -41,15 +41,17 @@ void SniiAdapter::build_and_open(const Corpus& c) {
   using snii::writer::SpimiTermBuffer;
   using snii::writer::TermPostings;
 
-  // 1. Accumulate every (term, doc, position) into the SPIMI buffer. A non-zero
+  // 1. Accumulate every (term-id, doc, position) into the SPIMI buffer. The
+  // corpus tokens are ALREADY dense integer ids into c.vocab, so feed the raw id
+  // (buf borrows c.vocab) -- no per-token string hashing/construction. A non-zero
   // spill threshold bounds input RAM: once the live buffer exceeds it, a sorted
   // run is spilled to disk and memory cleared; the final build k-way-merges all
   // runs, materializing one term at a time (peak RSS independent of postings).
-  SpimiTermBuffer buf(/*has_positions=*/true, spill_threshold_bytes_);
+  SpimiTermBuffer buf(&c.vocab, /*has_positions=*/true, spill_threshold_bytes_);
   for (uint32_t d = 0; d < c.doc_count; ++d) {
     const auto& toks = c.docs[d];
     for (uint32_t pos = 0; pos < toks.size(); ++pos) {
-      buf.add_token(c.vocab[toks[pos]], d, pos);
+      buf.add_token(toks[pos], d, pos);
     }
   }
 
