@@ -38,18 +38,25 @@
 - **TERM 的 read_at SNII 远少**（5M high-df 3 vs 43）：CLucene cursor 把大倒排拆成数十次小读。
 - 多窗口使 PHRASE 的 read_at 升高（每窗口一次物理读），但被批量成少数串行轮次；TERM high-df 在 1M 出现 SNII 轮次略多（多窗口 prelude+窗口），属多窗口结构特性。
 
-## 读取字节数权衡（remote_bytes）
+## 读取字节数优化（freq-skip + posting 级 dd/freq 分组）
 
-成本模型按 1MiB 块对齐计费，故 remote_bytes 反映触及的块数：
-- **TERM mid/low-df：SNII 更少**（1.0 vs 2.1MB；命中少、单块）。
-- **TERM high-df：SNII 略多**（5M 5.2 vs 4.2MB；多窗口整读高频词全倒排）。
-- **5-term 短语：子块跳读后 SNII 反而更少**（5M 15.7 vs 21.8MB）——只读命中窗口。
+设计覆盖审计发现：`dd_part_len`（bitmap/docid-only 跳过 freq）等省字节设计当时只 CPU 跳过、未网络跳过。实现了 #1–#5（详见 `docs/superpowers/specs/2026-06-18-snii-read-byte-optimizations-design.md`）：① docid-only term 与所有短语只读每窗 docs 区、跳 freq；② 同-term coalesce_gap；③ 真实 max_norm；④ 自适应窗口；⑤ WAND 选择性读窗口；并据实测把 frq posting 重排为 **`[prelude][dd-block][freq-block]`**（dd/freq 分离到 posting 级），docid-only 读**一段连续 dd 块**。
 
-整体符合设计文档取舍：
+**两个字节口径**：`remote_bytes`=1MiB FileCache 块对齐（Doris 部署的缓存占用）；`request_bytes`=精确请求字节（= 设计「所有 range 返回总字节」，直连 S3 / 带宽口径）。
 
-> 代价可能是增加倒排索引数据大小，换取冷查性能；在存算分离模式下 file cache 与 S3 单位字节约 10:1，牺牲一些索引大小换取更少的 file cache。
+**5M 实测（优化后，CLucene → SNII；全部 `ALL DOCIDS MATCH`）**：
 
-设计优先级是**先降串行轮次与远端请求数**，其次才是字节数——延迟主指标（serial_rounds / range_gets）SNII 全规模全查询占优或持平。
+| 查询 | read_at | serial_rounds | remote_bytes(块对齐) | **request_bytes(精确)** |
+|---|---|---|---|---|
+| TERM high-df | 43 → **3** | 4 → **3** | 4.2 → **3.1MB** | 2.82MB → **1.37MB（2.1×）** |
+| TERM mid/low | 2 → **1** | 2 → **1** | 2.1 → **1.0MB** | 131KB → **~400 B（~300×）** |
+| 5-term PHRASE | 90 → **38** | 16 → **8** | 21.8 → **15.7MB** | 10.77MB → **0.96MB（11×）** |
+
+**posting 级分组的效果**（TERM high-df，优化迭代）：
+- 每窗交错布局（freq-skip 初版）→ docid-only 碎片化：read_at **4532**、remote_bytes 5.2MB（块对齐掩盖、不降）。
+- posting 级分组 → 连续 dd 块：read_at **3**、remote_bytes **5.2→3.1MB（−40%，FileCache 下也省块）**、request_bytes 1.37MB。**read_at / range_gets / 字节三指标全降**，符合设计优先级（先降轮次与请求数，再降字节）。
+
+> 设计原话：代价可能是增加倒排索引数据大小，换取冷查性能；存算分离下 file cache 与 S3 单位字节约 10:1。优化后 SNII 在精确字节上对 CLucene 全面领先（短语 11×、term 2×），FileCache 块占用 high-df term 亦降 40%。
 
 ## 方法论与公平性说明（诚实标注）
 
