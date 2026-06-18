@@ -15,7 +15,9 @@
 #include <aws/s3/model/HeadObjectRequest.h>
 #include <aws/s3/model/PutObjectRequest.h>
 
+#include <algorithm>
 #include <atomic>
+#include <future>
 #include <mutex>
 #include <sstream>
 #include <utility>
@@ -129,6 +131,30 @@ Status S3FileReader::read_at(uint64_t offset, size_t len,
     return Status::Corruption("GetObject returned fewer bytes than requested");
   }
   return Status::OK();
+}
+
+Status S3FileReader::read_batch(const std::vector<Range>& ranges,
+                                std::vector<std::vector<uint8_t>>* outs) {
+  outs->resize(ranges.size());
+  if (ranges.empty()) return Status::OK();
+  // Issue GETs concurrently in bounded waves; aws S3Client is safe for parallel
+  // requests and each range writes a distinct output buffer.
+  constexpr size_t kMaxConcurrent = 16;
+  Status first_err;
+  for (size_t base = 0; base < ranges.size(); base += kMaxConcurrent) {
+    const size_t end = std::min(base + kMaxConcurrent, ranges.size());
+    std::vector<std::future<Status>> futs;
+    for (size_t i = base; i < end; ++i) {
+      futs.push_back(std::async(std::launch::async, [this, &ranges, outs, i]() {
+        return read_at(ranges[i].offset, ranges[i].len, &(*outs)[i]);
+      }));
+    }
+    for (auto& f : futs) {
+      const Status s = f.get();
+      if (!s.ok() && first_err.ok()) first_err = s;
+    }
+  }
+  return first_err;
 }
 
 // ---------------------------------------------------------------------------

@@ -93,11 +93,10 @@ Status MeteredFileReader::read_batch(const std::vector<Range>& ranges,
   }
   if (any_miss) ++metrics_.serial_rounds;
 
-  outs->resize(ranges.size());
-  for (size_t i = 0; i < ranges.size(); ++i) {
-    SNII_RETURN_IF_ERROR(inner_->read_at(ranges[i].offset, ranges[i].len, &(*outs)[i]));
-  }
-  return Status::OK();
+  // Delegate the actual byte fetch to the inner reader's batch path, so a backend
+  // that fetches a batch concurrently (e.g. S3FileReader) realizes the planned
+  // round as parallel GETs (matching the single serial round accounted above).
+  return inner_->read_batch(ranges, outs);
 }
 
 }  // namespace snii::io

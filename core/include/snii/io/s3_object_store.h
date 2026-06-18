@@ -73,6 +73,10 @@ class S3FileReader : public FileReader {
                      S3FileReader* out);
 
   Status read_at(uint64_t offset, size_t len, std::vector<uint8_t>* out) override;
+  // Concurrent batch: issues the ranges' GetObjects in parallel (bounded), so a
+  // planned read round costs ~one round-trip instead of the sum of all GETs.
+  Status read_batch(const std::vector<Range>& ranges,
+                    std::vector<std::vector<uint8_t>>* outs) override;
   uint64_t size() const override { return size_; }
 
  private:
