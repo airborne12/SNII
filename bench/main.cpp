@@ -12,7 +12,10 @@
 // For every query the runner asserts SNII docids == CLucene docids == oracle
 // docids (all sorted). Any mismatch exits nonzero.
 
+#include <unistd.h>
+
 #include <algorithm>
+#include <chrono>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
@@ -27,6 +30,13 @@
 #include "snii/io/metered_file_reader.h"
 #include "snii_adapter.h"
 
+#ifdef SNII_WITH_S3
+#include "clucene_oss_adapter.h"
+#include "oss_cleanup.h"
+#include "snii/io/s3_object_store.h"
+#include "snii_oss_adapter.h"
+#endif
+
 namespace {
 
 struct Args {
@@ -35,6 +45,7 @@ struct Args {
   double zipf = 1.1;
   uint32_t doclen = 12;
   uint64_t seed = 42;
+  bool oss = false;  // run the real-OSS wall-clock comparison instead of local
 };
 
 Args parse_args(int argc, char** argv) {
@@ -59,6 +70,8 @@ Args parse_args(int argc, char** argv) {
           static_cast<uint32_t>(std::strtoul(next("--doclen"), nullptr, 10));
     } else if (flag == "--seed") {
       a.seed = std::strtoull(next("--seed"), nullptr, 10);
+    } else if (flag == "--oss") {
+      a.oss = true;
     } else {
       std::fprintf(stderr, "unknown argument: %s\n", flag.c_str());
       std::exit(2);
@@ -149,6 +162,201 @@ void print_metrics_row(const char* engine, const snii::io::IoMetrics& m) {
               static_cast<unsigned long long>(m.remote_bytes));
 }
 
+#ifdef SNII_WITH_S3
+// One real-OSS query result: wall-clock latency for both engines plus their
+// (identical cost model) I/O metrics and the docid-equality verdict.
+struct OssQueryResult {
+  std::string label;
+  size_t hits = 0;
+  double snii_wall_ms = 0.0;
+  double clucene_wall_ms = 0.0;
+  snii::io::IoMetrics snii;
+  snii::io::IoMetrics clucene;
+  bool docids_match = false;
+};
+
+double ms_since(std::chrono::steady_clock::time_point t0) {
+  return std::chrono::duration<double, std::milli>(
+             std::chrono::steady_clock::now() - t0)
+      .count();
+}
+
+// Builds the OSS connection config. Credentials are read from the environment
+// (SNII_OSS_AK / SNII_OSS_SK) and never hardcoded. A per-run prefix suffix keeps
+// concurrent runs from colliding on the same object keys.
+bool build_oss_config(snii::io::S3Config* cfg) {
+  const char* ak = std::getenv("SNII_OSS_AK");
+  const char* sk = std::getenv("SNII_OSS_SK");
+  if (ak == nullptr || sk == nullptr || ak[0] == '\0' || sk[0] == '\0') {
+    std::fprintf(stderr,
+                 "FATAL: --oss requires SNII_OSS_AK and SNII_OSS_SK in the "
+                 "environment\n");
+    return false;
+  }
+  cfg->endpoint = "oss-cn-hongkong.aliyuncs.com";
+  cfg->region = "cn-hongkong";
+  cfg->bucket = "doris-community-test";
+  cfg->prefix = "cloud_regression/snii_oss_bench/run_" +
+                std::to_string(static_cast<long long>(::getpid()));
+  cfg->ak = ak;
+  cfg->sk = sk;
+  return true;
+}
+
+void print_oss_metrics_row(const char* engine, double wall_ms,
+                           const snii::io::IoMetrics& m) {
+  std::printf("  %-8s wall_ms=%-9.1f serial_rounds=%-4llu range_gets=%-4llu "
+              "remote_bytes=%-9llu\n",
+              engine, wall_ms,
+              static_cast<unsigned long long>(m.serial_rounds),
+              static_cast<unsigned long long>(m.range_gets),
+              static_cast<unsigned long long>(m.remote_bytes));
+}
+
+// Runs the full real-OSS comparison. Returns the process exit code (0 on success
+// with all docids matching, nonzero otherwise).
+int run_oss_mode(const Args& args, const bench::Corpus& corpus,
+                 const Oracle& oracle) {
+  snii::io::S3Config cfg;
+  if (!build_oss_config(&cfg)) return 2;
+
+  // One process-wide aws InitAPI/ShutdownAPI guard on the main stack.
+  snii::io::AwsApiGuard aws_guard;
+
+  std::printf("\n=== REAL-OSS mode ===\n");
+  std::printf("oss endpoint=%s bucket=%s prefix=%s\n", cfg.endpoint.c_str(),
+              cfg.bucket.c_str(), cfg.prefix.c_str());
+
+  bench::SniiOssAdapter snii_idx;
+  bench::CluceneOssAdapter cl_idx;
+  std::vector<std::string> all_keys;  // for best-effort cleanup at the end
+  try {
+    std::printf("building + uploading SNII index to OSS...\n");
+    auto t0 = std::chrono::steady_clock::now();
+    snii_idx.build_upload_and_open(corpus, cfg);
+    std::printf("  SNII uploaded in %.0f ms (key=%s)\n", ms_since(t0),
+                snii_idx.uploaded_key().c_str());
+    all_keys.push_back(snii_idx.uploaded_key());
+
+    std::printf("building + uploading CLucene index to OSS...\n");
+    t0 = std::chrono::steady_clock::now();
+    cl_idx.build_upload_and_open(corpus, cfg);
+    std::printf("  CLucene uploaded %zu files in %.0f ms\n",
+                cl_idx.uploaded_keys().size(), ms_since(t0));
+    for (const std::string& k : cl_idx.uploaded_keys()) all_keys.push_back(k);
+  } catch (const std::exception& e) {
+    std::fprintf(stderr, "FATAL: OSS index build/upload failed: %s\n", e.what());
+    bench::oss_delete_objects(cfg, all_keys);
+    return 1;
+  }
+
+  const std::string high_term = corpus.vocab[bench::highest_df_term(corpus)];
+  const std::string mid_term = corpus.vocab[bench::mid_df_term(corpus)];
+  const std::string low_term = corpus.vocab[bench::low_df_term(corpus)];
+  const std::vector<std::string> phrase = bench::extract_phrase(corpus, 5);
+
+  std::printf("query terms: high-df='%s'(df=%zu) mid-df='%s'(df=%zu) "
+              "low-df='%s'(df=%zu)\n",
+              high_term.c_str(), oracle.term(high_term).size(), mid_term.c_str(),
+              oracle.term(mid_term).size(), low_term.c_str(),
+              oracle.term(low_term).size());
+  std::printf("phrase: '%s'\n", join_words(phrase).c_str());
+
+  std::vector<OssQueryResult> results;
+  bool all_match = true;
+
+  auto run_term = [&](const std::string& label, const std::string& term) {
+    OssQueryResult r;
+    r.label = label + " '" + term + "'";
+    std::vector<uint32_t> sdoc, cdoc;
+    try {
+      auto t0 = std::chrono::steady_clock::now();
+      snii_idx.term_query(term, &sdoc, &r.snii);
+      r.snii_wall_ms = ms_since(t0);
+      t0 = std::chrono::steady_clock::now();
+      cl_idx.term_query(term, &cdoc, &r.clucene);
+      r.clucene_wall_ms = ms_since(t0);
+    } catch (const std::exception& e) {
+      std::fprintf(stderr, "FATAL: OSS term query '%s' failed: %s\n",
+                   term.c_str(), e.what());
+      bench::oss_delete_objects(cfg, all_keys);
+      std::exit(1);
+    }
+    const std::vector<uint32_t> odoc = oracle.term(term);
+    r.hits = sdoc.size();
+    r.docids_match = (sdoc == cdoc) && (sdoc == odoc);
+    if (!r.docids_match) {
+      all_match = false;
+      std::fprintf(stderr,
+                   "MISMATCH on %s: snii=%zu clucene=%zu oracle=%zu\n",
+                   r.label.c_str(), sdoc.size(), cdoc.size(), odoc.size());
+    }
+    results.push_back(r);
+  };
+
+  auto run_phrase = [&](const std::vector<std::string>& words) {
+    OssQueryResult r;
+    r.label = "PHRASE '" + join_words(words) + "'";
+    std::vector<uint32_t> sdoc, cdoc;
+    try {
+      auto t0 = std::chrono::steady_clock::now();
+      snii_idx.phrase_query(words, &sdoc, &r.snii);
+      r.snii_wall_ms = ms_since(t0);
+      t0 = std::chrono::steady_clock::now();
+      cl_idx.phrase_query(words, &cdoc, &r.clucene);
+      r.clucene_wall_ms = ms_since(t0);
+    } catch (const std::exception& e) {
+      std::fprintf(stderr, "FATAL: OSS phrase query failed: %s\n", e.what());
+      bench::oss_delete_objects(cfg, all_keys);
+      std::exit(1);
+    }
+    const std::vector<uint32_t> odoc = oracle.phrase(words);
+    r.hits = sdoc.size();
+    r.docids_match = (sdoc == cdoc) && (sdoc == odoc);
+    if (!r.docids_match) {
+      all_match = false;
+      std::fprintf(stderr,
+                   "MISMATCH on PHRASE: snii=%zu clucene=%zu oracle=%zu\n",
+                   sdoc.size(), cdoc.size(), odoc.size());
+    }
+    results.push_back(r);
+  };
+
+  run_term("TERM high-df", high_term);
+  run_term("TERM mid-df", mid_term);
+  run_term("TERM low-df", low_term);
+  if (!phrase.empty()) {
+    run_phrase(phrase);
+  } else {
+    std::fprintf(stderr, "WARNING: no 5-token phrase found in corpus\n");
+  }
+
+  std::printf("\n=== REAL-OSS wall-clock comparison (CLucene vs SNII, "
+              "same cost model, real OSS GETs) ===\n");
+  for (const OssQueryResult& r : results) {
+    std::printf("[%s]  hits=%zu  docids_match=%s\n", r.label.c_str(), r.hits,
+                r.docids_match ? "YES" : "NO");
+    print_oss_metrics_row("CLucene", r.clucene_wall_ms, r.clucene);
+    print_oss_metrics_row("SNII", r.snii_wall_ms, r.snii);
+    std::printf("  ratio    wall_ms(CL/SNII)=%.2f  serial_rounds(CL/SNII)=%.2f  "
+                "range_gets(CL/SNII)=%.2f\n",
+                ratio(static_cast<uint64_t>(r.clucene_wall_ms),
+                      static_cast<uint64_t>(r.snii_wall_ms)),
+                ratio(r.clucene.serial_rounds, r.snii.serial_rounds),
+                ratio(r.clucene.range_gets, r.snii.range_gets));
+  }
+
+  // Best-effort cleanup of the uploaded OSS objects.
+  const size_t removed = bench::oss_delete_objects(cfg, all_keys);
+  std::printf("\ncleanup: removed %zu / %zu OSS objects\n", removed,
+              all_keys.size());
+
+  std::printf("\nresult: %s\n",
+              all_match ? "ALL DOCIDS MATCH" : "DOCID MISMATCH");
+  return all_match ? 0 : 1;
+}
+#endif  // SNII_WITH_S3
+
 }  // namespace
 
 int main(int argc, char** argv) {
@@ -163,6 +371,18 @@ int main(int argc, char** argv) {
   const bench::Corpus corpus =
       bench::generate(args.docs, args.vocab, args.zipf, args.doclen, args.seed);
   const Oracle oracle(corpus);
+
+  // 1b. Real-OSS mode: build + upload both indexes to OSS and run the SAME
+  //     queries reading from OSS, measuring real wall-clock for both engines.
+  if (args.oss) {
+#ifdef SNII_WITH_S3
+    return run_oss_mode(args, corpus, oracle);
+#else
+    std::fprintf(stderr,
+                 "FATAL: --oss requires building with -DSNII_WITH_S3=ON\n");
+    return 2;
+#endif
+  }
 
   // 2. Build both indexes over the SAME corpus.
   bench::SniiAdapter snii_idx;
