@@ -60,13 +60,18 @@ uint8_t pack_win_mode(const DictEntry& e) {
 }
 
 // Writes the slim/inline region codec metadata (dd always; freq when tier>=T2).
-void write_region_meta(const DictEntry& e, IndexTier tier, ByteSink* sink) {
+// store_crc=false (INLINE entries, format v2) omits the redundant per-region
+// crc32c: the inline bytes already sit inside the dict block, whose own
+// block-level crc32c covers them. POD-ref entries pass store_crc=true (their
+// regions live in the separately-fetched .frq POD, uncovered by the block crc).
+void write_region_meta(const DictEntry& e, IndexTier tier, bool store_crc,
+                       ByteSink* sink) {
   sink->put_u8(pack_win_mode(e));
   sink->put_varint64(e.dd_meta.uncomp_len);
-  sink->put_fixed32(e.dd_meta.crc);
+  if (store_crc) sink->put_fixed32(e.dd_meta.crc);
   if (!tier_has_stats(tier)) return;
   sink->put_varint64(e.freq_meta.uncomp_len);
-  sink->put_fixed32(e.freq_meta.crc);
+  if (store_crc) sink->put_fixed32(e.freq_meta.crc);
 }
 
 void write_pod_ref(const DictEntry& e, IndexTier tier, ByteSink* sink) {
@@ -76,7 +81,8 @@ void write_pod_ref(const DictEntry& e, IndexTier tier, ByteSink* sink) {
     sink->put_varint64(e.prelude_len);
   } else {
     sink->put_varint64(e.frq_docs_len);  // slim pod_ref: dd region on-disk length
-    write_region_meta(e, tier, sink);
+    // POD-ref regions live in the .frq POD (not covered by the block crc): keep crc.
+    write_region_meta(e, tier, /*store_crc=*/true, sink);
   }
   if (!tier_has_stats(tier)) return;
   sink->put_varint64(e.prx_off_delta);
@@ -87,7 +93,8 @@ void write_inline(const DictEntry& e, IndexTier tier, ByteSink* sink) {
   sink->put_varint64(static_cast<uint64_t>(e.frq_bytes.size()));
   sink->put_bytes(Slice(e.frq_bytes));
   sink->put_varint64(e.inline_dd_disk_len);
-  write_region_meta(e, tier, sink);
+  // INLINE bytes are covered by the dict block crc32c: omit the redundant per-region crc.
+  write_region_meta(e, tier, /*store_crc=*/false, sink);
   if (!tier_has_stats(tier)) return;
   sink->put_varint64(static_cast<uint64_t>(e.prx_bytes.size()));
   sink->put_bytes(Slice(e.prx_bytes));
@@ -129,10 +136,14 @@ Status read_stats(ByteSource* src, IndexTier tier, DictEntry* out) {
   return Status::OK();
 }
 
-// Reads the slim/inline region codec metadata (mode/uncomp/crc) and fills the
-// dd/freq region disk_len from the supplied total/split lengths.
-Status read_region_meta(ByteSource* src, IndexTier tier, uint64_t dd_disk_len,
-                        uint64_t freq_disk_len, DictEntry* out) {
+// Reads the slim/inline region codec metadata (mode/uncomp/[crc]) and fills the
+// dd/freq region disk_len from the supplied total/split lengths. has_crc=false
+// (INLINE entries, format v2) means no per-region crc was stored: the on-disk
+// crc field is absent and region decode must skip crc verification (verify_crc=
+// false) since the dict block's own crc32c already covers the inline bytes.
+Status read_region_meta(ByteSource* src, IndexTier tier, bool has_crc,
+                        uint64_t dd_disk_len, uint64_t freq_disk_len,
+                        DictEntry* out) {
   uint8_t mode = 0;
   SNII_RETURN_IF_ERROR(src->get_u8(&mode));
   if ((mode & ~0x3u) != 0) {
@@ -140,8 +151,9 @@ Status read_region_meta(ByteSource* src, IndexTier tier, uint64_t dd_disk_len,
   }
   out->dd_meta.zstd = (mode & (1u << 0)) != 0;
   out->dd_meta.disk_len = dd_disk_len;
+  out->dd_meta.verify_crc = has_crc;
   SNII_RETURN_IF_ERROR(src->get_varint64(&out->dd_meta.uncomp_len));
-  SNII_RETURN_IF_ERROR(src->get_fixed32(&out->dd_meta.crc));
+  if (has_crc) SNII_RETURN_IF_ERROR(src->get_fixed32(&out->dd_meta.crc));
   if (!tier_has_stats(tier)) {
     if (mode & (1u << 1)) {
       return Status::Corruption("dict_entry: freq mode set without freq tier");
@@ -150,8 +162,9 @@ Status read_region_meta(ByteSource* src, IndexTier tier, uint64_t dd_disk_len,
   }
   out->freq_meta.zstd = (mode & (1u << 1)) != 0;
   out->freq_meta.disk_len = freq_disk_len;
+  out->freq_meta.verify_crc = has_crc;
   SNII_RETURN_IF_ERROR(src->get_varint64(&out->freq_meta.uncomp_len));
-  SNII_RETURN_IF_ERROR(src->get_fixed32(&out->freq_meta.crc));
+  if (has_crc) SNII_RETURN_IF_ERROR(src->get_fixed32(&out->freq_meta.crc));
   return Status::OK();
 }
 
@@ -165,7 +178,8 @@ Status read_pod_ref(ByteSource* src, IndexTier tier, DictEntry* out) {
     if (out->frq_docs_len > out->frq_len) {
       return Status::Corruption("dict_entry: frq_docs_len exceeds frq_len");
     }
-    SNII_RETURN_IF_ERROR(read_region_meta(src, tier, out->frq_docs_len,
+    SNII_RETURN_IF_ERROR(read_region_meta(src, tier, /*has_crc=*/true,
+                                          out->frq_docs_len,
                                           out->frq_len - out->frq_docs_len, out));
   }
   if (!tier_has_stats(tier)) return Status::OK();
@@ -191,8 +205,10 @@ Status read_inline(ByteSource* src, IndexTier tier, DictEntry* out) {
   }
   const uint64_t freq_disk_len =
       static_cast<uint64_t>(out->frq_bytes.size()) - out->inline_dd_disk_len;
-  SNII_RETURN_IF_ERROR(
-      read_region_meta(src, tier, out->inline_dd_disk_len, freq_disk_len, out));
+  // INLINE entries store no per-region crc (covered by the block crc): has_crc=false.
+  SNII_RETURN_IF_ERROR(read_region_meta(src, tier, /*has_crc=*/false,
+                                        out->inline_dd_disk_len, freq_disk_len,
+                                        out));
   if (!tier_has_stats(tier)) return Status::OK();
   SNII_RETURN_IF_ERROR(read_byte_blob(src, &out->prx_bytes));
   return Status::OK();

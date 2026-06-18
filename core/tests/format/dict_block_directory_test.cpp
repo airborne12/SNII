@@ -33,9 +33,33 @@ void ExpectRefEq(const BlockRef& a, const BlockRef& b) {
   EXPECT_EQ(a.n_entries, b.n_entries);
   EXPECT_EQ(a.flags, b.flags);
   EXPECT_EQ(a.checksum, b.checksum);
+  EXPECT_EQ(a.uncomp_len, b.uncomp_len);
 }
 
 }  // namespace
+
+// A zstd-compressed block ref carries uncomp_len; a raw ref does not. Both
+// round-trip exactly, and the raw ref's directory bytes stay v1-compact (no
+// trailing uncomp_len varint when the kZstd flag is clear).
+TEST(DictBlockDirectory, ZstdRefCarriesUncompLen) {
+  std::vector<BlockRef> refs = {
+      {0, 40000, 250, block_ref_flags::kZstd, 0xABCDEF01u, 65536},  // compressed
+      {40000, 4096, 64, 0, 0x11223344u, 0},                         // raw
+  };
+  auto bytes = Build(refs);
+  DictBlockDirectoryReader reader;
+  ASSERT_TRUE(DictBlockDirectoryReader::open(Slice(bytes), &reader).ok());
+  ASSERT_EQ(reader.n_blocks(), 2u);
+  BlockRef z{}, r{};
+  ASSERT_TRUE(reader.get(0, &z).ok());
+  ASSERT_TRUE(reader.get(1, &r).ok());
+  ExpectRefEq(z, refs[0]);
+  ExpectRefEq(r, refs[1]);
+  EXPECT_EQ(z.uncomp_len, 65536u);
+  EXPECT_TRUE((z.flags & block_ref_flags::kZstd) != 0);
+  EXPECT_EQ(r.uncomp_len, 0u);
+  EXPECT_FALSE((r.flags & block_ref_flags::kZstd) != 0);
+}
 
 TEST(DictBlockDirectory, RoundTripMultipleRefs) {
   std::vector<BlockRef> refs = {

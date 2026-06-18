@@ -131,9 +131,11 @@ class LogicalIndexWriter {
   // absolute file offset is computed as dict_region_offset + rel_offset.
   struct BlockRecord {
     uint64_t rel_offset = 0;  // byte offset of this block within the dict region
-    uint64_t length = 0;      // serialized block length
+    uint64_t length = 0;      // ON-DISK block length (compressed when flags&kZstd)
     uint32_t n_entries = 0;
-    uint32_t checksum = 0;
+    uint32_t checksum = 0;    // crc32c of the UNCOMPRESSED block bytes
+    uint8_t flags = 0;        // block_ref_flags::* (kZstd when block is compressed)
+    uint64_t uncomp_len = 0;  // uncompressed block length (when flags&kZstd)
     std::string first_term;
   };
 

@@ -106,6 +106,12 @@ struct WindowMeta {
   uint64_t prx_len = 0;  // valid only when has_prx
   uint32_t max_freq = 0;
   uint8_t max_norm = 0;
+
+  // In-memory only (NOT serialized in the prelude row). When false, the dd/freq
+  // region decode skips crc verification -- used when these region bytes are
+  // covered by an enclosing crc (e.g. an INLINE entry inside its dict block).
+  // Windowed/slim POD-ref rows leave this true (their regions carry a crc).
+  bool verify_crc = true;
 };
 
 // Builder input: one fully-computed WindowMeta per window, in term order, plus the

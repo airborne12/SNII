@@ -2,7 +2,9 @@
 
 #include <vector>
 
+#include "snii/encoding/zstd_codec.h"
 #include "snii/format/dict_block.h"
+#include "snii/format/dict_block_directory.h"
 
 namespace snii::reader {
 
@@ -60,12 +62,21 @@ Status LogicalIndexReader::lookup(std::string_view term, bool* found,
   BlockRef ref{};
   SNII_RETURN_IF_ERROR(dbd_.get(ordinal, &ref));
 
-  // 4. One range read of the DICT block, then anchor search.
+  // 4. One range read of the DICT block, then anchor search. A zstd-compressed
+  //    block is fetched compressed (fewer S3 bytes) and decompressed in RAM
+  //    before parsing; the block-level crc32c still validates the inflated bytes.
   std::vector<uint8_t> block_bytes;
   SNII_RETURN_IF_ERROR(reader_->read_at(ref.offset, ref.length, &block_bytes));
+  std::vector<uint8_t> inflated;
+  Slice block_slice(block_bytes);
+  if (ref.flags & snii::format::block_ref_flags::kZstd) {
+    SNII_RETURN_IF_ERROR(snii::zstd_decompress(
+        Slice(block_bytes), static_cast<size_t>(ref.uncomp_len), &inflated));
+    block_slice = Slice(inflated);
+  }
   DictBlockReader br;
   SNII_RETURN_IF_ERROR(
-      DictBlockReader::open(Slice(block_bytes), tier_, has_positions_, &br));
+      DictBlockReader::open(block_slice, tier_, has_positions_, &br));
 
   bool hit = false;
   SNII_RETURN_IF_ERROR(br.find_term(term, &hit, entry));

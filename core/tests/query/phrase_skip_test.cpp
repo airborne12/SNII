@@ -189,6 +189,9 @@ bool DecodeFullTerm(const LogicalIndexReader& idx, const std::string& term,
   meta.dd_uncomp_len = entry.dd_meta.uncomp_len;
   meta.dd_disk_len = entry.dd_meta.disk_len;
   meta.crc_dd = entry.dd_meta.crc;
+  // INLINE entries (format v2) carry no per-region crc -- their bytes are covered
+  // by the dict block crc32c -- so decode must skip the region crc check.
+  meta.verify_crc = entry.dd_meta.verify_crc;
   EXPECT_LE(entry.dd_meta.disk_len, frq.size());
   Slice dd_region(frq.data(), static_cast<size_t>(entry.dd_meta.disk_len));
   std::vector<uint32_t> freqs;

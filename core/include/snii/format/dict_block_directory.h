@@ -9,15 +9,27 @@
 
 namespace snii::format {
 
+// BlockRef.flags bit definitions.
+namespace block_ref_flags {
+// bit0: the on-disk block bytes are zstd(uncompressed_block). When set, the
+// directory also stores uncomp_len, and the reader zstd-decompresses the fetched
+// [offset, offset+length) range to uncomp_len before parsing the dict block. The
+// block-level crc32c (and BlockRef.checksum) cover the UNCOMPRESSED bytes, so a
+// zstd block shrinks the bytes fetched from S3 while keeping the same integrity
+// guarantees after decompression in RAM.
+inline constexpr uint8_t kZstd = 1u << 0;
+}  // namespace block_ref_flags
+
 // Physical location and checksum info for a single DICT block. Aligned with SampledTermIndex by ordinal:
 // SampledTermIndex[i]'s first_term corresponds to DictBlockDirectory[i] (see design spec
 // "sampled dict index"). The read path issues a single range read over [offset, offset+length).
 struct BlockRef {
   uint64_t offset = 0;     // absolute byte offset of the block within the container
-  uint64_t length = 0;     // byte length of the block
+  uint64_t length = 0;     // ON-DISK byte length of the block (compressed when kZstd)
   uint32_t n_entries = 0;  // number of DictEntry records within this block
-  uint8_t flags = 0;       // block-level flags (encoding/compression etc., passed through in this release)
-  uint32_t checksum = 0;   // crc32c of the block's own content (verified after read)
+  uint8_t flags = 0;       // block-level flags (block_ref_flags::*)
+  uint32_t checksum = 0;   // crc32c of the block's UNCOMPRESSED content (verified after read)
+  uint64_t uncomp_len = 0; // uncompressed block byte length (stored only when kZstd set)
 };
 
 // DICT block directory: block ordinal → physical location mapping.

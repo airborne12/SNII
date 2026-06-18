@@ -9,12 +9,15 @@ namespace snii::format {
 namespace {
 
 // Each block_ref has a fixed field order; reuse ByteSink varint/fixed primitives — do not hand-craft bytes manually.
+// uncomp_len trails only when the kZstd flag is set, so uncompressed-block
+// directories keep their compact (v1-identical) per-ref byte layout.
 void encode_ref(const BlockRef& ref, ByteSink* payload) {
   payload->put_varint64(ref.offset);
   payload->put_varint64(ref.length);
   payload->put_varint32(ref.n_entries);
   payload->put_u8(ref.flags);
   payload->put_fixed32(ref.checksum);
+  if (ref.flags & block_ref_flags::kZstd) payload->put_varint64(ref.uncomp_len);
 }
 
 Status decode_ref(ByteSource* ps, BlockRef* ref) {
@@ -23,6 +26,9 @@ Status decode_ref(ByteSource* ps, BlockRef* ref) {
   SNII_RETURN_IF_ERROR(ps->get_varint32(&ref->n_entries));
   SNII_RETURN_IF_ERROR(ps->get_u8(&ref->flags));
   SNII_RETURN_IF_ERROR(ps->get_fixed32(&ref->checksum));
+  if (ref->flags & block_ref_flags::kZstd) {
+    SNII_RETURN_IF_ERROR(ps->get_varint64(&ref->uncomp_len));
+  }
   return Status::OK();
 }
 

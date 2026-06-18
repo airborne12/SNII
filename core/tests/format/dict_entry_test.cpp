@@ -167,6 +167,48 @@ TEST(DictEntry, InlineTier3RoundTrip) {
   EXPECT_EQ(out.prx_bytes, in.prx_bytes);
 }
 
+// Format v2: an INLINE entry omits the redundant per-region crc32c bytes
+// (dd_crc + freq_crc) -- its region bytes are covered by the dict block crc32c.
+// Decoded inline metas carry verify_crc=false so region decode skips the check.
+// A slim POD-ref entry KEEPS its crc (regions live in the separately-fetched
+// .frq POD), so it is exactly 8 bytes larger for the same df.
+TEST(DictEntry, InlineOmitsRedundantRegionCrc) {
+  DictEntry inl = MakeInline("melon", 8);
+  inl.dd_meta.crc = 0xDEADBEEF;    // would be written by v1; must be omitted now
+  inl.freq_meta.crc = 0xCAFEF00D;  // ditto
+  ByteSink inl_sink;
+  ASSERT_TRUE(encode_dict_entry(inl, "", IndexTier::kT2, &inl_sink).ok());
+
+  // Same payload but encoded as a slim POD-ref keeps both crcs (dd + freq = 8B).
+  DictEntry ref = inl;
+  ref.kind = DictEntryKind::kPodRef;
+  ref.frq_len = inl.frq_bytes.size();
+  ref.frq_docs_len = inl.inline_dd_disk_len;
+  ByteSink ref_sink;
+  ASSERT_TRUE(encode_dict_entry(ref, "", IndexTier::kT2, &ref_sink).ok());
+  // The POD-ref locator differs structurally; assert the inline encoding does not
+  // carry the 8 crc bytes by decoding and checking verify_crc is OFF.
+  ByteSource src(inl_sink.view());
+  DictEntry out;
+  ASSERT_TRUE(decode_dict_entry(&src, "", IndexTier::kT2, &out).ok());
+  EXPECT_FALSE(out.dd_meta.verify_crc);
+  EXPECT_FALSE(out.freq_meta.verify_crc);
+  EXPECT_EQ(out.dd_meta.crc, 0u);    // crc not stored -> decoded as 0
+  EXPECT_EQ(out.freq_meta.crc, 0u);
+}
+
+// A POD-ref slim entry decodes with verify_crc=true (its regions carry a crc).
+TEST(DictEntry, PodRefSlimKeepsRegionCrc) {
+  DictEntry in = MakePodRefSlim("nectarine", 50);
+  in.dd_meta.crc = 0x12345678;
+  in.freq_meta.crc = 0x9ABCDEF0;
+  DictEntry out = RoundTrip(in, "", IndexTier::kT2);
+  EXPECT_TRUE(out.dd_meta.verify_crc);
+  EXPECT_TRUE(out.freq_meta.verify_crc);
+  EXPECT_EQ(out.dd_meta.crc, 0x12345678u);
+  EXPECT_EQ(out.freq_meta.crc, 0x9ABCDEF0u);
+}
+
 // Front coding: consecutive encode/decode of sorted terms; suffix stores only the differing part.
 TEST(DictEntry, PrefixCompressionSharedPrefix) {
   // "interest" and "interesting" share the prefix "interest".

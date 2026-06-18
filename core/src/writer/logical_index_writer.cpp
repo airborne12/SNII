@@ -7,7 +7,9 @@
 
 #include "snii/common/slice.h"
 #include "snii/encoding/crc32c.h"
+#include "snii/encoding/zstd_codec.h"
 #include "snii/format/dict_block.h"
+#include "snii/format/dict_block_directory.h"
 #include "snii/format/frq_prelude.h"
 #include "snii/format/frq_pod.h"
 #include "snii/format/norms_pod.h"
@@ -40,6 +42,12 @@ constexpr int kAutoZstd = -1;
 constexpr int kRawFrqRegion = 0;
 // Windows per super-block in the two-level prelude directory (design section 5).
 constexpr uint32_t kPreludeGroupSize = 64;
+// zstd level for whole-DICT-block compression. Level 3 (zstd default) compresses
+// the 64KiB front-coded term-key + entry-meta + inline-posting blocks ~40% at
+// ~120 MiB/s encode / ~600 MiB/s decode -- a large size win for a small build-CPU
+// cost, and a per-lookup decode (~0.1ms/64KiB) that is dominated by the S3 round
+// trip it shrinks. Higher levels gain <1% here for materially more CPU.
+constexpr int kDictBlockZstdLevel = 3;
 
 using snii::format::FrqRegionMeta;
 
@@ -418,21 +426,39 @@ Status LogicalIndexWriter::build_entry(TermPostings& tp, uint64_t frq_base,
   return build_slim_entry(tp, frq_base, prx_base, e);
 }
 
-// Serializes the current open block, streams its bytes straight into the dict
-// scratch file (not retained in RAM), and records a compact directory entry. The
-// block's offset within the dict region is the dict file's running size, so the
-// concatenation order/content is identical to the old in-RAM dict_region_.
+// Serializes the current open block, zstd-compresses it (the dict region is the
+// single largest section -- term keys + entry meta + inline postings -- and the
+// 64KiB blocks compress ~40%), streams the compressed bytes into the dict scratch
+// file, and records a directory entry. The block-level crc32c (rec.checksum)
+// covers the UNCOMPRESSED bytes, so DictBlockReader::open verifies integrity
+// after the reader decompresses. A compressed block also shrinks the bytes a term
+// lookup fetches from S3 -- aligning with the read-byte thesis. If zstd does not
+// shrink a (tiny) block, it is stored raw so a lookup never pays a pointless
+// decompress.
 Status LogicalIndexWriter::flush_block(DictBlockBuilder* block,
                                        std::string first_term) {
   ByteSink bsink;
   block->finish(&bsink);
+  const Slice plain = bsink.view();
   BlockRecord rec;
   rec.rel_offset = dict_file_.size();
-  rec.length = static_cast<uint64_t>(bsink.size());
   rec.n_entries = block->n_entries();
-  rec.checksum = snii::crc32c(bsink.view());
+  rec.checksum = snii::crc32c(plain);  // crc over UNCOMPRESSED block bytes
   rec.first_term = first_term;
-  SNII_RETURN_IF_ERROR(dict_file_.append(bsink.buffer()));
+
+  std::vector<uint8_t> comp;
+  Status zs = snii::zstd_compress(plain, kDictBlockZstdLevel, &comp);
+  if (zs.ok() && comp.size() < plain.size()) {
+    rec.flags = snii::format::block_ref_flags::kZstd;
+    rec.uncomp_len = static_cast<uint64_t>(plain.size());
+    rec.length = static_cast<uint64_t>(comp.size());
+    SNII_RETURN_IF_ERROR(dict_file_.append(comp));
+  } else {
+    rec.flags = 0;
+    rec.uncomp_len = 0;
+    rec.length = static_cast<uint64_t>(plain.size());
+    SNII_RETURN_IF_ERROR(dict_file_.append(bsink.buffer()));
+  }
   sample_first_terms_.push_back(std::move(first_term));
   blocks_.push_back(std::move(rec));
   return Status::OK();
@@ -556,8 +582,9 @@ Status LogicalIndexWriter::finish_meta(const SectionRefs& abs_refs,
     ref.offset = dict_region_offset + b.rel_offset;
     ref.length = b.length;
     ref.n_entries = b.n_entries;
-    ref.flags = 0;
+    ref.flags = b.flags;
     ref.checksum = b.checksum;
+    ref.uncomp_len = b.uncomp_len;
     dir.add(ref);
   }
   ByteSink dir_sink;

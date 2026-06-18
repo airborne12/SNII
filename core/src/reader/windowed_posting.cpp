@@ -164,6 +164,7 @@ Status decode_window_slices(const WindowMeta& meta, Slice dd_region, Slice freq_
   dd_meta.uncomp_len = meta.dd_uncomp_len;
   dd_meta.disk_len = meta.dd_disk_len;
   dd_meta.crc = meta.crc_dd;
+  dd_meta.verify_crc = meta.verify_crc;
   SNII_RETURN_IF_ERROR(
       snii::format::decode_dd_region(dd_region, dd_meta, meta.win_base, docids));
   if (docids->size() != meta.doc_count) {
@@ -175,6 +176,7 @@ Status decode_window_slices(const WindowMeta& meta, Slice dd_region, Slice freq_
     freq_meta.uncomp_len = meta.freq_uncomp_len;
     freq_meta.disk_len = meta.freq_disk_len;
     freq_meta.crc = meta.crc_freq;
+    freq_meta.verify_crc = meta.verify_crc;
     SNII_RETURN_IF_ERROR(snii::format::decode_freq_region(freq_region, freq_meta,
                                                           meta.doc_count, freqs));
   } else {

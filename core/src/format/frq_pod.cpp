@@ -97,7 +97,10 @@ Status open_region(Slice disk, const FrqRegionMeta& meta, std::vector<uint8_t>* 
   if (meta.uncomp_len > kMaxRegionUncompBytes) {
     return Status::Corruption("frq: region uncomp_len exceeds sane cap");
   }
-  if (crc32c(disk) != meta.crc) {
+  // Inline entries (verify_crc=false) carry no per-region crc: their on-disk
+  // bytes are covered by the enclosing dict block's block-level crc32c, so the
+  // region crc would be redundant. POD-ref regions keep their own crc check.
+  if (meta.verify_crc && crc32c(disk) != meta.crc) {
     return Status::Corruption("frq: region crc mismatch");
   }
   if (!meta.zstd) {

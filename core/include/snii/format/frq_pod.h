@@ -39,6 +39,12 @@ struct FrqRegionMeta {
   uint64_t uncomp_len = 0;  // plaintext byte length (== disk_len when raw)
   uint64_t disk_len = 0;    // on-disk byte length of this region
   uint32_t crc = 0;         // crc32c of the on-disk (disk_len) bytes
+  // When false, decode_*_region SKIPS the per-region crc check (and the writer
+  // omits the 4-byte crc from the dict entry). Set false for INLINE entries:
+  // their region bytes live inside the dict block, whose own block-level crc32c
+  // already covers them, so a per-region crc is fully redundant. POD-ref regions
+  // (slim/windowed) live in the separately-fetched .frq POD -- their crc stays.
+  bool verify_crc = true;
 };
 
 // Encodes a window's dd_region plaintext (VInt n ++ PFOR_runs(doc_delta)) into raw
