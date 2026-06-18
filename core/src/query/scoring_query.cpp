@@ -305,6 +305,324 @@ Status scoring_query_exhaustive(const LogicalIndexReader& idx,
   return Status::OK();
 }
 
+namespace {
+
+// --- Phase C: selective-fetch (lazy window) WAND -----------------------------
+//
+// A LazyTermCursor knows its per-window block-max bounds + docid ranges from the
+// frq_prelude WITHOUT fetching any .frq window. Each window's exact (docid,score)
+// postings are decoded on first access and cached, so a window is fetched at most
+// once and ONLY when the WAND control flow touches a posting in it. Combined with
+// window-level SkipTo (advance past whole windows whose last_docid < target via
+// the prelude, never fetching them), the offer sequence is byte-identical to the
+// eager scoring_query_wand path -- only the bytes read differ.
+//
+// Soundness: a window is fetched only when LazyCurrentDoc/LazySkipTo land the
+// cursor inside it, i.e. it covers a candidate the WAND pivot already proved can
+// reach the running theta (bound >= theta). LazySkipTo jumps the cursor to the
+// SAME posting (first docid >= target) the eager per-doc walk would, so pivots,
+// alignments and offers are identical to the eager path; only windows the eager
+// path read-through-but-never-offered-from are skipped. Windows whose block-max
+// bound never reaches theta are never the pivot, so never fetched.
+
+// One query term's lazily-fetched scoring state.
+struct LazyTermCursor {
+  const LogicalIndexReader* idx = nullptr;
+  const snii::stats::SniiStatsProvider* stats = nullptr;
+  ScorerContext ctx = ScorerContext::make(1, 1);
+  Bm25Params params;
+  DictEntry entry;
+  uint64_t frq_base = 0;
+  uint64_t prx_base = 0;
+  FrqPreludeReader prelude;
+  bool windowed = false;  // false => slim/inline single block already materialized
+
+  std::vector<WindowBound> windows;   // ascending; from prelude (or slim fallback)
+  std::vector<TermPosting> postings;  // sparse: only fetched windows are filled
+  std::vector<uint32_t> win_start;    // prefix offsets, size = windows.size()+1
+  std::vector<char> fetched;          // size = windows.size()
+  size_t pos = 0;                     // virtual cursor over all windows' postings
+};
+
+// Total posting count across all windows (the virtual stream length).
+uint32_t TotalPostings(const LazyTermCursor& c) {
+  return c.win_start.empty() ? 0 : c.win_start.back();
+}
+
+// Index of the window whose virtual range contains posting index p (p < total).
+uint32_t WindowOf(const LazyTermCursor& c, uint32_t p) {
+  const auto it = std::upper_bound(c.win_start.begin(), c.win_start.end(), p);
+  return static_cast<uint32_t>((it - c.win_start.begin()) - 1);
+}
+
+// Fetches + decodes window w into the cursor's posting cache (idempotent). Only
+// reached when the WAND proves window w can still contribute to the top-K.
+Status MaterializeWindow(LazyTermCursor* c, uint32_t w) {
+  if (c->fetched[w]) return Status::OK();
+  WindowMeta meta;
+  SNII_RETURN_IF_ERROR(c->prelude.window(w, &meta));
+  snii::reader::WindowAbsRange r;
+  SNII_RETURN_IF_ERROR(snii::reader::windowed_window_range(
+      *c->idx, c->entry, c->frq_base, c->prx_base, c->prelude, w,
+      /*want_positions=*/false, /*want_freq=*/true, &r));
+  snii::io::BatchRangeFetcher fetcher(c->idx->reader());
+  const size_t h = fetcher.add(r.frq_off, static_cast<size_t>(r.frq_len));
+  SNII_RETURN_IF_ERROR(fetcher.fetch());
+  std::vector<uint32_t> docids;
+  std::vector<uint32_t> freqs;
+  std::vector<std::vector<uint32_t>> pos;
+  SNII_RETURN_IF_ERROR(snii::reader::decode_window_slices(
+      meta, fetcher.get(h), Slice(), /*want_positions=*/false,
+      /*want_freq=*/true, &docids, &freqs, &pos));
+  if (docids.size() != c->win_start[w + 1] - c->win_start[w]) {
+    return Status::Corruption("scoring_query: selective window doc-count drift");
+  }
+  std::vector<TermPosting> scored;
+  SNII_RETURN_IF_ERROR(
+      ScoreDecoded(*c->stats, c->ctx, c->params, docids, freqs, &scored));
+  std::copy(scored.begin(), scored.end(), c->postings.begin() + c->win_start[w]);
+  c->fetched[w] = 1;
+  return Status::OK();
+}
+
+// Current docid at the cursor, fetching the covering window if needed. Exhausted
+// cursor -> UINT32_MAX.
+Status LazyCurrentDoc(LazyTermCursor* c, uint32_t* docid) {
+  if (c->pos >= TotalPostings(*c)) {
+    *docid = std::numeric_limits<uint32_t>::max();
+    return Status::OK();
+  }
+  const uint32_t w = WindowOf(*c, static_cast<uint32_t>(c->pos));
+  SNII_RETURN_IF_ERROR(MaterializeWindow(c, w));
+  *docid = c->postings[c->pos].docid;
+  return Status::OK();
+}
+
+// Advances pos to the first posting with docid >= target, skipping ENTIRE windows
+// whose last_docid < target WITHOUT fetching them (prelude-only), then fetching
+// just the landing window. Lands on the same posting the eager per-doc walk would.
+Status LazySkipTo(LazyTermCursor* c, uint32_t target) {
+  const uint32_t total = TotalPostings(*c);
+  while (c->pos < total) {
+    const uint32_t w = WindowOf(*c, static_cast<uint32_t>(c->pos));
+    if (c->windows[w].last_docid >= target) break;
+    c->pos = c->win_start[w + 1];  // skip this window entirely (no fetch)
+  }
+  if (c->pos >= total) return Status::OK();
+  const uint32_t w = WindowOf(*c, static_cast<uint32_t>(c->pos));
+  SNII_RETURN_IF_ERROR(MaterializeWindow(c, w));
+  while (c->pos < total && c->postings[c->pos].docid < target) ++c->pos;
+  return Status::OK();
+}
+
+// Initializes a lazy windowed cursor from the prelude alone: per-window block-max
+// bounds + ranges + cache slots, with NO .frq window fetched.
+Status BuildLazyWindowed(LazyTermCursor* c) {
+  SNII_RETURN_IF_ERROR(snii::reader::fetch_windowed_prelude(
+      *c->idx, c->entry, c->frq_base, &c->prelude));
+  SNII_RETURN_IF_ERROR(BuildWindowBounds(c->prelude, c->ctx, c->stats->avgdl(),
+                                         c->params, &c->windows));
+  // BuildWindowBounds keeps only non-empty windows, in window order. Build the
+  // matching prefix-sum of doc_counts over those same non-empty windows so the
+  // bound list, win_start and fetched stay 1:1.
+  const uint32_t nb = static_cast<uint32_t>(c->windows.size());
+  c->win_start.assign(nb + 1, 0);
+  c->fetched.assign(nb, 0);
+  uint32_t bi = 0;
+  uint32_t acc = 0;
+  for (uint32_t w = 0; w < c->prelude.n_windows() && bi < nb; ++w) {
+    WindowMeta meta;
+    SNII_RETURN_IF_ERROR(c->prelude.window(w, &meta));
+    if (meta.doc_count == 0) continue;
+    acc += meta.doc_count;
+    c->win_start[++bi] = acc;
+  }
+  c->postings.assign(acc, TermPosting{});
+  return Status::OK();
+}
+
+// Initializes a slim/inline cursor: its single window is small, so fetch + score
+// it eagerly (exactly as the existing path). One bound covers all its postings.
+Status BuildLazySlim(LazyTermCursor* c) {
+  std::vector<uint32_t> docids;
+  std::vector<uint32_t> freqs;
+  SNII_RETURN_IF_ERROR(
+      DecodeSlim(*c->idx, c->entry, c->frq_base, &docids, &freqs));
+  SNII_RETURN_IF_ERROR(
+      ScoreDecoded(*c->stats, c->ctx, c->params, docids, freqs, &c->postings));
+  SingleWindowFallback(c->postings, &c->windows);
+  c->win_start = {0, static_cast<uint32_t>(c->postings.size())};
+  c->fetched.assign(1, 1);  // already materialized
+  return Status::OK();
+}
+
+// Builds a LazyTermCursor for one term: prelude-only for windowed terms (no .frq
+// fetched), fully-materialized single window for slim/inline (small).
+Status BuildLazyCursor(const LogicalIndexReader& idx,
+                       const snii::stats::SniiStatsProvider& stats,
+                       const std::string& term, const Bm25Params& params,
+                       bool* found, LazyTermCursor* c) {
+  uint64_t prx_base = 0;
+  SNII_RETURN_IF_ERROR(
+      idx.lookup(term, found, &c->entry, &c->frq_base, &prx_base));
+  if (!*found) return Status::OK();
+  c->idx = &idx;
+  c->stats = &stats;
+  c->params = params;
+  c->prx_base = prx_base;
+  c->ctx = ScorerContext::make(stats.indexed_doc_count(), c->entry.df);
+  c->windowed = c->entry.kind == DictEntryKind::kPodRef &&
+                c->entry.enc == DictEntryEnc::kWindowed;
+  return c->windowed ? BuildLazyWindowed(c) : BuildLazySlim(c);
+}
+
+Status SelectiveBuildCursors(const LogicalIndexReader& idx,
+                             const snii::stats::SniiStatsProvider& stats,
+                             const std::vector<std::string>& terms,
+                             const Bm25Params& params,
+                             std::vector<LazyTermCursor>* cursors) {
+  for (const auto& term : terms) {
+    bool found = false;
+    LazyTermCursor c;
+    SNII_RETURN_IF_ERROR(BuildLazyCursor(idx, stats, term, params, &found, &c));
+    if (found && TotalPostings(c) > 0) cursors->push_back(std::move(c));
+  }
+  return Status::OK();
+}
+
+// Block-max upper bound for a lazy cursor at docid: block_max of the window
+// covering docid (ascending, contiguous). Beyond the last window -> 0. Same
+// semantics as TermBoundAt over the eager cursor's window list.
+double LazyTermBoundAt(const LazyTermCursor& c, uint32_t docid) {
+  for (const auto& w : c.windows) {
+    if (docid <= w.last_docid) return w.max_score;
+  }
+  return 0.0;
+}
+
+// Sorts cursors ascending by current docid (materializing each cursor's current
+// covering window), returning the smallest current docid via *front.
+Status SelectiveSortByDoc(std::vector<LazyTermCursor>* cursors, uint32_t* front) {
+  std::vector<uint32_t> cur(cursors->size());
+  for (size_t i = 0; i < cursors->size(); ++i) {
+    SNII_RETURN_IF_ERROR(LazyCurrentDoc(&(*cursors)[i], &cur[i]));
+  }
+  std::vector<size_t> order(cursors->size());
+  for (size_t i = 0; i < order.size(); ++i) order[i] = i;
+  std::sort(order.begin(), order.end(),
+            [&](size_t a, size_t b) { return cur[a] < cur[b]; });
+  std::vector<LazyTermCursor> sorted;
+  sorted.reserve(cursors->size());
+  for (size_t i : order) sorted.push_back(std::move((*cursors)[i]));
+  *cursors = std::move(sorted);
+  *front = order.empty() ? std::numeric_limits<uint32_t>::max() : cur[order.front()];
+  return Status::OK();
+}
+
+// Finds the pivot term: the first cursor (current-docid order) at which the
+// accumulated block-max bound reaches theta. >= keeps boundary ties (matching the
+// exhaustive total order). *found=false when no remaining doc can beat theta.
+Status SelectivePivot(std::vector<LazyTermCursor>* cursors, double theta,
+                      size_t* pivot, uint32_t* pivot_doc, bool* found) {
+  double bound = 0.0;
+  *found = false;
+  for (size_t i = 0; i < cursors->size(); ++i) {
+    uint32_t d = 0;
+    SNII_RETURN_IF_ERROR(LazyCurrentDoc(&(*cursors)[i], &d));
+    if (d == std::numeric_limits<uint32_t>::max()) break;
+    bound += LazyTermBoundAt((*cursors)[i], d);
+    if (bound >= theta) {
+      *pivot = i;
+      *pivot_doc = d;
+      *found = true;
+      return Status::OK();
+    }
+  }
+  return Status::OK();
+}
+
+// Scores the aligned pivot doc exactly (summing all cursors AT pivot_doc) and
+// advances those cursors by one posting.
+Status SelectiveScorePivot(std::vector<LazyTermCursor>* cursors,
+                           uint32_t pivot_doc, TopK* topk) {
+  double doc_score = 0.0;
+  for (auto& c : *cursors) {
+    uint32_t d = 0;
+    SNII_RETURN_IF_ERROR(LazyCurrentDoc(&c, &d));
+    if (d == pivot_doc) {
+      doc_score += c.postings[c.pos].score;  // window already materialized
+      ++c.pos;
+    }
+  }
+  topk->offer(pivot_doc, doc_score);
+  return Status::OK();
+}
+
+// Advances the first lagging cursor (current doc < pivot_doc) up to pivot_doc.
+Status SelectiveAdvanceLagging(std::vector<LazyTermCursor>* cursors,
+                               uint32_t pivot_doc) {
+  for (auto& c : *cursors) {
+    uint32_t d = 0;
+    SNII_RETURN_IF_ERROR(LazyCurrentDoc(&c, &d));
+    if (d < pivot_doc) {
+      SNII_RETURN_IF_ERROR(LazySkipTo(&c, pivot_doc));
+      return Status::OK();
+    }
+  }
+  return Status::OK();
+}
+
+// One WAND iteration body: sort, pick pivot, then either score (aligned) or skip
+// a lagging cursor forward. *done=true ends the loop.
+Status SelectiveStep(std::vector<LazyTermCursor>* cursors, TopK* topk, bool* done) {
+  uint32_t front = 0;
+  SNII_RETURN_IF_ERROR(SelectiveSortByDoc(cursors, &front));
+  if (cursors->empty() || front == std::numeric_limits<uint32_t>::max()) {
+    *done = true;
+    return Status::OK();
+  }
+  size_t pivot = 0;
+  uint32_t pivot_doc = 0;
+  bool found_pivot = false;
+  SNII_RETURN_IF_ERROR(SelectivePivot(cursors, topk->threshold(), &pivot,
+                                      &pivot_doc, &found_pivot));
+  if (!found_pivot) {
+    *done = true;
+    return Status::OK();
+  }
+  if (front == pivot_doc) {
+    return SelectiveScorePivot(cursors, pivot_doc, topk);
+  }
+  return SelectiveAdvanceLagging(cursors, pivot_doc);
+}
+
+Status SelectiveWandLoop(std::vector<LazyTermCursor>* cursors, TopK* topk) {
+  bool done = false;
+  while (!done) {
+    SNII_RETURN_IF_ERROR(SelectiveStep(cursors, topk, &done));
+  }
+  return Status::OK();
+}
+
+}  // namespace
+
+Status scoring_query_wand_selective(
+    const LogicalIndexReader& idx, const snii::stats::SniiStatsProvider& stats,
+    const std::vector<std::string>& terms, uint32_t k, const Bm25Params& params,
+    std::vector<ScoredDoc>* out) {
+  if (out == nullptr) return Status::InvalidArgument("scoring_query: null out");
+  out->clear();
+  if (k == 0) return Status::OK();
+
+  std::vector<LazyTermCursor> cursors;
+  SNII_RETURN_IF_ERROR(SelectiveBuildCursors(idx, stats, terms, params, &cursors));
+
+  TopK topk(k);
+  SNII_RETURN_IF_ERROR(SelectiveWandLoop(&cursors, &topk));
+  DrainSorted(&topk, out);
+  return Status::OK();
+}
+
 Status scoring_query_wand(const LogicalIndexReader& idx,
                           const snii::stats::SniiStatsProvider& stats,
                           const std::vector<std::string>& terms, uint32_t k,

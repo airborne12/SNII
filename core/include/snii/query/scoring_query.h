@@ -46,4 +46,19 @@ Status scoring_query_wand(const snii::reader::LogicalIndexReader& idx,
                           const std::vector<std::string>& terms, uint32_t k,
                           const Bm25Params& params, std::vector<ScoredDoc>* out);
 
+// SELECTIVE-FETCH block-max WAND (design spec section 5, "Phase C"). Same WAND /
+// theta / >= tie machinery as scoring_query_wand, but it DEFERS the .frq window
+// fetch: for each windowed term it first reads ONLY the frq_prelude (block-max
+// columns), then fetches a term's .frq window lazily and at most once -- and ONLY
+// when the running block-max bound proves a doc in that window can still reach the
+// top-K (bound >= theta). A window the bound rules out is never fetched. The
+// result (top-K docids AND scores, INCLUDING ties) is byte-identical to
+// scoring_query_exhaustive / scoring_query_wand; only the bytes read differ.
+// Slim/inline terms (no prelude) are fetched fully, exactly as today.
+Status scoring_query_wand_selective(const snii::reader::LogicalIndexReader& idx,
+                                    const snii::stats::SniiStatsProvider& stats,
+                                    const std::vector<std::string>& terms,
+                                    uint32_t k, const Bm25Params& params,
+                                    std::vector<ScoredDoc>* out);
+
 }  // namespace snii::query
