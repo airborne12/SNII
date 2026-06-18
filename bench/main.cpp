@@ -461,10 +461,14 @@ double peak_rss_mib() {
 
 double mib(uint64_t bytes) { return static_cast<double>(bytes) / (1024.0 * 1024.0); }
 
-// Applies the SNII spill threshold (MiB -> bytes) to a SniiAdapter only; the
-// generic overload is a no-op so CLucene and other engines ignore the flag.
+// Applies the same MiB flush/spill threshold to either engine so build memory
+// is bounded (or unbounded) IDENTICALLY for a fair comparison: SNII spills its
+// SPIMI buffer at `spill_mib`; CLucene flushes a segment at the same RAM size.
 void apply_spill(bench::SniiAdapter& idx, uint32_t spill_mib) {
   idx.set_spill_threshold_bytes(static_cast<size_t>(spill_mib) * 1024u * 1024u);
+}
+void apply_spill(bench::CluceneAdapter& idx, uint32_t spill_mib) {
+  idx.set_ram_buffer_mb(static_cast<double>(spill_mib));  // 0 = no auto flush
 }
 template <typename Adapter>
 void apply_spill(Adapter&, uint32_t) {}
@@ -504,7 +508,8 @@ int run_resources_mode(const Args& args, const bench::Corpus& corpus) {
   const bool clu = args.engine == "clucene" || args.engine == "both";
   try {
     if (snii) build_and_report<bench::SniiAdapter>("SNII", corpus, args.spill_mib);
-    if (clu) build_and_report<bench::CluceneAdapter>("CLucene", corpus, 0);
+    // Same threshold for CLucene: its RAM-buffer flush matches SNII's spill.
+    if (clu) build_and_report<bench::CluceneAdapter>("CLucene", corpus, args.spill_mib);
   } catch (const std::exception& e) {
     std::fprintf(stderr, "FATAL: resource build failed: %s\n", e.what());
     return 1;

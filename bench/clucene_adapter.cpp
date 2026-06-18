@@ -250,6 +250,18 @@ void CluceneAdapter::build_and_open(const Corpus& c) {
     writer->setUseCompoundFile(false);
     writer->setMaxFieldLength(0x7FFFFFFFL);  // never truncate a document
 
+    // FAIRNESS: match CLucene's RAM-buffer flush to SNII's spill threshold.
+    // CLucene's DEFAULT is RAM-buffer flush at 16 MiB with doc-count auto-flush
+    // disabled (DEFAULT_RAM_BUFFER_SIZE_MB=16, DEFAULT_MAX_BUFFERED_DOCS=DISABLE),
+    // so the default ALREADY matches SNII --spill-mib 16. Calling setRAMBufferSizeMB
+    // again after construction crashes this fork at scale, so for the bounded case
+    // we keep the default (16 MiB) and document that the matched comparison uses
+    // spill_mib=16. Only the no-spill case overrides: a huge buffer => no flush,
+    // matching SNII --spill-mib 0 (both build the whole index in RAM).
+    if (ram_buffer_mb_ <= 0.0) {
+      writer->setRAMBufferSizeMB(1.0e9f);  // no auto flush (in-RAM build)
+    }
+
     auto* reader = _CLNEW lucene::util::SStringReader<char>();
 
     const std::wstring field_name = widen("body");

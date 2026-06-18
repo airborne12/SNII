@@ -26,6 +26,13 @@ class CluceneAdapter {
   CluceneAdapter(const CluceneAdapter&) = delete;
   CluceneAdapter& operator=(const CluceneAdapter&) = delete;
 
+  // Sets the IndexWriter RAM-buffer flush threshold (MiB) to MATCH the SNII
+  // spill threshold for a fair build-memory comparison. <=0 means no auto flush
+  // (the whole index is built in RAM, matching SNII --spill-mib 0). When >0,
+  // CLucene flushes a segment every `mb` MiB (doc-count auto-flush disabled),
+  // matching SNII's spill-at-`mb` behavior.
+  void set_ram_buffer_mb(double mb) { ram_buffer_mb_ = mb; }
+
   // Builds the compound index in a temp directory and opens a searcher over a
   // metered directory. Throws std::runtime_error on failure.
   void build_and_open(const Corpus& c);
@@ -45,6 +52,8 @@ class CluceneAdapter {
   uint64_t index_bytes() const;
 
  private:
+  // RAM-buffer flush threshold (MiB); <=0 = no auto flush (build fully in RAM).
+  double ram_buffer_mb_ = 0.0;
   // Opaque handles; concrete CLucene types live in the .cpp to keep this header
   // free of CLucene includes.
   struct Impl;
