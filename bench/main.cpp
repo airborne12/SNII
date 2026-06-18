@@ -12,6 +12,7 @@
 // For every query the runner asserts SNII docids == CLucene docids == oracle
 // docids (all sorted). Any mismatch exits nonzero.
 
+#include <malloc.h>
 #include <sys/resource.h>
 #include <unistd.h>
 
@@ -516,6 +517,14 @@ int run_resources_mode(const Args& args, const bench::Corpus& corpus) {
 }  // namespace
 
 int main(int argc, char** argv) {
+  // Return transient build buffers to the OS promptly (glibc retains freed
+  // arena memory by default, inflating peak RSS for an allocation-heavy build).
+  // mmap large blocks so free() unmaps them; trim the main arena aggressively.
+  // Applied to BOTH engines for fairness; production Doris uses jemalloc, which
+  // reclaims similarly. Verified CLucene's peak is unchanged by this.
+  mallopt(M_MMAP_THRESHOLD, 128 * 1024);
+  mallopt(M_TRIM_THRESHOLD, 128 * 1024);
+
   const Args args = parse_args(argc, argv);
 
   std::printf("=== SNII vs CLucene S3-access benchmark ===\n");
