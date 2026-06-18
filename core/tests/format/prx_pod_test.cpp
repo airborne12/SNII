@@ -3,6 +3,7 @@
 #include <gtest/gtest.h>
 
 #include <cstdint>
+#include <cstring>
 #include <vector>
 
 #include "snii/common/slice.h"
@@ -17,11 +18,23 @@ using snii::Slice;
 using snii::Status;
 using snii::StatusCode;
 using snii::format::build_prx_window;
+using snii::format::build_prx_window_flat;
 using snii::format::read_prx_window;
 
 namespace {
 
 using PerDoc = std::vector<std::vector<uint32_t>>;
+
+// Flattens per-doc lists into (flat positions, freqs) the way the accumulator
+// stores them, so the flat builder can be checked for byte-identity.
+void Flatten(const PerDoc& in, std::vector<uint32_t>* flat, std::vector<uint32_t>* freqs) {
+  flat->clear();
+  freqs->clear();
+  for (const auto& doc : in) {
+    freqs->push_back(static_cast<uint32_t>(doc.size()));
+    flat->insert(flat->end(), doc.begin(), doc.end());
+  }
+}
 
 // Build data above/below the raw threshold consistent with the production path; provides a stable, controlled round-trip helper.
 Status RoundTrip(const PerDoc& in, int level, PerDoc* out) {
@@ -40,6 +53,55 @@ TEST(PrxPod, SingleDocRoundTrip) {
   PerDoc out;
   ASSERT_TRUE(RoundTrip(in, -1, &out).ok());
   EXPECT_EQ(out, in);
+}
+
+// The FLAT builder (used by the writer to avoid materializing a vector-of-vectors
+// for high-df terms) must produce BYTE-IDENTICAL window bytes to the per-doc
+// builder for the same logical positions, at every codec level. This is the
+// load-bearing guarantee that the flat refactor keeps .prx byte-identical.
+TEST(PrxPod, FlatBuilderMatchesPerDocBytes) {
+  const std::vector<PerDoc> cases = {
+      {},                                    // 0 docs
+      {{}, {3}, {}, {}, {1, 2}},             // empty docs interleaved
+      {{0, 5, 12}, {1}, {2, 2, 9, 9, 40}},   // duplicate positions (delta 0)
+      {{3, 7, 7, 10, 100}},                  // single doc
+  };
+  for (const auto& in : cases) {
+    std::vector<uint32_t> flat, freqs;
+    Flatten(in, &flat, &freqs);
+    for (int level : {-1, 0, 3}) {
+      ByteSink per_doc_sink, flat_sink;
+      ASSERT_TRUE(build_prx_window(in, level, &per_doc_sink).ok());
+      ASSERT_TRUE(build_prx_window_flat(flat, freqs, level, &flat_sink).ok());
+      const Slice a = per_doc_sink.view();
+      const Slice b = flat_sink.view();
+      ASSERT_EQ(a.size(), b.size()) << "level=" << level;
+      EXPECT_EQ(0, std::memcmp(a.data(), b.data(), a.size())) << "level=" << level;
+      // The flat-built window still decodes back to the original per-doc lists.
+      PerDoc out;
+      ByteSource src(flat_sink.view());
+      ASSERT_TRUE(read_prx_window(&src, &out).ok());
+      EXPECT_EQ(out, in) << "level=" << level;
+    }
+  }
+}
+
+// A large window (>= zstd auto threshold) built flat must equal the per-doc build
+// AND must actually take the zstd branch (codec byte == kZstd), proving the flat
+// path is byte-identical even through compression.
+TEST(PrxPod, FlatBuilderMatchesPerDocLargeZstd) {
+  PerDoc in;
+  for (uint32_t d = 0; d < 300; ++d) in.push_back({d, d + 1u, d + 2u});
+  std::vector<uint32_t> flat, freqs;
+  Flatten(in, &flat, &freqs);
+  ByteSink per_doc_sink, flat_sink;
+  ASSERT_TRUE(build_prx_window(in, -1, &per_doc_sink).ok());
+  ASSERT_TRUE(build_prx_window_flat(flat, freqs, -1, &flat_sink).ok());
+  const Slice a = per_doc_sink.view();
+  const Slice b = flat_sink.view();
+  ASSERT_EQ(a.size(), b.size());
+  EXPECT_EQ(0, std::memcmp(a.data(), b.data(), a.size()));
+  EXPECT_EQ(a.data()[0], static_cast<uint8_t>(snii::format::PrxCodec::kZstd));
 }
 
 // Multiple docs, positions ascending within each doc, no shared baseline across docs.

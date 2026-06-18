@@ -2,6 +2,7 @@
 
 #include <cstdint>
 #include <functional>
+#include <span>
 #include <string>
 #include <string_view>
 #include <unordered_map>
@@ -12,12 +13,55 @@
 namespace snii::writer {
 
 // One term's posting list: docids ascending, with parallel freqs and (when
-// positions are enabled) per-doc position lists.
+// positions are enabled) a single FLAT positions buffer.
+//
+// positions_flat holds every position for the term in document order, partitioned
+// by freqs: doc i owns the next freqs[i] entries. This is the SAME layout the
+// accumulator stores natively, so no per-doc vector-of-vectors is ever built on
+// the build/merge hot path (that vector-of-vectors was the dominant peak-RSS
+// driver for high-df terms). doc_positions(i) returns a non-owning span view of
+// doc i's positions for consumers that want per-doc access (e.g. the prx window
+// builder, tests). positions_flat is empty when positions are disabled.
 struct TermPostings {
   std::string term;
   std::vector<uint32_t> docids;
   std::vector<uint32_t> freqs;
-  std::vector<std::vector<uint32_t>> positions;  // empty when positions disabled
+  std::vector<uint32_t> positions_flat;  // empty when positions disabled
+
+  // Byte offset of doc i's first position within positions_flat (prefix sum of
+  // freqs). O(i) -- callers iterating all docs should track a running offset.
+  size_t pos_offset(size_t doc_index) const {
+    size_t off = 0;
+    for (size_t i = 0; i < doc_index; ++i) off += freqs[i];
+    return off;
+  }
+  // Non-owning view of doc i's positions (length freqs[i]) into positions_flat.
+  std::span<const uint32_t> doc_positions(size_t doc_index) const {
+    const size_t off = pos_offset(doc_index);
+    return std::span<const uint32_t>(positions_flat.data() + off, freqs[doc_index]);
+  }
+
+  // Rebuilds the per-doc position lists (for callers/tests wanting per-doc access)
+  // from positions_flat partitioned by freqs. O(total positions); allocates.
+  std::vector<std::vector<uint32_t>> positions_per_doc() const {
+    std::vector<std::vector<uint32_t>> out(freqs.size());
+    size_t off = 0;
+    for (size_t i = 0; i < freqs.size(); ++i) {
+      out[i].assign(positions_flat.begin() + off,
+                    positions_flat.begin() + off + freqs[i]);
+      off += freqs[i];
+    }
+    return out;
+  }
+
+  // Sets the flat positions from per-doc lists (convenience for tests / callers
+  // that produce per-doc positions). Does NOT touch freqs; the caller is expected
+  // to keep freqs[i] == per_doc[i].size() consistent (the writer validates this).
+  void set_positions_per_doc(const std::vector<std::vector<uint32_t>>& per_doc) {
+    positions_flat.clear();
+    for (const auto& d : per_doc)
+      positions_flat.insert(positions_flat.end(), d.begin(), d.end());
+  }
 };
 
 // In-memory SPIMI (Single-Pass In-Memory Indexing) accumulator for one logical
@@ -168,14 +212,25 @@ class SpimiTermBuffer {
   size_t live_bytes_ = 0;         // tracked live cost of terms_ vs the threshold
   uint64_t total_tokens_ = 0;
 
-  // Dense per-id accumulators, indexed by term-id (sized to vocab). present_[id]
-  // is true while id has a live (non-drained) Term; touched_ids_ lists every id
-  // currently present so finalize/spill iterate touched ids without scanning the
-  // whole (possibly huge) vocabulary.
-  std::vector<Term> terms_;
-  std::vector<uint8_t> present_;
+  // POOLED accumulators (replaces a dense vocab-sized std::vector<Term>, which
+  // cost ~80 B per vocab id even for the ~empty majority -- the single largest
+  // input-phase memory line). slot_of_ is the only vocab-sized array: a 4 B index
+  // per id (0 == no live Term; otherwise slot index + 1). slots_ holds ONE Term
+  // per CURRENTLY-LIVE id, so its size tracks the live touched count, not the
+  // vocabulary. On first touch an id claims a slot (reusing a freed one from
+  // free_slots_ when available, else appending). release_term frees the slot back
+  // to the pool and clears slot_of_[id]. touched_ids_ lists every live id so
+  // finalize/spill iterate touched ids without scanning the whole vocabulary.
+  // present_[id] is now (slot_of_[id] != 0). The hot add path is still a vector
+  // index + a couple of pushes: no hashing, no per-token allocation.
+  std::vector<uint32_t> slot_of_;       // vocab-sized: id -> slot index + 1 (0=empty)
+  std::vector<Term> slots_;             // live Term pool (size ~ live touched count)
+  std::vector<uint32_t> free_slots_;    // recycled slot indices (drained terms)
   std::vector<uint32_t> touched_ids_;
   size_t live_term_count_ = 0;  // present (non-drained) terms; == unique_terms()
+
+  // Returns the live Term for `term_id`, claiming a pool slot on first touch.
+  Term& term_slot(uint32_t term_id, bool* new_term);
 
   std::vector<std::string> run_paths_;  // spilled run temp files (deleted in dtor)
   Status spill_status_;                 // first spill / range error, at finalize

@@ -45,6 +45,15 @@ inline Status build_prx_window(
                           zstd_level_or_negative_for_auto, sink);
 }
 
+// FLAT-positions builder: byte-identical output to build_prx_window above, but
+// reads the window's positions from a single flat span partitioned per-doc by
+// `freqs` (doc d owns the next freqs[d] entries; freqs.size() == doc count and
+// sum(freqs) == positions_flat.size()). Lets the writer pass a subspan of the
+// term's flat positions/freqs with NO vector-of-vectors materialization.
+Status build_prx_window_flat(std::span<const uint32_t> positions_flat,
+                             std::span<const uint32_t> freqs,
+                             int zstd_level_or_negative_for_auto, ByteSink* sink);
+
 // Read and verify a .prx window from source, reconstructing the per-doc position list.
 // CRC mismatch / invalid codec / truncation / decompression failure all return a non-OK Status.
 Status read_prx_window(ByteSource* source,

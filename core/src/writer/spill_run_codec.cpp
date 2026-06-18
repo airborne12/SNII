@@ -27,6 +27,17 @@ void AppendVarint(std::vector<uint8_t>* buf, uint64_t v) {
   buf->insert(buf->end(), tmp, tmp + n);
 }
 
+// Appends a block of `count` uint32 values as RAW little-endian fixed-width bytes
+// (memcpy from contiguous source). Runs are private temp files; the on-disk index
+// is unaffected. Raw blocks make encode/decode ~10x cheaper than per-value varint
+// for the freqs/positions streams (which compress poorly as varints anyway), at
+// the cost of a modestly larger temp run. Empty source is a no-op.
+void AppendRawU32(std::vector<uint8_t>* buf, const uint32_t* src, size_t count) {
+  if (count == 0) return;
+  const auto* bytes = reinterpret_cast<const uint8_t*>(src);
+  buf->insert(buf->end(), bytes, bytes + count * sizeof(uint32_t));
+}
+
 // Writes the full byte range [data, data+len) to fd, looping over short writes.
 Status WriteAll(int fd, const uint8_t* data, size_t len) {
   size_t off = 0;
@@ -70,18 +81,19 @@ Status RunWriter::flush() {
 Status RunWriter::write_term(uint32_t term_id, const TermPostings& tp) {
   AppendVarint(&buf_, term_id);
   AppendVarint(&buf_, tp.docids.size());
+  // Docids stay VInt delta: ascending, so deltas are small and compress well.
   uint32_t prev = 0;
   for (size_t i = 0; i < tp.docids.size(); ++i) {
     AppendVarint(&buf_, static_cast<uint64_t>(tp.docids[i]) - prev);
     prev = tp.docids[i];
   }
-  for (uint32_t f : tp.freqs) AppendVarint(&buf_, f);
-  uint64_t n_pos = 0;
-  for (const auto& pl : tp.positions) n_pos += pl.size();
+  // Freqs + positions are RAW fixed-width u32 blocks (bulk memcpy). The decoder
+  // reads them back the same way; n_pos == positions_flat.size() is recoverable
+  // from sum(freqs), but is written explicitly so a reader can size the block.
+  AppendRawU32(&buf_, tp.freqs.data(), tp.freqs.size());
+  const uint64_t n_pos = tp.positions_flat.size();
   AppendVarint(&buf_, n_pos);
-  for (const auto& pl : tp.positions) {
-    for (uint32_t p : pl) AppendVarint(&buf_, p);
-  }
+  AppendRawU32(&buf_, tp.positions_flat.data(), tp.positions_flat.size());
   if (buf_.size() >= kWriteFlushBytes) SNII_RETURN_IF_ERROR(flush());
   return Status::OK();
 }
@@ -176,6 +188,33 @@ Status RunReader::read_varint(uint64_t* v) {
   }
 }
 
+// Bulk-decodes `count` raw little-endian u32s into `out`, topping up the window
+// from disk as needed. Copies whatever is buffered each pass (the window may hold
+// only part of a large block), so a high-df term's freqs/positions stream through
+// in 64 KiB chunks without ever needing the whole block resident at once.
+Status RunReader::read_raw_u32(size_t count, std::vector<uint32_t>* out) {
+  out->resize(count);
+  if (count == 0) return Status::OK();
+  auto* dst = reinterpret_cast<uint8_t*>(out->data());
+  size_t need = count * sizeof(uint32_t);
+  size_t written = 0;
+  while (need > 0) {
+    if (available() == 0) {
+      const size_t had = available();
+      SNII_RETURN_IF_ERROR(fill());
+      if (available() == had && eof_) {
+        return Status::Corruption("run truncated: needed more raw bytes than available");
+      }
+    }
+    const size_t take = std::min(need, available());
+    std::memcpy(dst + written, window_.data() + pos_, take);
+    pos_ += take;
+    written += take;
+    need -= take;
+  }
+  return Status::OK();
+}
+
 Status RunReader::advance() {
   // End-of-run detection: at a record boundary, if no bytes remain we are done.
   if (available() == 0) {
@@ -194,7 +233,6 @@ Status RunReader::advance() {
   uint64_t n_docs = 0;
   SNII_RETURN_IF_ERROR(read_varint(&n_docs));
   current_.docids.resize(static_cast<size_t>(n_docs));
-  current_.freqs.resize(static_cast<size_t>(n_docs));
   uint32_t acc = 0;
   for (size_t i = 0; i < n_docs; ++i) {
     uint64_t d = 0;
@@ -202,30 +240,20 @@ Status RunReader::advance() {
     acc = static_cast<uint32_t>(acc + d);  // delta-decode (wraps validated by writer)
     current_.docids[i] = acc;
   }
-  for (size_t i = 0; i < n_docs; ++i) {
-    uint64_t f = 0;
-    SNII_RETURN_IF_ERROR(read_varint(&f));
-    if (f > UINT32_MAX) return Status::Corruption("run freq exceeds uint32");
-    current_.freqs[i] = static_cast<uint32_t>(f);
-  }
+  // Freqs: RAW u32 block (bulk read), matching the writer's AppendRawU32.
+  SNII_RETURN_IF_ERROR(read_raw_u32(static_cast<size_t>(n_docs), &current_.freqs));
   uint64_t n_pos = 0;
   SNII_RETURN_IF_ERROR(read_varint(&n_pos));
-  current_.positions.clear();
+  current_.positions_flat.clear();
   if (has_positions_) {
-    current_.positions.resize(static_cast<size_t>(n_docs));
-    for (size_t i = 0; i < n_docs; ++i) {
-      current_.positions[i].resize(current_.freqs[i]);
-      for (uint32_t k = 0; k < current_.freqs[i]; ++k) {
-        uint64_t p = 0;
-        SNII_RETURN_IF_ERROR(read_varint(&p));
-        current_.positions[i][k] = static_cast<uint32_t>(p);
-      }
-    }
-  } else {
-    for (uint64_t i = 0; i < n_pos; ++i) {
-      uint64_t skip = 0;
-      SNII_RETURN_IF_ERROR(read_varint(&skip));  // tolerate stray positions
-    }
+    // Positions: RAW u32 block, flat document-order (partitioned by freqs). No
+    // per-doc vector-of-vectors is built -- the widest term's positions land in a
+    // single contiguous buffer.
+    SNII_RETURN_IF_ERROR(read_raw_u32(static_cast<size_t>(n_pos), &current_.positions_flat));
+  } else if (n_pos != 0) {
+    // No-positions runs should carry n_pos == 0; tolerate (skip) a stray block.
+    std::vector<uint32_t> skip;
+    SNII_RETURN_IF_ERROR(read_raw_u32(static_cast<size_t>(n_pos), &skip));
   }
   return Status::OK();
 }
@@ -257,25 +285,38 @@ struct HeapGreater {
 // Appends src's postings onto dst (run order). Later runs only cover docids
 // >= dst's last, so docids stay ascending. COALESCE the boundary doc: if a spill
 // fell BETWEEN two tokens of the same doc, that doc ends one run and begins the
-// next with the SAME docid -- merge them (sum freqs, append positions) so the
+// next with the SAME docid -- merge them (sum freqs, splice positions) so the
 // merged term has exactly one entry per docid (matching the in-memory build).
+//
+// Positions are FLAT: doc order, partitioned by freqs. Because both dst and src
+// already store doc-ordered flat positions, the common (no-boundary-overlap) case
+// is a single bulk append. The boundary-overlap case must INSERT src's first
+// doc's positions right after dst's last doc's positions so flat order stays
+// consistent with the merged (coalesced) freqs.
 void Concat(TermPostings* dst, const TermPostings& src, bool has_positions) {
   if (src.docids.empty()) return;
   size_t start = 0;
+  size_t src_pos_start = 0;  // flat offset of src positions to append after splice
   if (!dst->docids.empty() && dst->docids.back() == src.docids.front()) {
-    dst->freqs.back() += src.freqs.front();
-    if (has_positions) {
-      auto& tail = dst->positions.back();
-      const auto& head = src.positions.front();
-      tail.insert(tail.end(), head.begin(), head.end());
+    const uint32_t head_fc = src.freqs.front();
+    if (has_positions && head_fc != 0) {
+      // Splice src's first-doc positions in right after dst's last-doc positions.
+      // dst's last doc owns dst->freqs.back() entries at the tail of positions_flat
+      // BEFORE we bump that freq, so insert at end() (last doc is the tail run).
+      auto& flat = dst->positions_flat;
+      flat.insert(flat.end(), src.positions_flat.begin(),
+                  src.positions_flat.begin() + head_fc);
     }
+    dst->freqs.back() += head_fc;
+    src_pos_start = head_fc;
     start = 1;  // boundary doc folded in; append the rest
   }
   dst->docids.insert(dst->docids.end(), src.docids.begin() + start, src.docids.end());
   dst->freqs.insert(dst->freqs.end(), src.freqs.begin() + start, src.freqs.end());
   if (has_positions) {
-    dst->positions.insert(dst->positions.end(), src.positions.begin() + start,
-                          src.positions.end());
+    dst->positions_flat.insert(dst->positions_flat.end(),
+                               src.positions_flat.begin() + src_pos_start,
+                               src.positions_flat.end());
   }
 }
 

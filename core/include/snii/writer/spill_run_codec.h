@@ -14,9 +14,13 @@ namespace snii::writer {
 // On-disk SPIMI "run" codec for the spill / k-way-merge out-of-core build path.
 //
 // A RUN is a self-describing file holding a sequence of terms keyed by TERM-ID,
-// each followed by its postings, in this exact wire layout (all integers LEB128
-// varints, no fixed framing -- the file is produced and consumed by this module
-// only, but decode still validates every length against the file size):
+// each followed by its postings, in this exact wire layout. The file is produced
+// and consumed by THIS module only (a private temp file -- the on-disk INDEX is
+// unaffected and stays byte-identical), so the format is chosen for cheap I/O:
+// docids stay VInt-delta (small ascending gaps), but freqs and positions are RAW
+// fixed-width little-endian u32 BLOCKS (bulk memcpy on both ends, ~10x cheaper
+// than per-value varint, which compressed those streams poorly anyway). Decode
+// still validates every length against the file size.
 //
 //   run := record*                       (term-ids ordered by vocab string,
 //                                          strictly ascending within a run)
@@ -28,9 +32,10 @@ namespace snii::writer {
 //     VInt docid_delta * n_docs          (first delta is docid-0, then gaps; all
 //                                          docids ascending so deltas are >= 1
 //                                          after the first, which may be 0)
-//     VInt freq * n_docs                 (each >= 1)
+//     u32  freq    * n_docs              (RAW LE block, memcpy; each >= 1)
 //     VInt n_pos                         (== sum(freqs) when has_positions, else 0)
-//     VInt position * n_pos              (document-order, partitioned by freqs)
+//     u32  position * n_pos              (RAW LE block, document-order, partitioned
+//                                          by freqs)
 //
 // Decode is fully STREAMED: a RunReader reads a small fixed buffer at a time and
 // materializes only the CURRENT term's postings, never the whole run. The k-way
@@ -55,8 +60,9 @@ class RunWriter {
   // Opens `path` for writing (truncating). Returns IoError on failure.
   Status open(const std::string& path);
 
-  // Appends one term's postings under `term_id`. `tp.positions` must be empty
-  // iff !has_positions. Caller guarantees ascending docids and parallel lengths.
+  // Appends one term's postings under `term_id`. `tp.positions_flat` must be empty
+  // iff !has_positions (and otherwise hold sum(freqs) entries in doc order).
+  // Caller guarantees ascending docids and parallel docids/freqs lengths.
   Status write_term(uint32_t term_id, const TermPostings& tp);
 
   // Flushes the buffer and closes the file. Safe to call once; idempotent.
@@ -98,6 +104,9 @@ class RunReader {
   Status fill();                         // tops up the decode window from disk
   Status ensure(size_t n);               // guarantees >= n buffered bytes (or eof)
   Status read_varint(uint64_t* v);       // bounds-checked streamed varint
+  // Bulk-reads `count` RAW little-endian u32s from the window into `out` (resized
+  // to count). Bounds-checked against the run's true length (Corruption on EOF).
+  Status read_raw_u32(size_t count, std::vector<uint32_t>* out);
 
   int fd_ = -1;
   bool has_positions_ = false;

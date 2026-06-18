@@ -42,7 +42,7 @@ TermPostings MakeTerm(std::vector<uint32_t> docids, std::vector<uint32_t> freqs,
   TermPostings tp;
   tp.docids = std::move(docids);
   tp.freqs = std::move(freqs);
-  tp.positions = std::move(positions);
+  tp.set_positions_per_doc(positions);  // flatten per-doc lists into positions_flat
   return tp;
 }
 
@@ -66,7 +66,7 @@ void RoundTrip(const std::vector<IdTerm>& terms, bool has_positions) {
     EXPECT_EQ(got.docids, expect.tp.docids);
     EXPECT_EQ(got.freqs, expect.tp.freqs);
     if (has_positions) {
-      EXPECT_EQ(got.positions, expect.tp.positions);
+      EXPECT_EQ(got.positions_flat, expect.tp.positions_flat);
     }
     ASSERT_TRUE(r.advance().ok());
   }
@@ -149,11 +149,51 @@ TEST(SpillRunCodec, MergeConcatenatesAcrossRuns) {
   EXPECT_EQ(merged[0].term, "common");
   EXPECT_EQ(merged[0].docids, (std::vector<uint32_t>{0, 1, 5, 8, 9}));
   EXPECT_EQ(merged[0].freqs, (std::vector<uint32_t>{1, 2, 1, 1, 1}));
-  EXPECT_EQ(merged[0].positions[1], (std::vector<uint32_t>{1, 2}));
+  // Flat positions: doc0{0} doc1{1,2} doc5{0} doc8{0} doc9{0}.
+  EXPECT_EQ(merged[0].positions_flat, (std::vector<uint32_t>{0, 1, 2, 0, 0, 0}));
+  EXPECT_EQ(std::vector<uint32_t>(merged[0].doc_positions(1).begin(),
+                                  merged[0].doc_positions(1).end()),
+            (std::vector<uint32_t>{1, 2}));
   EXPECT_EQ(merged[1].term, "only0");
   EXPECT_EQ(merged[1].docids, (std::vector<uint32_t>{3}));
   EXPECT_EQ(merged[2].term, "zzz");
   EXPECT_EQ(merged[2].docids, (std::vector<uint32_t>{2}));
+}
+
+// BOUNDARY COALESCE with FLAT positions: a spill that falls BETWEEN two tokens of
+// the SAME doc leaves that doc ending one run and beginning the next with the same
+// docid. The merge must fold them into ONE doc whose positions concatenate (run
+// order) into the correct flat layout -- the trickiest flat-positions merge path.
+TEST(SpillRunCodec, MergeCoalescesBoundaryDocPositionsFlat) {
+  const std::vector<std::string> vocab = {"alpha"};
+  TempRun r0, r1;
+  {
+    RunWriter w;
+    ASSERT_TRUE(w.open(r0.path).ok());
+    // doc 0 (pos 0,7), doc 1 first half (pos 1) -- doc 1 continues in r1.
+    ASSERT_TRUE(w.write_term(0, MakeTerm({0, 1}, {2, 1}, {{0, 7}, {1}})).ok());
+    ASSERT_TRUE(w.close().ok());
+  }
+  {
+    RunWriter w;
+    ASSERT_TRUE(w.open(r1.path).ok());
+    // doc 1 second half (pos 4,9), then doc 2 (pos 3).
+    ASSERT_TRUE(w.write_term(0, MakeTerm({1, 2}, {2, 1}, {{4, 9}, {3}})).ok());
+    ASSERT_TRUE(w.close().ok());
+  }
+  std::vector<TermPostings> merged;
+  ASSERT_TRUE(MergeRuns({r0.path, r1.path}, vocab, /*has_positions=*/true,
+                        [&](TermPostings&& tp) { merged.push_back(std::move(tp)); })
+                  .ok());
+  ASSERT_EQ(merged.size(), 1u);
+  EXPECT_EQ(merged[0].docids, (std::vector<uint32_t>{0, 1, 2}));
+  // doc 1 coalesced: freq 1 + 2 = 3, positions 1,4,9 (run order).
+  EXPECT_EQ(merged[0].freqs, (std::vector<uint32_t>{2, 3, 1}));
+  // Flat: doc0{0,7} doc1{1,4,9} doc2{3}.
+  EXPECT_EQ(merged[0].positions_flat, (std::vector<uint32_t>{0, 7, 1, 4, 9, 3}));
+  EXPECT_EQ(std::vector<uint32_t>(merged[0].doc_positions(1).begin(),
+                                  merged[0].doc_positions(1).end()),
+            (std::vector<uint32_t>{1, 4, 9}));
 }
 
 // The merge order follows the VOCAB STRING, not the numeric id: ids whose

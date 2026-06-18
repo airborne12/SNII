@@ -152,9 +152,7 @@ SniiIndexInput ToInput(const Corpus& c) {
     for (const auto& [docid, freq] : plist) {
       tp.docids.push_back(docid);
       tp.freqs.push_back(freq);
-      std::vector<uint32_t> pos;
-      for (uint32_t k = 0; k < freq; ++k) pos.push_back(k);
-      tp.positions.push_back(std::move(pos));
+      for (uint32_t k = 0; k < freq; ++k) tp.positions_flat.push_back(k);  // flat
     }
     in.terms.push_back(std::move(tp));
   }

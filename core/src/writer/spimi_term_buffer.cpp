@@ -11,9 +11,23 @@
 
 #include "snii/writer/spill_run_codec.h"
 
+#if defined(__GLIBC__)
+#include <malloc.h>
+#endif
+
 namespace snii::writer {
 
 namespace {
+
+// Returns freed heap arenas to the OS (glibc only). The spill encode churns many
+// small allocations whose freed chunks glibc retains in its arenas; trimming
+// before the peak-RSS-defining merge phase recovers that retention. No-op (and
+// harmless) on non-glibc libcs.
+void TrimMalloc() {
+#if defined(__GLIBC__)
+  ::malloc_trim(0);
+#endif
+}
 
 // Per-element overhead used by the live-byte estimate (4-byte docid/freq/pos
 // each, plus a rough per-term node + key cost). The exact constant is irrelevant
@@ -39,9 +53,10 @@ SpimiTermBuffer::SpimiTermBuffer(const std::vector<std::string>* vocab,
     : vocab_(vocab),
       has_positions_(has_positions),
       spill_threshold_bytes_(spill_threshold_bytes) {
-  // Borrowed-vocab mode: dense per-id accumulators sized to the vocabulary.
-  terms_.resize(vocab_->size());
-  present_.assign(vocab_->size(), 0);
+  // Borrowed-vocab mode: only the 4 B/id slot-index array is sized to the
+  // vocabulary; the Term pool (slots_) grows with the LIVE touched count, so an
+  // all-but-empty vocabulary costs ~4 B/id instead of ~80 B/id.
+  slot_of_.assign(vocab_->size(), 0);
 }
 
 SpimiTermBuffer::SpimiTermBuffer(bool has_positions, size_t spill_threshold_bytes)
@@ -62,14 +77,35 @@ void SpimiTermBuffer::account_token(uint32_t term_id, bool new_term, bool new_do
   if (has_positions_) live_bytes_ += kBytesPerPosition;
 }
 
+// Returns the live Term for `term_id`, claiming a pool slot on first touch (1 ==
+// new). Reuses a freed slot from free_slots_ when available; otherwise appends a
+// fresh Term to slots_. slot_of_[term_id] holds (slot index + 1); 0 means empty.
+SpimiTermBuffer::Term& SpimiTermBuffer::term_slot(uint32_t term_id, bool* new_term) {
+  uint32_t enc = slot_of_[term_id];
+  if (enc != 0) {
+    *new_term = false;
+    return slots_[enc - 1];
+  }
+  *new_term = true;
+  uint32_t slot;
+  if (!free_slots_.empty()) {
+    slot = free_slots_.back();
+    free_slots_.pop_back();
+  } else {
+    slot = static_cast<uint32_t>(slots_.size());
+    slots_.emplace_back();
+  }
+  slot_of_[term_id] = slot + 1;
+  return slots_[slot];
+}
+
 void SpimiTermBuffer::accumulate(uint32_t term_id, uint32_t docid, uint32_t pos) {
-  const bool new_term = present_[term_id] == 0;
+  bool new_term = false;
+  Term& t = term_slot(term_id, &new_term);
   if (new_term) {
-    present_[term_id] = 1;
     touched_ids_.push_back(term_id);
     ++live_term_count_;
   }
-  Term& t = terms_[term_id];
   const bool new_doc = t.docids.empty() || t.docids.back() != docid;
   if (new_doc) {
     if (!t.docids.empty() && docid < t.docids.back()) t.sorted = false;
@@ -89,9 +125,9 @@ void SpimiTermBuffer::accumulate(uint32_t term_id, uint32_t docid, uint32_t pos)
 }
 
 void SpimiTermBuffer::add_token(uint32_t term_id, uint32_t docid, uint32_t pos) {
-  // Hot path: a dense vector index + a couple of pushes. No hashing, no string
+  // Hot path: a pooled slot lookup + a couple of pushes. No hashing, no string
   // construction per token. Reject (and latch) an out-of-range id.
-  if (term_id >= terms_.size()) {
+  if (term_id >= slot_of_.size()) {
     if (spill_status_.ok()) {
       spill_status_ = Status::InvalidArgument("spimi: term_id out of vocab range");
     }
@@ -109,8 +145,7 @@ void SpimiTermBuffer::add_token(std::string_view term, uint32_t docid, uint32_t 
     term_id = static_cast<uint32_t>(owned_vocab_.size());
     owned_vocab_.emplace_back(term);
     intern_.emplace(owned_vocab_.back(), term_id);
-    terms_.emplace_back();
-    present_.push_back(0);
+    slot_of_.push_back(0);  // vocab grows: new id starts with no live slot
   } else {
     term_id = it->second;
   }
@@ -118,20 +153,6 @@ void SpimiTermBuffer::add_token(std::string_view term, uint32_t docid, uint32_t 
 }
 
 namespace {
-
-// Re-slices a term's flat positions (document order, partitioned by freqs) into
-// per-doc position lists. positions_flat[run] maps to doc i for run lengths freqs[i].
-std::vector<std::vector<uint32_t>> SlicePositions(const std::vector<uint32_t>& freqs,
-                                                  std::vector<uint32_t>&& flat) {
-  std::vector<std::vector<uint32_t>> out(freqs.size());
-  size_t off = 0;
-  for (size_t i = 0; i < freqs.size(); ++i) {
-    const size_t n = freqs[i];
-    out[i].assign(flat.begin() + off, flat.begin() + off + n);
-    off += n;
-  }
-  return out;
-}
 
 // Reorders a term's flat arrays into ascending-docid order. Only invoked for the
 // rare term that received out-of-order docids; the common path stays untouched.
@@ -180,7 +201,8 @@ TermPostings SpimiTermBuffer::to_postings(std::string term, Term&& t) const {
   tp.docids = std::move(t.docids);
   tp.freqs = std::move(t.freqs);
   if (has_positions_) {
-    tp.positions = SlicePositions(tp.freqs, std::move(t.positions_flat));
+    // Flat positions move straight through -- no per-doc vector-of-vectors built.
+    tp.positions_flat = std::move(t.positions_flat);
   }
   return tp;
 }
@@ -194,16 +216,20 @@ std::vector<uint32_t> SpimiTermBuffer::sorted_ids() const {
 }
 
 void SpimiTermBuffer::release_term(uint32_t term_id) {
-  present_[term_id] = 0;
+  const uint32_t enc = slot_of_[term_id];
+  if (enc == 0) return;  // not live (defensive)
+  const uint32_t slot = enc - 1;
+  slots_[slot] = Term();  // free this term's arrays; the empty Term slot is reusable
+  free_slots_.push_back(slot);
+  slot_of_[term_id] = 0;
   --live_term_count_;
-  terms_[term_id] = Term();  // return this term's arrays to the allocator
 }
 
 void SpimiTermBuffer::drain_sorted(const std::function<void(TermPostings&&)>& fn) {
   const std::vector<std::string>& v = vocab();
   for (uint32_t id : sorted_ids()) {
-    Term term = std::move(terms_[id]);
-    release_term(id);  // release this term's arrays before building the next
+    Term term = std::move(slots_[slot_of_[id] - 1]);
+    release_term(id);  // release this term's slot before building the next
     TermPostings tp = to_postings(v[id], std::move(term));
     fn(std::move(tp));
   }
@@ -217,7 +243,7 @@ Status SpimiTermBuffer::drain_to_writer(RunWriter* w) {
   // Spill writes by term-id (no string IO). Iterate touched ids in vocab-string
   // order so each run is sorted; the k-way merge re-orders runs by the same key.
   for (uint32_t id : sorted_ids()) {
-    Term term = std::move(terms_[id]);
+    Term term = std::move(slots_[slot_of_[id] - 1]);
     release_term(id);
     TermPostings tp = to_postings(v[id], std::move(term));
     if (st.ok()) st = w->write_term(id, tp);
@@ -247,11 +273,15 @@ void SpimiTermBuffer::merge_runs(const std::function<void(TermPostings&&)>& fn) 
     if (!s.ok() && spill_status_.ok()) spill_status_ = s;
   }
   if (!spill_status_.ok()) return;  // a spill failed earlier; emit nothing
-  // All terms are now spilled; the merge reads runs and never touches the dense
-  // accumulators. Free their (vocab-sized) capacity so the merge phase does not
-  // hold ~vocab_size idle Term slots resident -- keeps spill-mode peak RSS down.
-  std::vector<Term>().swap(terms_);
-  std::vector<uint8_t>().swap(present_);
+  // All terms are now spilled; the merge reads runs and never touches the
+  // accumulators. Free the pool + the vocab-sized slot index so the merge phase
+  // holds none of the input-side arrays resident -- keeps spill-mode peak RSS
+  // down. malloc_trim(0) returns the freed glibc arenas to the OS so the peak RSS
+  // measurement reflects the merge transient, not retained input-phase chunks.
+  std::vector<Term>().swap(slots_);
+  std::vector<uint32_t>().swap(free_slots_);
+  std::vector<uint32_t>().swap(slot_of_);
+  TrimMalloc();
   Status s = MergeRuns(run_paths_, vocab(), has_positions_, fn);
   if (!s.ok() && spill_status_.ok()) spill_status_ = s;
 }

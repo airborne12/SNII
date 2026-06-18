@@ -64,10 +64,9 @@ TermPostings MakeTerm(const std::string& term, const std::vector<uint32_t>& doci
     tp.freqs[i] = static_cast<uint32_t>((i % 3) + 1);
   }
   if (with_positions) {
-    tp.positions.resize(docids.size());
     for (size_t i = 0; i < docids.size(); ++i) {
       for (uint32_t k = 0; k < tp.freqs[i]; ++k) {
-        tp.positions[i].push_back(k * 2);  // ascending positions
+        tp.positions_flat.push_back(k * 2);  // ascending positions (flat, by freq)
       }
     }
   }
@@ -332,8 +331,7 @@ TermPostings MakePosTerm(const std::string& term, const std::vector<uint32_t>& d
   tp.term = term;
   tp.docids = docs;
   tp.freqs.assign(docs.size(), 1);
-  tp.positions.resize(docs.size());
-  for (size_t i = 0; i < docs.size(); ++i) tp.positions[i].push_back(pos);
+  tp.positions_flat.assign(docs.size(), pos);  // one position per doc, flat
   return tp;
 }
 

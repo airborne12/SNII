@@ -89,8 +89,7 @@ TermPostings MakePosTerm(const std::string& term, const std::vector<uint32_t>& d
   tp.term = term;
   tp.docids = docs;
   tp.freqs.assign(docs.size(), 1);
-  tp.positions.resize(docs.size());
-  for (size_t i = 0; i < docs.size(); ++i) tp.positions[i].push_back(pos);
+  tp.positions_flat.assign(docs.size(), pos);  // one position per doc, flat
   return tp;
 }
 

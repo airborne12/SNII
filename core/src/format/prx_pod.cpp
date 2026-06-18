@@ -37,6 +37,30 @@ Status encode_payload(std::span<const std::vector<uint32_t>> per_doc, ByteSink* 
   return Status::OK();
 }
 
+// FLAT-positions encoder: identical wire output to encode_payload above, but
+// reads positions from a single flat span partitioned per-doc by `freqs` (doc d
+// owns the next freqs[d] entries). This avoids materializing a vector-of-vectors
+// for the window; freqs.size() is the doc count and sum(freqs) == flat.size().
+Status encode_payload_flat(std::span<const uint32_t> flat,
+                           std::span<const uint32_t> freqs, ByteSink* out) {
+  out->put_varint32(static_cast<uint32_t>(freqs.size()));
+  size_t off = 0;
+  for (uint32_t fc : freqs) {
+    out->put_varint32(fc);
+    uint32_t prev = 0;
+    for (uint32_t i = 0; i < fc; ++i) {
+      const uint32_t pos = flat[off + i];
+      if (i > 0 && pos < prev) {
+        return Status::InvalidArgument("prx: positions within a doc must be ascending");
+      }
+      out->put_varint32(i == 0 ? pos : pos - prev);
+      prev = pos;
+    }
+    off += fc;
+  }
+  return Status::OK();
+}
+
 // Decode per-doc position lists from a plain payload.
 Status decode_payload(Slice plain, std::vector<std::vector<uint32_t>>* out) {
   ByteSource src(plain);
@@ -128,6 +152,20 @@ Status build_prx_window(std::span<const std::vector<uint32_t>> per_doc_positions
   if (sink == nullptr) return Status::InvalidArgument("prx: null sink");
   ByteSink plain;
   SNII_RETURN_IF_ERROR(encode_payload(per_doc_positions, &plain));
+  Slice plain_view = plain.view();
+  if (!should_compress(zstd_level_or_negative_for_auto, plain_view.size())) {
+    write_raw(plain_view, sink);
+    return Status::OK();
+  }
+  return write_zstd(plain_view, zstd_level_or_negative_for_auto, sink);
+}
+
+Status build_prx_window_flat(std::span<const uint32_t> positions_flat,
+                             std::span<const uint32_t> freqs,
+                             int zstd_level_or_negative_for_auto, ByteSink* sink) {
+  if (sink == nullptr) return Status::InvalidArgument("prx: null sink");
+  ByteSink plain;
+  SNII_RETURN_IF_ERROR(encode_payload_flat(positions_flat, freqs, &plain));
   Slice plain_view = plain.view();
   if (!should_compress(zstd_level_or_negative_for_auto, plain_view.size())) {
     write_raw(plain_view, sink);

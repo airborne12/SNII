@@ -35,9 +35,9 @@ TEST(SpimiTermBuffer, AccumulateAndSort) {
   ASSERT_EQ(apple.docids.size(), 2u);
   EXPECT_EQ(apple.docids[0], 0u);
   EXPECT_EQ(apple.freqs[0], 2u);
-  ASSERT_EQ(apple.positions[0].size(), 2u);
-  EXPECT_EQ(apple.positions[0][0], 1u);
-  EXPECT_EQ(apple.positions[0][1], 2u);
+  ASSERT_EQ(apple.doc_positions(0).size(), 2u);
+  EXPECT_EQ(apple.doc_positions(0)[0], 1u);
+  EXPECT_EQ(apple.doc_positions(0)[1], 2u);
   EXPECT_EQ(apple.docids[1], 1u);
   EXPECT_EQ(apple.freqs[1], 1u);
 }
@@ -57,7 +57,7 @@ TEST(SpimiTermBuffer, DocsOnlyNoPositions) {
   EXPECT_EQ(terms[0].freqs[0], 2u);
   EXPECT_EQ(terms[0].docids[1], 2u);
   EXPECT_EQ(terms[0].freqs[1], 1u);
-  EXPECT_TRUE(terms[0].positions.empty());
+  EXPECT_TRUE(terms[0].positions_flat.empty());
 }
 
 TEST(SpimiTermBuffer, Empty) {
@@ -94,13 +94,15 @@ TEST(SpimiTermBuffer, StreamingMatchesMaterialized) {
     EXPECT_EQ(material[i].term, streamed[i].term);
     EXPECT_EQ(material[i].docids, streamed[i].docids);
     EXPECT_EQ(material[i].freqs, streamed[i].freqs);
-    EXPECT_EQ(material[i].positions, streamed[i].positions);
+    EXPECT_EQ(material[i].positions_flat, streamed[i].positions_flat);
   }
   // apple: docs {0(pos 1,2), 1(pos 0), 5(pos 3,7)} -> positions re-sliced by freq.
   ASSERT_EQ(streamed[0].term, "apple");
   ASSERT_EQ(streamed[0].docids.size(), 3u);
   EXPECT_EQ(streamed[0].freqs, (std::vector<uint32_t>{2u, 1u, 2u}));
-  EXPECT_EQ(streamed[0].positions[2], (std::vector<uint32_t>{3u, 7u}));
+  EXPECT_EQ(std::vector<uint32_t>(streamed[0].doc_positions(2).begin(),
+                                  streamed[0].doc_positions(2).end()),
+            (std::vector<uint32_t>{3u, 7u}));
 }
 
 // Out-of-order docid GROUPS (each doc's tokens stay contiguous, but the docids
@@ -120,9 +122,7 @@ TEST(SpimiTermBuffer, OutOfOrderDocidsSortedAtFinalize) {
   const TermPostings& t = terms[0];
   EXPECT_EQ(t.docids, (std::vector<uint32_t>{1u, 3u, 5u}));
   EXPECT_EQ(t.freqs, (std::vector<uint32_t>{2u, 1u, 2u}));
-  EXPECT_EQ(t.positions[0], (std::vector<uint32_t>{10u, 11u}));
-  EXPECT_EQ(t.positions[1], (std::vector<uint32_t>{30u}));
-  EXPECT_EQ(t.positions[2], (std::vector<uint32_t>{50u, 51u}));
+  EXPECT_EQ(t.positions_flat, (std::vector<uint32_t>{10u, 11u, 30u, 50u, 51u}));
 }
 
 // BORROWED-vocab id path: feeding raw term-ids (no per-token string work)
@@ -151,7 +151,9 @@ TEST(SpimiTermBuffer, TermIdPathMatchesStringPath) {
   const TermPostings& apple = terms[0];
   ASSERT_EQ(apple.docids.size(), 2u);
   EXPECT_EQ(apple.freqs[0], 2u);
-  EXPECT_EQ(apple.positions[0], (std::vector<uint32_t>{1u, 2u}));
+  EXPECT_EQ(std::vector<uint32_t>(apple.doc_positions(0).begin(),
+                                 apple.doc_positions(0).end()),
+            (std::vector<uint32_t>{1u, 2u}));
   EXPECT_EQ(apple.docids[1], 1u);
   EXPECT_EQ(apple.freqs[1], 1u);
 }
@@ -211,7 +213,7 @@ TEST(SpimiTermBuffer, TermIdSpillMatchesUnlimited) {
     EXPECT_EQ(a[i].term, b[i].term);
     EXPECT_EQ(a[i].docids, b[i].docids);
     EXPECT_EQ(a[i].freqs, b[i].freqs);
-    EXPECT_EQ(a[i].positions, b[i].positions);
+    EXPECT_EQ(a[i].positions_flat, b[i].positions_flat);
   }
   EXPECT_TRUE(un.status().ok());
   EXPECT_TRUE(sp.status().ok());

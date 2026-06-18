@@ -68,11 +68,15 @@ Status EncodeRegions(std::span<const uint32_t> docids,
   return Status::OK();
 }
 
-// Builds a single .prx window from a slice of per-doc position lists.
-Status MakePrxWindow(std::span<const std::vector<uint32_t>> positions,
-                     std::vector<uint8_t>* out) {
+// Builds a single .prx window directly from a FLAT positions slice + its parallel
+// freqs slice (doc d owns the next freqs[d] entries). Byte-identical to building
+// from per-doc vectors, but with NO vector-of-vectors materialization: the writer
+// indexes straight into the term's flat positions buffer.
+Status MakePrxWindow(std::span<const uint32_t> positions_flat,
+                     std::span<const uint32_t> freqs, std::vector<uint8_t>* out) {
   ByteSink sink;
-  SNII_RETURN_IF_ERROR(snii::format::build_prx_window(positions, kAutoZstd, &sink));
+  SNII_RETURN_IF_ERROR(
+      snii::format::build_prx_window_flat(positions_flat, freqs, kAutoZstd, &sink));
   *out = sink.buffer();
   return Status::OK();
 }
@@ -178,8 +182,9 @@ Status BuildWindowedPosting(const TermPostings& tp, bool has_freq, bool has_prx,
   // of the per-doc position lists. Output bytes are unchanged.
   const std::span<const uint32_t> all_docs(tp.docids);
   const std::span<const uint32_t> all_freqs(tp.freqs);
-  const std::span<const std::vector<uint32_t>> all_pos(tp.positions);
+  const std::span<const uint32_t> all_pos(tp.positions_flat);
   uint64_t win_base = 0;  // absolute last docid of the previous window
+  size_t pos_off = 0;     // running flat-positions offset of the current window
   for (size_t start = 0; start < n; start += unit) {
     const size_t len = std::min<size_t>(unit, n - start);
     const auto docs = all_docs.subspan(start, len);
@@ -198,13 +203,18 @@ Status BuildWindowedPosting(const TermPostings& tp, bool has_freq, bool has_prx,
     m.max_norm = WindowMaxNorm(norms, docs);
     LayoutWindowRegions(dd_meta, dd_bytes, freq_meta, freq_bytes, has_freq, out, &m);
 
+    // This window owns sum(freqs) flat positions starting at pos_off.
+    size_t win_pos = 0;
+    for (uint32_t f : freqs) win_pos += f;
     if (has_prx) {
       std::vector<uint8_t> prx_win;
-      SNII_RETURN_IF_ERROR(MakePrxWindow(all_pos.subspan(start, len), &prx_win));
+      SNII_RETURN_IF_ERROR(
+          MakePrxWindow(all_pos.subspan(pos_off, win_pos), freqs, &prx_win));
       m.prx_off = static_cast<uint64_t>(out->prx_bytes.size());
       m.prx_len = static_cast<uint64_t>(prx_win.size());
       AppendBytes(&out->prx_bytes, prx_win);
     }
+    pos_off += win_pos;
     out->windows.push_back(m);
     win_base = m.last_docid;
   }
@@ -232,8 +242,13 @@ Status LogicalIndexWriter::validate_term(const TermPostings& tp) const {
   if (tp.freqs.size() != tp.docids.size()) {
     return Status::InvalidArgument("logical_index: freqs length must equal docids");
   }
-  if (has_prx_ && tp.positions.size() != tp.docids.size()) {
-    return Status::InvalidArgument("logical_index: positions length must equal docids");
+  if (has_prx_) {
+    uint64_t total_pos = 0;
+    for (uint32_t f : tp.freqs) total_pos += f;
+    if (total_pos != tp.positions_flat.size()) {
+      return Status::InvalidArgument(
+          "logical_index: flat positions count must equal sum(freqs)");
+    }
   }
   for (size_t i = 1; i < tp.docids.size(); ++i) {
     if (tp.docids[i] <= tp.docids[i - 1]) {
@@ -290,7 +305,9 @@ Status LogicalIndexWriter::build_slim_entry(const TermPostings& tp, uint64_t frq
   std::vector<uint8_t> frq_win = dd_bytes;  // [dd_region][freq_region]
   AppendBytes(&frq_win, freq_bytes);
   std::vector<uint8_t> prx_win;
-  if (has_prx_) SNII_RETURN_IF_ERROR(MakePrxWindow(tp.positions, &prx_win));
+  if (has_prx_) {
+    SNII_RETURN_IF_ERROR(MakePrxWindow(tp.positions_flat, tp.freqs, &prx_win));
+  }
 
   e->enc = DictEntryEnc::kSlim;
   e->dd_meta = dd_meta;

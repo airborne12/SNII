@@ -221,7 +221,7 @@ TEST(SpimiSpillWriter, FinalizeSortedMatchesAcrossSpill) {
     EXPECT_EQ(a[i].term, b[i].term);
     EXPECT_EQ(a[i].docids, b[i].docids);
     EXPECT_EQ(a[i].freqs, b[i].freqs);
-    EXPECT_EQ(a[i].positions, b[i].positions);
+    EXPECT_EQ(a[i].positions_flat, b[i].positions_flat);
   }
   EXPECT_TRUE(un.status().ok());
   EXPECT_TRUE(sp.status().ok());
