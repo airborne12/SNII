@@ -58,6 +58,16 @@
 
 > 设计原话：代价可能是增加倒排索引数据大小，换取冷查性能；存算分离下 file cache 与 S3 单位字节约 10:1。优化后 SNII 在精确字节上对 CLucene 全面领先（短语 11×、term 2×），FileCache 块占用 high-df term 亦降 40%。
 
+**真实 OSS 端到端验证（5M，`--oss --repeat 15`，request_bytes=真实 OSS 传输字节）**：字节优化直接转化为 wall-clock 提速。
+
+| 5M 查询 | CLucene median wall / request_bytes | SNII median wall / request_bytes | vs CLucene | vs 字节优化前 SNII |
+|---|---|---|---|---|
+| TERM high-df | 427.0ms / 2.82MB | **50.1ms / 1.37MB** | **8.5×** | 197→**50ms**（3.9× 提速）|
+| 5-term PHRASE | 666.9ms / 10.77MB | **107.5ms / 0.96MB** | **6.2×** | 227→**107ms**（2.1× 提速）|
+| TERM mid/low | 6.1ms | 7.4ms | 0.83× | 微查询单轮、差异在 OSS 抖动量级 |
+
+SNII 自身因传输字节下降（高频 term 减半 + 连续 dd 块、短语去掉 freq）在真实 OSS 上提速 **2–4×**；对 CLucene 拉开到高频 term **8.5×**、短语 **6.2×**。`ALL DOCIDS MATCH`。这印证设计「读取字节数」指标的优化在对象存储上有真实带宽 / 延迟收益。
+
 ## 方法论与公平性说明（诚实标注）
 
 1. **小规模单块假象**：索引 <1MiB 时整个索引落入一个 1MiB cache block，SNII serial_rounds=1 是"单块整读"而非批量之功——故以 1M/5M（索引远超 1MiB）为准，2K 仅作 sanity。
