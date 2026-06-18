@@ -157,13 +157,17 @@ double ratio(uint64_t clucene, uint64_t snii_val) {
 }
 
 void print_metrics_row(const char* engine, const snii::io::IoMetrics& m) {
+  // remote_bytes = 1MiB-block-aligned bytes (FileCache occupancy);
+  // request_bytes = exact bytes the query asked for (matches the design's
+  // "all ranges' returned bytes" on a direct/no-cache S3 read).
   std::printf("  %-8s read_at=%-6llu serial_rounds=%-4llu range_gets=%-4llu "
-              "remote_bytes=%-9llu\n",
+              "remote_bytes=%-9llu request_bytes=%-9llu\n",
               engine,
               static_cast<unsigned long long>(m.read_at_calls),
               static_cast<unsigned long long>(m.serial_rounds),
               static_cast<unsigned long long>(m.range_gets),
-              static_cast<unsigned long long>(m.remote_bytes));
+              static_cast<unsigned long long>(m.remote_bytes),
+              static_cast<unsigned long long>(m.total_request_bytes));
 }
 
 #ifdef SNII_WITH_S3
