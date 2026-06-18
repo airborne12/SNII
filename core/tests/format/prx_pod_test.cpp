@@ -86,10 +86,10 @@ TEST(PrxPod, FlatBuilderMatchesPerDocBytes) {
   }
 }
 
-// A large window (>= zstd auto threshold) built flat must equal the per-doc build
-// AND must actually take the zstd branch (codec byte == kZstd), proving the flat
-// path is byte-identical even through compression.
-TEST(PrxPod, FlatBuilderMatchesPerDocLargeZstd) {
+// A large window built flat (auto codec) must equal the per-doc build AND must
+// take the PFOR branch (codec byte == kPfor): the auto path now bit-packs deltas
+// instead of zstd, so this proves the flat path is byte-identical through PFOR.
+TEST(PrxPod, FlatBuilderMatchesPerDocLargePfor) {
   PerDoc in;
   for (uint32_t d = 0; d < 300; ++d) in.push_back({d, d + 1u, d + 2u});
   std::vector<uint32_t> flat, freqs;
@@ -101,7 +101,12 @@ TEST(PrxPod, FlatBuilderMatchesPerDocLargeZstd) {
   const Slice b = flat_sink.view();
   ASSERT_EQ(a.size(), b.size());
   EXPECT_EQ(0, std::memcmp(a.data(), b.data(), a.size()));
-  EXPECT_EQ(a.data()[0], static_cast<uint8_t>(snii::format::PrxCodec::kZstd));
+  EXPECT_EQ(a.data()[0], static_cast<uint8_t>(snii::format::PrxCodec::kPfor));
+  // Round-trips losslessly back to the per-doc lists.
+  PerDoc out;
+  ByteSource src(flat_sink.view());
+  ASSERT_TRUE(read_prx_window(&src, &out).ok());
+  EXPECT_EQ(out, in);
 }
 
 // Multiple docs, positions ascending within each doc, no shared baseline across docs.
@@ -125,8 +130,10 @@ TEST(PrxPod, EmptyPositions) {
   EXPECT_EQ(out2, with_empty_docs);
 }
 
-// Small window (level<0 auto) should use raw: codec byte == kRaw, and no comp_len.
-TEST(PrxPod, SmallWindowUsesRaw) {
+// Small window (level<0 auto) now uses PFOR: the auto codec always bit-packs
+// deltas (PFOR is cheap and competitive even for small windows; no zstd, no
+// size-based raw fallback). codec byte == kPfor and it round-trips.
+TEST(PrxPod, SmallWindowUsesPfor) {
   PerDoc in = {{1, 2, 3}, {4, 5}};
   ByteSink sink;
   ASSERT_TRUE(build_prx_window(in, -1, &sink).ok());
@@ -134,18 +141,24 @@ TEST(PrxPod, SmallWindowUsesRaw) {
   ByteSource src(sink.view());
   uint8_t codec = 0xFF;
   ASSERT_TRUE(src.get_u8(&codec).ok());
-  EXPECT_EQ(codec, static_cast<uint8_t>(snii::format::PrxCodec::kRaw));
+  EXPECT_EQ(codec, static_cast<uint8_t>(snii::format::PrxCodec::kPfor));
+
+  PerDoc out;
+  ByteSource rt(sink.view());
+  ASSERT_TRUE(read_prx_window(&rt, &out).ok());
+  EXPECT_EQ(out, in);
 }
 
-// Large window (highly compressible) automatically triggers zstd, and total bytes are smaller than forced raw encoding.
-TEST(PrxPod, LargeWindowTriggersZstdAndIsSmaller) {
+// Large window (all-1 deltas) auto-encodes as PFOR; for tiny constant deltas the
+// 1-bit-packed PFOR payload is much smaller than the forced raw varint encoding.
+TEST(PrxPod, LargeWindowTriggersPforAndIsSmaller) {
   PerDoc in;
   in.reserve(64);
   for (int d = 0; d < 64; ++d) {
     std::vector<uint32_t> doc;
     uint32_t p = 0;
     for (int i = 0; i < 256; ++i) {
-      p += 1;  // all-1 deltas: highly compressible
+      p += 1;  // all-1 deltas: pack to ~1 bit each
       doc.push_back(p);
     }
     in.push_back(std::move(doc));
@@ -156,9 +169,8 @@ TEST(PrxPod, LargeWindowTriggersZstdAndIsSmaller) {
   ByteSource probe(auto_sink.view());
   uint8_t codec = 0xFF;
   ASSERT_TRUE(probe.get_u8(&codec).ok());
-  EXPECT_EQ(codec, static_cast<uint8_t>(snii::format::PrxCodec::kZstd));
+  EXPECT_EQ(codec, static_cast<uint8_t>(snii::format::PrxCodec::kPfor));
 
-  // Force raw (level cannot be negative, but using a very large threshold that avoids compression is impractical; compare directly against the raw path instead).
   ByteSink raw_sink;
   ASSERT_TRUE(build_prx_window(in, /*level=*/0, &raw_sink).ok());
   ByteSource raw_probe(raw_sink.view());
@@ -168,11 +180,34 @@ TEST(PrxPod, LargeWindowTriggersZstdAndIsSmaller) {
 
   EXPECT_LT(auto_sink.size(), raw_sink.size());
 
-  // The compressed path can still be restored losslessly.
+  // The PFOR path restores losslessly.
   PerDoc out;
   ByteSource z(auto_sink.view());
   ASSERT_TRUE(read_prx_window(&z, &out).ok());
   EXPECT_EQ(out, in);
+}
+
+// PFOR round-trips arbitrary multi-doc windows (including empty docs, duplicate
+// positions, and large jumps that force PFOR exceptions) losslessly.
+TEST(PrxPod, PforRoundTripVariety) {
+  const std::vector<PerDoc> cases = {
+      {{0, 5, 12}, {1}, {2, 2, 9, 9, 40}, {7, 8, 9, 10}},
+      {{}, {3}, {}, {}, {1, 2}},
+      {{0, 1000000, 1000001}, {5}},  // large jump => PFOR exception
+      {{3, 7, 7, 10, 100}},          // duplicate positions (delta 0)
+  };
+  for (const auto& in : cases) {
+    ByteSink sink;
+    ASSERT_TRUE(build_prx_window(in, -1, &sink).ok());
+    ByteSource probe(sink.view());
+    uint8_t codec = 0xFF;
+    ASSERT_TRUE(probe.get_u8(&codec).ok());
+    EXPECT_EQ(codec, static_cast<uint8_t>(snii::format::PrxCodec::kPfor));
+    PerDoc out;
+    ByteSource src(sink.view());
+    ASSERT_TRUE(read_prx_window(&src, &out).ok());
+    EXPECT_EQ(out, in);
+  }
 }
 
 // level=0 explicitly forces raw (no compression), useful for testing and the oversized single-doc degenerate path.

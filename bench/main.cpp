@@ -459,6 +459,19 @@ double peak_rss_mib() {
   return static_cast<double>(ru.ru_maxrss) / 1024.0;
 }
 
+// Current (not peak) resident set size in MiB, read from /proc/self/statm
+// (field 2 = resident pages). Used to print the corpus floor before the build.
+double current_rss_mib() {
+  long rss_pages = 0;
+  if (FILE* f = std::fopen("/proc/self/statm", "r")) {
+    long total = 0;
+    if (std::fscanf(f, "%ld %ld", &total, &rss_pages) != 2) rss_pages = 0;
+    std::fclose(f);
+  }
+  const long page = sysconf(_SC_PAGESIZE);
+  return static_cast<double>(rss_pages) * static_cast<double>(page) / (1024.0 * 1024.0);
+}
+
 double mib(uint64_t bytes) { return static_cast<double>(bytes) / (1024.0 * 1024.0); }
 
 // Applies the same MiB flush/spill threshold to either engine so build memory
@@ -480,6 +493,7 @@ void build_and_report(const char* name, const bench::Corpus& corpus,
                       uint32_t spill_mib) {
   Adapter idx;
   apply_spill(idx, spill_mib);
+  std::printf("  %-8s pre_build_rss=%.1f MiB (corpus floor)\n", name, current_rss_mib());
   const double c0 = cpu_seconds();
   const auto w0 = std::chrono::steady_clock::now();
   idx.build_and_open(corpus);

@@ -166,12 +166,15 @@ void AppendBytes(std::vector<uint8_t>* dst, const std::vector<uint8_t>& src) {
 
 // One windowed term's grouped .frq layout (design 1.6): all dd regions form the
 // dd-block, all freq regions form the freq-block. The final .frq payload is
-// [prelude][dd-block][freq-block]; .prx stays per-window concatenated. Per-window
-// metadata (region offsets/lens/modes/crcs) is recorded for the prelude.
+// [prelude][dd-block][freq-block]. The .prx windows are STREAMED straight to the
+// .prx scratch file during pass 1 (not buffered here) -- so the widest term's
+// ~tens-of-MiB prx bytes never co-exist with the dd/freq blocks at peak RSS;
+// only prx_total_len (the entry's prx byte span) is tracked. Per-window metadata
+// (region offsets/lens/modes/crcs, prx_off within the entry) is recorded for the prelude.
 struct WindowedPosting {
   std::vector<uint8_t> dd_block;   // dd_region_0 ++ dd_region_1 ++ ...
   std::vector<uint8_t> freq_block; // freq_region_0 ++ ... (empty if !has_freq)
-  std::vector<uint8_t> prx_bytes;  // [win0 prx][win1 prx]... (empty if !has_prx)
+  uint64_t prx_total_len = 0;      // total .prx bytes streamed for this entry
   std::vector<WindowMeta> windows;
 };
 
@@ -212,7 +215,8 @@ void LayoutWindowRegions(const FrqRegionMeta& dd_meta, const std::vector<uint8_t
 // docids/freqs are freed by the caller after this returns. Output bytes are
 // byte-identical to the single-pass build (regions/prelude/prx are independent).
 Status BuildWindowedPosting(TermPostings& tp, bool has_freq, bool has_prx,
-                            const std::vector<uint8_t>& norms, WindowedPosting* out) {
+                            const std::vector<uint8_t>& norms,
+                            TempSectionFile* prx_file, WindowedPosting* out) {
   const uint32_t unit = AdaptiveWindowDocs(static_cast<uint32_t>(tp.docids.size()));
   const size_t n = tp.docids.size();
   const std::span<const uint32_t> all_docs(tp.docids);
@@ -220,7 +224,12 @@ Status BuildWindowedPosting(TermPostings& tp, bool has_freq, bool has_prx,
 
   WindowScratch sc;  // reused across all windows (no per-window allocation churn)
 
-  // ---- pass 1: prx + window skeleton (last_docid/win_base/doc_count/max_*) ----
+  // ---- pass 1: prx (STREAMED to disk) + window skeleton ----
+  // Each window's .prx bytes are appended straight to the .prx scratch file as
+  // they are built, so the entry's full prx payload (tens of MiB for the widest
+  // term) is never buffered in RAM alongside the dd/freq blocks that pass 2
+  // grows. m.prx_off is the byte offset WITHIN this entry's prx span (running
+  // prx_total_len), matching the reader's prx_off_delta + meta.prx_off contract.
   {
     const std::span<const uint32_t> all_pos(tp.positions_flat);
     uint64_t win_base = 0;
@@ -241,9 +250,10 @@ Status BuildWindowedPosting(TermPostings& tp, bool has_freq, bool has_prx,
         sc.prx_sink.clear();
         SNII_RETURN_IF_ERROR(snii::format::build_prx_window_flat(
             all_pos.subspan(pos_off, win_pos), freqs, kAutoZstd, &sc.prx_sink));
-        m.prx_off = static_cast<uint64_t>(out->prx_bytes.size());
+        m.prx_off = out->prx_total_len;
         m.prx_len = static_cast<uint64_t>(sc.prx_sink.size());
-        AppendBytes(&out->prx_bytes, sc.prx_sink.buffer());
+        SNII_RETURN_IF_ERROR(prx_file->append(sc.prx_sink.buffer()));
+        out->prx_total_len += m.prx_len;
       }
       pos_off += win_pos;
       out->windows.push_back(m);
@@ -315,8 +325,12 @@ Status LogicalIndexWriter::validate_term(const TermPostings& tp) const {
 // frq_docs_len = prelude_len + dd_block_len is the contiguous docs-only prefix.
 Status LogicalIndexWriter::build_windowed_entry(TermPostings& tp, uint64_t frq_base,
                                                 uint64_t prx_base, DictEntry* e) {
+  // Capture the entry's .prx start offset BEFORE the build: pass 1 streams each
+  // .prx window straight into prx_file_, so prx_off_delta is measured here.
+  const uint64_t prx_off = prx_file_.size();
   WindowedPosting wp;
-  SNII_RETURN_IF_ERROR(BuildWindowedPosting(tp, has_freq_, has_prx_, encoded_norms_, &wp));
+  SNII_RETURN_IF_ERROR(
+      BuildWindowedPosting(tp, has_freq_, has_prx_, encoded_norms_, &prx_file_, &wp));
   // docids/freqs are now fully encoded into wp; release the source arrays before
   // the (potentially large) wp blocks are appended to disk.
   std::vector<uint32_t>().swap(tp.docids);
@@ -338,10 +352,8 @@ Status LogicalIndexWriter::build_windowed_entry(TermPostings& tp, uint64_t frq_b
   e->frq_off_delta = frq_off - frq_base;
   e->frq_len = frq_file_.size() - frq_off;
   if (has_prx_) {
-    const uint64_t prx_off = prx_file_.size();
-    SNII_RETURN_IF_ERROR(prx_file_.append(wp.prx_bytes));
     e->prx_off_delta = prx_off - prx_base;
-    e->prx_len = prx_file_.size() - prx_off;
+    e->prx_len = wp.prx_total_len;  // == prx_file_.size() - prx_off
   }
   return Status::OK();
 }

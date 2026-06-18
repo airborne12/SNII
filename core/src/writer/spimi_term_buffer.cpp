@@ -5,6 +5,7 @@
 #include <algorithm>
 #include <atomic>
 #include <cstdio>
+#include <cstdlib>
 #include <numeric>
 #include <string>
 #include <utility>
@@ -28,6 +29,7 @@ void TrimMalloc() {
   ::malloc_trim(0);
 #endif
 }
+
 
 // Per-element overhead used by the live-byte estimate (4-byte docid/freq/pos
 // each, plus a rough per-term node + key cost). The exact constant is irrelevant
@@ -302,6 +304,12 @@ void SpimiTermBuffer::merge_runs(const std::function<void(TermPostings&&)>& fn) 
   TrimMalloc();
   Status s = MergeRuns(run_paths_, vocab(), has_positions_, fn);
   if (!s.ok() && spill_status_.ok()) spill_status_ = s;
+  // The merge churns one large coalesced TermPostings per term (the widest term's
+  // arrays are tens of MiB) plus per-run reader windows; on completion glibc
+  // retains those freed chunks in its arenas. Trim again so the post-merge resident
+  // set (and thus the process peak high-water if a later phase allocates) reflects
+  // only live state, not merge-transient retention.
+  TrimMalloc();
 }
 
 void SpimiTermBuffer::for_each_term_sorted(const std::function<void(TermPostings&&)>& fn) {

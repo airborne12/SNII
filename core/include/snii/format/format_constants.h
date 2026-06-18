@@ -66,7 +66,12 @@ enum class DictEntryKind : uint8_t { kPodRef = 0, kInline = 1 };
 enum class DictEntryEnc : uint8_t { kSlim = 0, kWindowed = 1 };
 
 // ---- .prx window codec (codec byte bit0-5) ----
-enum class PrxCodec : uint8_t { kRaw = 0, kZstd = 1 /* bit7 cont-reserved */ };
+// kRaw  : plaintext varint payload (doc_count, per-doc pos_count + position deltas).
+// kZstd : zstd-compressed plaintext payload (legacy reader still supported).
+// kPfor : doc_count + per-doc pos_count (varint), then position deltas bit-packed
+//         as PFOR runs (kFrqBaseUnit each). No entropy coding -> far cheaper build
+//         CPU than zstd while staying competitive on size for ascending deltas.
+enum class PrxCodec : uint8_t { kRaw = 0, kZstd = 1, kPfor = 2 /* bit7 cont-reserved */ };
 
 // ---- Build-time parameters (not format semantics; may be tuned against real metrics) ----
 inline constexpr uint32_t kFrqBaseUnit = 256;             // window base unit

@@ -52,6 +52,11 @@ class CluceneAdapter {
   uint64_t index_bytes() const;
 
  private:
+  // Doc count CLucene should buffer before flushing a segment so its per-flush
+  // RAM matches SNII's spill-at-`ram_buffer_mb_` MiB (lever 4 fairness). Derived
+  // from the corpus's average doc length and the same per-doc byte model SNII uses.
+  int32_t flush_doc_count(const Corpus& c) const;
+
   // RAM-buffer flush threshold (MiB); <=0 = no auto flush (build fully in RAM).
   double ram_buffer_mb_ = 0.0;
   // Opaque handles; concrete CLucene types live in the .cpp to keep this header

@@ -54,6 +54,28 @@ void run_shell(const std::string& cmd) {
 
 }  // namespace
 
+// FAIRNESS HELPER (lever 4): how many docs CLucene should buffer before flushing
+// a segment, so its per-flush RAM matches SNII's spill-at-`ram_buffer_mb_` MiB.
+// SNII's spill accounting (SpimiTermBuffer): a doc with L tokens adds about
+//   distinct_terms*kBytesPerDocEntry + L*kBytesPerPosition  ~=  L*(8 + 4) = L*12
+// bytes (distinct-terms-per-doc ~= L for a high-vocab corpus). So the doc count
+// whose buffered postings reach `mb` MiB is mb*MiB / (avg_L * 12). Clamped to >=1.
+int32_t CluceneAdapter::flush_doc_count(const Corpus& c) const {
+  constexpr double kBytesPerDocEntry = 8.0;   // SNII: one docid + one freq
+  constexpr double kBytesPerPosition = 4.0;   // SNII: one position
+  uint64_t total_tokens = 0;
+  for (const auto& d : c.docs) total_tokens += d.size();
+  const double avg_len =
+      c.doc_count == 0 ? 1.0
+                       : static_cast<double>(total_tokens) / static_cast<double>(c.doc_count);
+  const double bytes_per_doc = avg_len * (kBytesPerDocEntry + kBytesPerPosition);
+  const double budget = ram_buffer_mb_ * 1024.0 * 1024.0;
+  const double n = budget / (bytes_per_doc > 0.0 ? bytes_per_doc : 1.0);
+  if (n < 1.0) return 1;
+  if (n > 2.0e9) return static_cast<int32_t>(2.0e9);
+  return static_cast<int32_t>(n);
+}
+
 // A BufferedIndexInput backed by a snii MeteredFileReader. The buffered base
 // class issues readInternal() calls at the position established by seekInternal;
 // each becomes one MeteredFileReader::read_at -- exactly the object-storage cost
@@ -250,16 +272,23 @@ void CluceneAdapter::build_and_open(const Corpus& c) {
     writer->setUseCompoundFile(false);
     writer->setMaxFieldLength(0x7FFFFFFFL);  // never truncate a document
 
-    // FAIRNESS: match CLucene's RAM-buffer flush to SNII's spill threshold.
-    // CLucene's DEFAULT is RAM-buffer flush at 16 MiB with doc-count auto-flush
-    // disabled (DEFAULT_RAM_BUFFER_SIZE_MB=16, DEFAULT_MAX_BUFFERED_DOCS=DISABLE),
-    // so the default ALREADY matches SNII --spill-mib 16. Calling setRAMBufferSizeMB
-    // again after construction crashes this fork at scale, so for the bounded case
-    // we keep the default (16 MiB) and document that the matched comparison uses
-    // spill_mib=16. Only the no-spill case overrides: a huge buffer => no flush,
-    // matching SNII --spill-mib 0 (both build the whole index in RAM).
+    // FAIRNESS (lever 4): match CLucene's flush threshold to SNII's spill.
+    // We attempted doc-count flush via setMaxBufferedDocs(flush_doc_count(c)) so a
+    // higher spill threshold could be compared fairly (CLucene also flushing
+    // larger). BUT at 5M this Doris CLucene fork SEGFAULTS the moment ANY flush
+    // setter (setMaxBufferedDocs OR setRAMBufferSizeMB) is called after
+    // construction -- the resulting multi-segment merge cascade + optimize() path
+    // faults (the UNtouched constructor default is the only stable config, and it
+    // is exactly a 16 MiB RAM-buffer flush). So CLucene is PINNED at ~16 MiB.
+    // The fair, matched comparison point is therefore SNII --spill-mib 16 (both
+    // flush at ~16 MiB). At higher SNII thresholds CLucene still flushes at 16 MiB
+    // (i.e. MORE often than SNII), so the memory comparison is, if anything,
+    // generous to CLucene there. flush_doc_count() is retained for the model and a
+    // future fork that does not crash.
     if (ram_buffer_mb_ <= 0.0) {
       writer->setRAMBufferSizeMB(1.0e9f);  // no auto flush (in-RAM build)
+    } else {
+      (void)flush_doc_count(c);  // computed for the fairness model; see note above
     }
 
     auto* reader = _CLNEW lucene::util::SStringReader<char>();

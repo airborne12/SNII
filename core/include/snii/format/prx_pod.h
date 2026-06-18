@@ -11,16 +11,23 @@
 // .prx position window (PrxPod): stores term position information for several docs within one window.
 //
 // Single-window on-disk byte layout (see docs/design SNII "prx design"):
-//   u8   codec        # PrxCodec: 0=raw / 1=zstd (bit7 cont-reserved, ignored for now)
-//   VInt uncomp_len   # uncompressed payload length, written even for raw
-//   VInt comp_len     # present only when codec != raw
+//   u8   codec        # PrxCodec: 0=raw / 1=zstd / 2=pfor (bit7 cont-reserved)
+//   VInt uncomp_len   # payload length (raw/pfor: on-disk payload bytes; zstd: plaintext)
+//   VInt comp_len     # present only when codec==zstd
 //   u32  crc32c       # covers header (codec..comp_len) + payload
-//   bytes payload     # codec==raw: plaintext; codec==zstd: compressed bytes
+//   bytes payload     # raw: varint plaintext; zstd: compressed; pfor: bit-packed
 //
-// Decompressed payload (self-describing, allows reader to reconstruct per-doc boundaries):
+// raw/zstd plaintext payload (self-describing per-doc boundaries):
 //   VInt doc_count
 //   per doc: VInt pos_count, followed by pos_count position deltas (VInt)
-//   positions within a doc are ascending, stored as deltas (first is absolute, subsequent are differences).
+//   positions within a doc are ascending, stored as deltas (first absolute).
+//
+// pfor payload (default build codec; no entropy coding):
+//   VInt doc_count
+//   VInt total_pos                   # sum of all pos_counts
+//   per doc: VInt pos_count
+//   PFOR_runs(position_deltas)       # total_pos deltas, kFrqBaseUnit per run,
+//                                    #   flat doc order (first per doc absolute)
 //
 // Multi-byte fixed-length fields are little-endian; variable-length integers reuse snii/encoding/varint. crc32c checksum at window tail detects corruption.
 namespace snii::format {
