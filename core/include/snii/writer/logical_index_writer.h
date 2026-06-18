@@ -13,7 +13,9 @@
 #include "snii/format/per_index_meta.h"
 #include "snii/format/sampled_term_index.h"
 #include "snii/format/stats_block.h"
+#include "snii/io/file_writer.h"
 #include "snii/writer/spimi_term_buffer.h"
+#include "snii/writer/temp_section_file.h"
 
 // LogicalIndexWriter -- builds the per-logical-index section bytes (DICT block
 // region, .frq POD, .prx POD) and the meta sub-sections (SampledTermIndex, DICT
@@ -86,11 +88,28 @@ class LogicalIndexWriter {
   // mismatch when scoring is enabled, or non-ascending docids).
   Status build();
 
-  // Section byte blobs (relative; orchestrator decides their absolute offsets).
-  const std::vector<uint8_t>& dict_region_bytes() const { return dict_region_; }
-  const std::vector<uint8_t>& frq_pod_bytes() const { return frq_pod_; }
-  const std::vector<uint8_t>& prx_pod_bytes() const { return prx_pod_; }
+  // Section byte lengths (relative; orchestrator decides their absolute offsets).
+  // The DICT region, .frq POD and .prx POD are streamed to scratch temp files
+  // during build() rather than buffered in RAM, so only their lengths are exposed
+  // here; their bytes are emitted via stream_*_into below. norms stays in RAM
+  // (1 byte/doc, small) and is returned directly.
+  uint64_t dict_region_size() const { return dict_file_.size(); }
+  uint64_t frq_pod_size() const { return frq_file_.size(); }
+  uint64_t prx_pod_size() const { return prx_file_.size(); }
   const std::vector<uint8_t>& norms_bytes() const { return norms_section_; }
+
+  // Streams each section's bytes into the append-only container writer using a
+  // fixed copy buffer (no whole-section reload). Append order/content is
+  // unchanged, so the produced container is byte-identical to the in-RAM path.
+  Status stream_dict_region_into(snii::io::FileWriter* out) const {
+    return dict_file_.stream_into(out);
+  }
+  Status stream_frq_pod_into(snii::io::FileWriter* out) const {
+    return frq_file_.stream_into(out);
+  }
+  Status stream_prx_pod_into(snii::io::FileWriter* out) const {
+    return prx_file_.stream_into(out);
+  }
 
   bool has_prx() const { return has_prx_; }
   bool has_norms() const { return has_norms_; }
@@ -105,10 +124,14 @@ class LogicalIndexWriter {
                      uint64_t dict_region_offset, ByteSink* out) const;
 
  private:
-  // One DICT block's accumulated bytes + its directory metadata (offset filled
-  // by the orchestrator at finish_meta time).
-  struct BlockOut {
-    std::vector<uint8_t> bytes;
+  // One DICT block's directory record. The block's serialized bytes are streamed
+  // to the dict scratch file as soon as the block is cut (not retained); only this
+  // compact summary (offset within the dict region + length + entry count +
+  // checksum) is kept to build the DICT block directory at finish_meta time. The
+  // absolute file offset is computed as dict_region_offset + rel_offset.
+  struct BlockRecord {
+    uint64_t rel_offset = 0;  // byte offset of this block within the dict region
+    uint64_t length = 0;      // serialized block length
     uint32_t n_entries = 0;
     uint32_t checksum = 0;
     std::string first_term;
@@ -135,8 +158,9 @@ class LogicalIndexWriter {
   // pod_ref, no prelude.
   Status build_slim_entry(const TermPostings& tp, uint64_t frq_base,
                           uint64_t prx_base, snii::format::DictEntry* e);
-  // Serializes the current open block into a finished BlockOut.
-  void flush_block(snii::format::DictBlockBuilder* block, std::string first_term);
+  // Serializes the current open block, streams its bytes into the dict scratch
+  // file, and records a compact directory entry (no block bytes retained).
+  Status flush_block(snii::format::DictBlockBuilder* block, std::string first_term);
 
   uint64_t index_id_;
   std::string index_suffix_;
@@ -151,14 +175,20 @@ class LogicalIndexWriter {
   const std::vector<uint8_t>& encoded_norms_;
 
   uint32_t target_dict_block_bytes_;
-  std::vector<uint8_t> dict_region_;
-  std::vector<uint8_t> frq_pod_;
-  std::vector<uint8_t> prx_pod_;
+  // Large per-term-accumulated sections streamed to scratch temp files instead of
+  // being buffered in RAM until finish(). build() seals them; the orchestrator
+  // streams them into the container. RAII-cleaned on every path.
+  TempSectionFile dict_file_;
+  TempSectionFile frq_file_;
+  TempSectionFile prx_file_;
   std::vector<uint8_t> norms_section_;
 
-  std::vector<BlockOut> blocks_;
+  std::vector<BlockRecord> blocks_;
   std::vector<std::string> sample_first_terms_;
-  std::vector<std::string> all_terms_;
+  // One 8-byte XXH3 key per term (the only input build_xfilter needs), collected
+  // during the build pass so the whole-vocabulary string copy (all_terms_) is
+  // never retained.
+  std::vector<uint64_t> term_hashes_;
   snii::format::StatsBlock stats_;
   std::vector<uint8_t> xfilter_bytes_;
 };

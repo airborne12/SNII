@@ -1,5 +1,6 @@
 #include <gtest/gtest.h>
 
+#include <algorithm>
 #include <cstdint>
 #include <string>
 #include <string_view>
@@ -166,4 +167,49 @@ TEST(XFilter, NullPointersRejected) {
   EXPECT_EQ(build_xfilter({"a"}, nullptr).code(), StatusCode::kInvalidArgument);
   auto bytes = BuildFilter({"a"});
   EXPECT_EQ(XFilterReader::open(Slice(bytes), nullptr).code(), StatusCode::kInvalidArgument);
+  EXPECT_EQ(build_xfilter_hashed({1, 2, 3}, nullptr).code(),
+            StatusCode::kInvalidArgument);
+}
+
+// build_xfilter_hashed (pre-hashed keys) must produce BYTE-IDENTICAL output to
+// build_xfilter over the same term set: same dedup, params, seed search. This is
+// what lets the writer collect 8-byte keys during the build instead of retaining
+// every term string, with no change to the on-disk filter bytes.
+TEST(XFilter, HashedMatchesStringBuildByteForByte) {
+  for (size_t count : {size_t{0}, size_t{1}, size_t{7}, size_t{500}, size_t{5000}}) {
+    const std::vector<std::string> terms = MakeTerms("hx", count);
+    ByteSink str_sink;
+    ASSERT_TRUE(build_xfilter(terms, &str_sink).ok());
+
+    std::vector<uint64_t> keys;
+    keys.reserve(terms.size());
+    for (const auto& t : terms) keys.push_back(hash_term(t));
+    ByteSink hash_sink;
+    ASSERT_TRUE(build_xfilter_hashed(std::move(keys), &hash_sink).ok());
+
+    EXPECT_EQ(str_sink.buffer(), hash_sink.buffer()) << "count=" << count;
+  }
+}
+
+// build_xfilter_hashed normalizes (sorts+dedups) its input, so unsorted keys with
+// duplicates yield the same filter as the clean set -- and the same membership.
+TEST(XFilter, HashedNormalizesUnsortedDuplicateKeys) {
+  const std::vector<std::string> terms = MakeTerms("dup", 64);
+  std::vector<uint64_t> noisy;
+  for (const auto& t : terms) {
+    noisy.push_back(hash_term(t));
+    noisy.push_back(hash_term(t));  // duplicate
+  }
+  std::reverse(noisy.begin(), noisy.end());  // unsorted
+
+  ByteSink clean_sink, noisy_sink;
+  std::vector<uint64_t> clean;
+  for (const auto& t : terms) clean.push_back(hash_term(t));
+  ASSERT_TRUE(build_xfilter_hashed(std::move(clean), &clean_sink).ok());
+  ASSERT_TRUE(build_xfilter_hashed(std::move(noisy), &noisy_sink).ok());
+  EXPECT_EQ(clean_sink.buffer(), noisy_sink.buffer());
+
+  XFilterReader xf = OpenOrDie(noisy_sink.buffer());
+  for (const auto& t : terms) EXPECT_TRUE(xf.maybe_contains(t)) << t;
+  EXPECT_FALSE(xf.maybe_contains("definitely-absent-xyzzy"));
 }

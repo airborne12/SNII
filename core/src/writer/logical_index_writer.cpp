@@ -251,17 +251,17 @@ Status LogicalIndexWriter::build_windowed_entry(const TermPostings& tp, uint64_t
   e->frq_docs_len =
       e->prelude_len + static_cast<uint64_t>(wp.dd_block.size());  // [prelude][dd-block]
 
-  const uint64_t frq_off = static_cast<uint64_t>(frq_pod_.size());
-  AppendBytes(&frq_pod_, prelude);
-  AppendBytes(&frq_pod_, wp.dd_block);
-  AppendBytes(&frq_pod_, wp.freq_block);
+  const uint64_t frq_off = frq_file_.size();
+  SNII_RETURN_IF_ERROR(frq_file_.append(prelude));
+  SNII_RETURN_IF_ERROR(frq_file_.append(wp.dd_block));
+  SNII_RETURN_IF_ERROR(frq_file_.append(wp.freq_block));
   e->frq_off_delta = frq_off - frq_base;
-  e->frq_len = static_cast<uint64_t>(frq_pod_.size()) - frq_off;
+  e->frq_len = frq_file_.size() - frq_off;
   if (has_prx_) {
-    const uint64_t prx_off = static_cast<uint64_t>(prx_pod_.size());
-    AppendBytes(&prx_pod_, wp.prx_bytes);
+    const uint64_t prx_off = prx_file_.size();
+    SNII_RETURN_IF_ERROR(prx_file_.append(wp.prx_bytes));
     e->prx_off_delta = prx_off - prx_base;
-    e->prx_len = static_cast<uint64_t>(prx_pod_.size()) - prx_off;
+    e->prx_len = prx_file_.size() - prx_off;
   }
   return Status::OK();
 }
@@ -295,15 +295,15 @@ Status LogicalIndexWriter::build_slim_entry(const TermPostings& tp, uint64_t frq
 
   e->kind = DictEntryKind::kPodRef;
   e->frq_docs_len = dd_meta.disk_len;  // docs-only prefix = the single dd region
-  const uint64_t frq_off = static_cast<uint64_t>(frq_pod_.size());
-  AppendBytes(&frq_pod_, frq_win);
+  const uint64_t frq_off = frq_file_.size();
+  SNII_RETURN_IF_ERROR(frq_file_.append(frq_win));
   e->frq_off_delta = frq_off - frq_base;
-  e->frq_len = static_cast<uint64_t>(frq_pod_.size()) - frq_off;
+  e->frq_len = frq_file_.size() - frq_off;
   if (has_prx_) {
-    const uint64_t prx_off = static_cast<uint64_t>(prx_pod_.size());
-    AppendBytes(&prx_pod_, prx_win);
+    const uint64_t prx_off = prx_file_.size();
+    SNII_RETURN_IF_ERROR(prx_file_.append(prx_win));
     e->prx_off_delta = prx_off - prx_base;
-    e->prx_len = static_cast<uint64_t>(prx_pod_.size()) - prx_off;
+    e->prx_len = prx_file_.size() - prx_off;
   }
   return Status::OK();
 }
@@ -324,16 +324,24 @@ Status LogicalIndexWriter::build_entry(const TermPostings& tp, uint64_t frq_base
   return build_slim_entry(tp, frq_base, prx_base, e);
 }
 
-void LogicalIndexWriter::flush_block(DictBlockBuilder* block, std::string first_term) {
+// Serializes the current open block, streams its bytes straight into the dict
+// scratch file (not retained in RAM), and records a compact directory entry. The
+// block's offset within the dict region is the dict file's running size, so the
+// concatenation order/content is identical to the old in-RAM dict_region_.
+Status LogicalIndexWriter::flush_block(DictBlockBuilder* block,
+                                       std::string first_term) {
   ByteSink bsink;
   block->finish(&bsink);
-  BlockOut out;
-  out.bytes = bsink.buffer();
-  out.n_entries = block->n_entries();
-  out.checksum = snii::crc32c(Slice(out.bytes));
-  out.first_term = first_term;
+  BlockRecord rec;
+  rec.rel_offset = dict_file_.size();
+  rec.length = static_cast<uint64_t>(bsink.size());
+  rec.n_entries = block->n_entries();
+  rec.checksum = snii::crc32c(bsink.view());
+  rec.first_term = first_term;
+  SNII_RETURN_IF_ERROR(dict_file_.append(bsink.buffer()));
   sample_first_terms_.push_back(std::move(first_term));
-  blocks_.push_back(std::move(out));
+  blocks_.push_back(std::move(rec));
+  return Status::OK();
 }
 
 // Running state for the in-flight DICT block while terms stream past.
@@ -346,13 +354,14 @@ struct LogicalIndexWriter::BlockState {
 
 Status LogicalIndexWriter::process_term(const TermPostings& tp, BlockState* st) {
   SNII_RETURN_IF_ERROR(validate_term(tp));
-  all_terms_.push_back(tp.term);
+  // Collect only the 8-byte filter key per term (no whole-vocabulary string copy).
+  term_hashes_.push_back(snii::format::hash_term(tp.term));
   ++term_count_;
   stats_.sum_total_term_freq += SumOf(tp.freqs);
 
   if (!st->block) {
-    st->frq_base = static_cast<uint64_t>(frq_pod_.size());
-    st->prx_base = static_cast<uint64_t>(prx_pod_.size());
+    st->frq_base = frq_file_.size();
+    st->prx_base = prx_file_.size();
     st->block =
         std::make_unique<DictBlockBuilder>(tier_, has_prx_, st->frq_base, st->prx_base);
     st->block_first_term = tp.term;
@@ -363,7 +372,7 @@ Status LogicalIndexWriter::process_term(const TermPostings& tp, BlockState* st) 
   st->block->add_entry(e);
 
   if (st->block->estimated_bytes() >= target_dict_block_bytes_) {
-    flush_block(st->block.get(), st->block_first_term);
+    SNII_RETURN_IF_ERROR(flush_block(st->block.get(), st->block_first_term));
     st->block.reset();
   }
   return Status::OK();
@@ -387,7 +396,7 @@ Status LogicalIndexWriter::build_blocks() {
   } else {
     for (const auto& tp : terms_) SNII_RETURN_IF_ERROR(process_term(tp, &st));
   }
-  if (st.block) flush_block(st.block.get(), st.block_first_term);
+  if (st.block) SNII_RETURN_IF_ERROR(flush_block(st.block.get(), st.block_first_term));
   return Status::OK();
 }
 
@@ -395,9 +404,19 @@ Status LogicalIndexWriter::build() {
   if (has_norms_ && encoded_norms_.size() != doc_count_) {
     return Status::InvalidArgument("logical_index: norms length must equal doc_count");
   }
+  // Open the scratch files BEFORE any term is processed: the DICT region, .frq POD
+  // and .prx POD stream to disk instead of accumulating in RAM. .prx is opened
+  // only when positions exist (no empty file otherwise).
+  SNII_RETURN_IF_ERROR(dict_file_.open("dict"));
+  SNII_RETURN_IF_ERROR(frq_file_.open("frq"));
+  if (has_prx_) SNII_RETURN_IF_ERROR(prx_file_.open("prx"));
+
   SNII_RETURN_IF_ERROR(build_blocks());
 
-  for (const auto& b : blocks_) AppendBytes(&dict_region_, b.bytes);
+  // Seal the scratch files so the orchestrator can stream them into the container.
+  SNII_RETURN_IF_ERROR(dict_file_.seal());
+  SNII_RETURN_IF_ERROR(frq_file_.seal());
+  if (has_prx_) SNII_RETURN_IF_ERROR(prx_file_.seal());
 
   stats_.doc_count = doc_count_;
   stats_.indexed_doc_count = doc_count_;
@@ -412,8 +431,11 @@ Status LogicalIndexWriter::build() {
     norms_section_ = nsink.buffer();
   }
 
+  // Build the absent-term filter from the per-term hashes (no retained strings);
+  // term_hashes_ is moved in and consumed.
   ByteSink xsink;
-  SNII_RETURN_IF_ERROR(snii::format::build_xfilter(all_terms_, &xsink));
+  SNII_RETURN_IF_ERROR(
+      snii::format::build_xfilter_hashed(std::move(term_hashes_), &xsink));
   xfilter_bytes_ = xsink.buffer();
   return Status::OK();
 }
@@ -429,16 +451,14 @@ Status LogicalIndexWriter::finish_meta(const SectionRefs& abs_refs,
   sti.finish(&sti_sink);
 
   DictBlockDirectoryBuilder dir;
-  uint64_t running = dict_region_offset;
   for (const auto& b : blocks_) {
     BlockRef ref;
-    ref.offset = running;
-    ref.length = static_cast<uint64_t>(b.bytes.size());
+    ref.offset = dict_region_offset + b.rel_offset;
+    ref.length = b.length;
     ref.n_entries = b.n_entries;
     ref.flags = 0;
     ref.checksum = b.checksum;
     dir.add(ref);
-    running += b.bytes.size();
   }
   ByteSink dir_sink;
   dir.finish(&dir_sink);

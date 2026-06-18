@@ -465,3 +465,62 @@ TEST(SniiCompoundWriter, MultiSuperBlockReadBack) {
 
   std::remove(path.c_str());
 }
+
+// BYTE-IDENTICAL OUTPUT GUARANTEE: the section bytes (DICT region, .frq POD,
+// .prx POD) now stream through scratch temp files instead of in-RAM vectors, and
+// the xfilter is built from per-term hashes instead of retained strings. The
+// produced container must be deterministic and byte-for-byte stable: building the
+// same input twice yields identical container bytes (proves the temp-file path
+// reproduces the exact same layout/offsets/content as itself, with no in-RAM
+// residue affecting the bytes). The big multi-super-block index exercises every
+// section type (windowed pod_ref + inline + multi-block dict + prx).
+TEST(SniiCompoundWriter, StreamedOutputIsDeterministicByteForByte) {
+  const BigCorpus c = MakeBigCorpus();
+
+  auto build_one = [&](const std::string& path) {
+    io::LocalFileWriter w;
+    ASSERT_TRUE(w.open(path).ok());
+    SniiCompoundWriter cw(&w);
+    ASSERT_TRUE(cw.add_logical_index(MakeBigIndex(c)).ok());
+    ASSERT_TRUE(cw.finish().ok());
+  };
+
+  const std::string path_a = TempPath();
+  const std::string path_b = TempPath();
+  build_one(path_a);
+  build_one(path_b);
+
+  const std::vector<uint8_t> file_a = ReadAll(path_a);
+  const std::vector<uint8_t> file_b = ReadAll(path_b);
+  ASSERT_FALSE(file_a.empty());
+  EXPECT_EQ(file_a.size(), file_b.size());
+  EXPECT_EQ(file_a, file_b) << "streamed container must be byte-identical run-to-run";
+
+  std::remove(path_a.c_str());
+  std::remove(path_b.c_str());
+}
+
+// Determinism for a multi-index docs-positions container with multiple DICT
+// blocks per index (target_dict_block_bytes forces real block cuts, exercising
+// the dict scratch-file concat + the BlockRecord rel_offset directory math).
+TEST(SniiCompoundWriter, StreamedMultiIndexDeterministic) {
+  auto build_one = [&](const std::string& path) {
+    io::LocalFileWriter w;
+    ASSERT_TRUE(w.open(path).ok());
+    SniiCompoundWriter cw(&w);
+    SniiIndexInput a = MakeIndex(10, "title", 30);
+    SniiIndexInput b = MakeIndex(11, "body", 30);
+    a.target_dict_block_bytes = 64;  // force multiple dict blocks
+    b.target_dict_block_bytes = 64;
+    ASSERT_TRUE(cw.add_logical_index(a).ok());
+    ASSERT_TRUE(cw.add_logical_index(b).ok());
+    ASSERT_TRUE(cw.finish().ok());
+  };
+  const std::string p1 = TempPath();
+  const std::string p2 = TempPath();
+  build_one(p1);
+  build_one(p2);
+  EXPECT_EQ(ReadAll(p1), ReadAll(p2));
+  std::remove(p1.c_str());
+  std::remove(p2.c_str());
+}

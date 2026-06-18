@@ -194,10 +194,6 @@ bool try_build(const std::vector<uint64_t>& keys, uint64_t seed, const FuseParam
 
 // ---- Key extraction --------------------------------------------------------------------------------------
 
-uint64_t hash_term(std::string_view term) {
-  return XXH3_64bits(term.data(), term.size());
-}
-
 std::vector<uint64_t> distinct_keys(const std::vector<std::string>& terms) {
   std::vector<uint64_t> keys;
   keys.reserve(terms.size());
@@ -205,6 +201,14 @@ std::vector<uint64_t> distinct_keys(const std::vector<std::string>& terms) {
   std::sort(keys.begin(), keys.end());
   keys.erase(std::unique(keys.begin(), keys.end()), keys.end());
   return keys;
+}
+
+// Sorts + dedups a key vector in place (the only normalization build_xfilter and
+// build_xfilter_hashed need so both produce byte-identical output for the same
+// term set).
+void dedup_keys(std::vector<uint64_t>* keys) {
+  std::sort(keys->begin(), keys->end());
+  keys->erase(std::unique(keys->begin(), keys->end()), keys->end());
 }
 
 // ---- Serialization ---------------------------------------------------------------------------------------
@@ -219,13 +223,10 @@ void serialize(uint64_t seed, const FuseParams& p, const std::vector<uint8_t>& f
   SectionFramer::write(*sink, static_cast<uint8_t>(SectionType::kXFilter), payload.view());
 }
 
-}  // namespace
-
-Status build_xfilter(const std::vector<std::string>& terms, ByteSink* sink) {
-  if (sink == nullptr) {
-    return Status::InvalidArgument("xfilter: sink is null");
-  }
-  const std::vector<uint64_t> keys = distinct_keys(terms);
+// Builds + serializes the filter from already-deduped, ascending keys. Shared by
+// build_xfilter (terms -> distinct_keys) and build_xfilter_hashed (pre-hashed
+// keys), so both emit byte-identical bytes for the same term set.
+Status build_from_keys(const std::vector<uint64_t>& keys, ByteSink* sink) {
   if (keys.empty()) {
     serialize(0, FuseParams{}, std::vector<uint8_t>{}, sink);
     return Status::OK();
@@ -244,6 +245,27 @@ Status build_xfilter(const std::vector<std::string>& terms, ByteSink* sink) {
     seed = mix_seed(seed, 0x9E3779B97F4A7C15uLL) | 1uLL;  // derive a fresh nonzero seed
   }
   return Status::Internal("xfilter: binary-fuse-8 peeling failed after retry budget");
+}
+
+}  // namespace
+
+uint64_t hash_term(std::string_view term) {
+  return XXH3_64bits(term.data(), term.size());
+}
+
+Status build_xfilter(const std::vector<std::string>& terms, ByteSink* sink) {
+  if (sink == nullptr) {
+    return Status::InvalidArgument("xfilter: sink is null");
+  }
+  return build_from_keys(distinct_keys(terms), sink);
+}
+
+Status build_xfilter_hashed(std::vector<uint64_t> keys, ByteSink* sink) {
+  if (sink == nullptr) {
+    return Status::InvalidArgument("xfilter: sink is null");
+  }
+  dedup_keys(&keys);
+  return build_from_keys(keys, sink);
 }
 
 namespace {

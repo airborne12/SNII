@@ -36,6 +36,17 @@ namespace snii::format {
 // Returns kInvalidArgument if sink is null; kInternal only if peeling fails after the retry budget.
 Status build_xfilter(const std::vector<std::string>& terms, ByteSink* sink);
 
+// XXH3_64bits hash of a term -- the SAME key the filter is built/queried with. Exposed so a writer can
+// collect one 8-byte key per term DURING the build (folding the per-term string copy away) instead of
+// retaining the whole vocabulary just to feed build_xfilter at finish.
+uint64_t hash_term(std::string_view term);
+
+// Pre-hashed build: identical to build_xfilter but takes term hashes (from hash_term) directly. The keys
+// are sorted+deduped internally, so the caller may pass them unsorted and with duplicates. Producing the
+// exact same on-disk bytes as build_xfilter over the same term set (same dedup, same params, same seed
+// search). `keys` is consumed (moved-from) to avoid a second whole-vocabulary copy.
+Status build_xfilter_hashed(std::vector<uint64_t> keys, ByteSink* sink);
+
 // Reader: verifies the framing checksum and materializes the fingerprint table on open; subsequent queries
 // are pure in-memory lookups.
 class XFilterReader {

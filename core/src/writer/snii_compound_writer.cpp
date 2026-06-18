@@ -43,24 +43,29 @@ Status SniiCompoundWriter::write_bootstrap() {
   return append(sink.buffer());
 }
 
-// Writes each index's dict_region, frq_pod, prx_pod (in add order), capturing
-// the absolute offset/length of each into placements[i].
+// Streams each index's dict_region, frq_pod, prx_pod (in add order) from its
+// scratch temp files into the container, capturing the absolute offset/length of
+// each into placements[i]. The bytes/order are identical to the prior in-RAM
+// path, so the produced container is byte-identical; only the peak RSS drops.
 Status SniiCompoundWriter::write_index_sections(std::vector<Placement>* placements) {
   for (size_t i = 0; i < indexes_.size(); ++i) {
     Placement& p = (*placements)[i];
     const LogicalIndexWriter& w = *indexes_[i];
 
     p.dict_off = cursor_;
-    SNII_RETURN_IF_ERROR(append(w.dict_region_bytes()));
+    SNII_RETURN_IF_ERROR(w.stream_dict_region_into(out_));
+    cursor_ += w.dict_region_size();
     p.dict_len = cursor_ - p.dict_off;
 
     p.frq_off = cursor_;
-    SNII_RETURN_IF_ERROR(append(w.frq_pod_bytes()));
+    SNII_RETURN_IF_ERROR(w.stream_frq_pod_into(out_));
+    cursor_ += w.frq_pod_size();
     p.frq_len = cursor_ - p.frq_off;
 
     if (w.has_prx()) {
       p.prx_off = cursor_;
-      SNII_RETURN_IF_ERROR(append(w.prx_pod_bytes()));
+      SNII_RETURN_IF_ERROR(w.stream_prx_pod_into(out_));
+      cursor_ += w.prx_pod_size();
       p.prx_len = cursor_ - p.prx_off;
     }
   }
