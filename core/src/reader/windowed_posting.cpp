@@ -33,19 +33,6 @@ Status InBounds(uint64_t off, uint64_t len, uint64_t total) {
   return Status::OK();
 }
 
-// Fetches + parses the two-level prelude of a windowed entry.
-Status FetchPrelude(const LogicalIndexReader& idx, const DictEntry& entry,
-                    uint64_t frq_base, FrqPreludeReader* prelude) {
-  if (entry.prelude_len == 0) {
-    return Status::Corruption("windowed_posting: windowed entry has no prelude");
-  }
-  const uint64_t prelude_abs = PreludeAbs(idx, entry, frq_base);
-  snii::io::BatchRangeFetcher fetcher(idx.reader());
-  const size_t h = fetcher.add(prelude_abs, static_cast<size_t>(entry.prelude_len));
-  SNII_RETURN_IF_ERROR(fetcher.fetch());
-  return FrqPreludeReader::open(fetcher.get(h), prelude);
-}
-
 // Per-window batch handles for the planned .frq (+.prx) sub-range reads.
 struct WindowPlan {
   WindowMeta meta;
@@ -60,57 +47,112 @@ Status PlanWindows(const LogicalIndexReader& idx, const DictEntry& entry,
                    const FrqPreludeReader& prelude,
                    snii::io::BatchRangeFetcher* fetcher,
                    std::vector<WindowPlan>* plans) {
-  const uint64_t frq_window_start =
-      PreludeAbs(idx, entry, frq_base) + entry.prelude_len;
-  const uint64_t prx_region_start =
-      idx.section_refs().prx_pod.offset + prx_base + entry.prx_off_delta;
-  // The frq windows occupy entry.frq_len - prelude_len bytes after the prelude.
-  const uint64_t frq_region_len = entry.frq_len - entry.prelude_len;
   const uint32_t n = prelude.n_windows();
   plans->reserve(n);
   for (uint32_t w = 0; w < n; ++w) {
     WindowPlan p;
     SNII_RETURN_IF_ERROR(prelude.window(w, &p.meta));
-    SNII_RETURN_IF_ERROR(InBounds(p.meta.frq_off, p.meta.frq_len, frq_region_len));
-    p.frq_handle = fetcher->add(frq_window_start + p.meta.frq_off,
-                                static_cast<size_t>(p.meta.frq_len));
+    WindowAbsRange r;
+    SNII_RETURN_IF_ERROR(windowed_window_range(idx, entry, frq_base, prx_base,
+                                               prelude, w, want_positions, &r));
+    p.frq_handle = fetcher->add(r.frq_off, static_cast<size_t>(r.frq_len));
     if (want_positions) {
-      SNII_RETURN_IF_ERROR(InBounds(p.meta.prx_off, p.meta.prx_len, entry.prx_len));
-      p.prx_handle = fetcher->add(prx_region_start + p.meta.prx_off,
-                                  static_cast<size_t>(p.meta.prx_len));
+      p.prx_handle = fetcher->add(r.prx_off, static_cast<size_t>(r.prx_len));
     }
     plans->push_back(p);
   }
   return Status::OK();
 }
 
-// Decodes one window's docids/freqs (and positions) and appends to the output,
-// using the prelude-derived win_base so cross-window deltas rebuild correctly.
-Status DecodeWindow(const snii::io::BatchRangeFetcher& fetcher,
+// Decodes one window's docids/freqs (and positions) and appends to the output.
+Status AppendWindow(const snii::io::BatchRangeFetcher& fetcher,
                     const WindowPlan& p, bool want_positions, DecodedPosting* out) {
-  ByteSource fsrc(fetcher.get(p.frq_handle));
   std::vector<uint32_t> docids;
   std::vector<uint32_t> freqs;
-  SNII_RETURN_IF_ERROR(
-      snii::format::read_frq_window(&fsrc, p.meta.win_base, &docids, &freqs));
-  if (docids.size() != p.meta.doc_count) {
-    return Status::Corruption("windowed_posting: frq doc_count mismatch");
-  }
+  std::vector<std::vector<uint32_t>> pos;
+  const Slice prx = want_positions ? fetcher.get(p.prx_handle) : Slice();
+  SNII_RETURN_IF_ERROR(decode_window_slices(p.meta, fetcher.get(p.frq_handle), prx,
+                                            want_positions, &docids, &freqs, &pos));
   out->docids.insert(out->docids.end(), docids.begin(), docids.end());
   out->freqs.insert(out->freqs.end(), freqs.begin(), freqs.end());
-  if (!want_positions) return Status::OK();
-
-  ByteSource psrc(fetcher.get(p.prx_handle));
-  std::vector<std::vector<uint32_t>> pos;
-  SNII_RETURN_IF_ERROR(snii::format::read_prx_window(&psrc, &pos));
-  if (pos.size() != docids.size()) {
-    return Status::Corruption("windowed_posting: prx/frq doc-count mismatch");
+  if (want_positions) {
+    for (auto& v : pos) out->positions.push_back(std::move(v));
   }
-  for (auto& v : pos) out->positions.push_back(std::move(v));
   return Status::OK();
 }
 
 }  // namespace
+
+Status fetch_windowed_prelude(const LogicalIndexReader& idx, const DictEntry& entry,
+                              uint64_t frq_base, FrqPreludeReader* prelude) {
+  if (entry.prelude_len == 0) {
+    return Status::Corruption("windowed_posting: windowed entry has no prelude");
+  }
+  if (entry.prelude_len > entry.frq_len) {
+    return Status::Corruption("windowed_posting: prelude_len exceeds frq_len");
+  }
+  const uint64_t prelude_abs = PreludeAbs(idx, entry, frq_base);
+  snii::io::BatchRangeFetcher fetcher(idx.reader());
+  const size_t h = fetcher.add(prelude_abs, static_cast<size_t>(entry.prelude_len));
+  SNII_RETURN_IF_ERROR(fetcher.fetch());
+  return FrqPreludeReader::open(fetcher.get(h), prelude);
+}
+
+Status windowed_window_range(const LogicalIndexReader& idx, const DictEntry& entry,
+                             uint64_t frq_base, uint64_t prx_base,
+                             const FrqPreludeReader& prelude, uint32_t w,
+                             bool want_positions, WindowAbsRange* out) {
+  if (out == nullptr) return Status::InvalidArgument("windowed_posting: null range");
+  // Self-defend (the skip path reaches here without the prelude-fetch validation):
+  // prelude_len > frq_len would underflow frq_region_len below.
+  if (entry.prelude_len > entry.frq_len) {
+    return Status::Corruption("windowed_posting: prelude_len exceeds frq_len");
+  }
+  WindowMeta meta;
+  SNII_RETURN_IF_ERROR(prelude.window(w, &meta));
+
+  // .frq windows live after the prelude; validate against the post-prelude span.
+  const uint64_t frq_window_start = PreludeAbs(idx, entry, frq_base) + entry.prelude_len;
+  const uint64_t frq_region_len = entry.frq_len - entry.prelude_len;
+  SNII_RETURN_IF_ERROR(InBounds(meta.frq_off, meta.frq_len, frq_region_len));
+  out->frq_off = frq_window_start + meta.frq_off;
+  out->frq_len = meta.frq_len;
+
+  if (!want_positions) {
+    out->prx_off = 0;
+    out->prx_len = 0;
+    return Status::OK();
+  }
+  if (!prelude.has_prx()) {
+    return Status::Corruption("windowed_posting: positions requested but prelude has none");
+  }
+  const uint64_t prx_region_start =
+      idx.section_refs().prx_pod.offset + prx_base + entry.prx_off_delta;
+  SNII_RETURN_IF_ERROR(InBounds(meta.prx_off, meta.prx_len, entry.prx_len));
+  out->prx_off = prx_region_start + meta.prx_off;
+  out->prx_len = meta.prx_len;
+  return Status::OK();
+}
+
+Status decode_window_slices(const WindowMeta& meta, Slice frq_window, Slice prx_window,
+                            bool want_positions, std::vector<uint32_t>* docids,
+                            std::vector<uint32_t>* freqs,
+                            std::vector<std::vector<uint32_t>>* positions) {
+  ByteSource fsrc(frq_window);
+  SNII_RETURN_IF_ERROR(
+      snii::format::read_frq_window(&fsrc, meta.win_base, docids, freqs));
+  if (docids->size() != meta.doc_count) {
+    return Status::Corruption("windowed_posting: frq doc_count mismatch");
+  }
+  if (!want_positions) return Status::OK();
+
+  ByteSource psrc(prx_window);
+  SNII_RETURN_IF_ERROR(snii::format::read_prx_window(&psrc, positions));
+  if (positions->size() != docids->size()) {
+    return Status::Corruption("windowed_posting: prx/frq doc-count mismatch");
+  }
+  return Status::OK();
+}
 
 Status read_windowed_posting(const LogicalIndexReader& idx, const DictEntry& entry,
                              uint64_t frq_base, uint64_t prx_base,
@@ -119,12 +161,9 @@ Status read_windowed_posting(const LogicalIndexReader& idx, const DictEntry& ent
     return Status::InvalidArgument("windowed_posting: null out");
   }
   *out = DecodedPosting{};
-  if (entry.prelude_len > entry.frq_len) {
-    return Status::Corruption("windowed_posting: prelude_len exceeds frq_len");
-  }
 
   FrqPreludeReader prelude;
-  SNII_RETURN_IF_ERROR(FetchPrelude(idx, entry, frq_base, &prelude));
+  SNII_RETURN_IF_ERROR(fetch_windowed_prelude(idx, entry, frq_base, &prelude));
   if (want_positions && !prelude.has_prx()) {
     return Status::Corruption("windowed_posting: positions requested but prelude has none");
   }
@@ -136,7 +175,7 @@ Status read_windowed_posting(const LogicalIndexReader& idx, const DictEntry& ent
   if (fetcher.pending() > 0) SNII_RETURN_IF_ERROR(fetcher.fetch());
 
   for (const WindowPlan& p : plans) {
-    SNII_RETURN_IF_ERROR(DecodeWindow(fetcher, p, want_positions, out));
+    SNII_RETURN_IF_ERROR(AppendWindow(fetcher, p, want_positions, out));
   }
   return Status::OK();
 }
