@@ -1,18 +1,58 @@
 #include "snii/writer/spimi_term_buffer.h"
 
+#include <unistd.h>
+
 #include <algorithm>
+#include <atomic>
+#include <cstdio>
 #include <numeric>
+#include <string>
 #include <utility>
+
+#include "snii/writer/spill_run_codec.h"
 
 namespace snii::writer {
 
-SpimiTermBuffer::SpimiTermBuffer(bool has_positions) : has_positions_(has_positions) {}
+namespace {
+
+// Per-element overhead used by the live-byte estimate (4-byte docid/freq/pos
+// each, plus a rough per-term map-node + key cost). The exact constant is
+// irrelevant to correctness (output is byte-identical regardless of when we
+// spill); it only governs WHEN a spill fires relative to the threshold.
+constexpr size_t kBytesPerDocEntry = 4 + 4;  // one docid + one freq
+constexpr size_t kBytesPerPosition = 4;
+constexpr size_t kBytesPerTermNode = 64;     // map node + small Term struct
+
+// Process-unique temp path for a spill run (pid + monotonic counter so parallel
+// builds / multiple buffers never collide).
+std::string MakeRunPath() {
+  static std::atomic<uint64_t> counter{0};
+  const uint64_t n = counter.fetch_add(1);
+  return "/tmp/snii_spill_" + std::to_string(::getpid()) + "_" + std::to_string(n) +
+         ".run";
+}
+
+}  // namespace
+
+SpimiTermBuffer::SpimiTermBuffer(bool has_positions, size_t spill_threshold_bytes)
+    : has_positions_(has_positions), spill_threshold_bytes_(spill_threshold_bytes) {}
+
+SpimiTermBuffer::~SpimiTermBuffer() { cleanup_runs(); }
 
 size_t SpimiTermBuffer::unique_terms() const { return data_.size(); }
 
+void SpimiTermBuffer::account_token(const std::string& term, bool new_term,
+                                    bool new_doc) {
+  if (new_term) live_bytes_ += kBytesPerTermNode + term.size();
+  if (new_doc) live_bytes_ += kBytesPerDocEntry;
+  if (has_positions_) live_bytes_ += kBytesPerPosition;
+}
+
 void SpimiTermBuffer::add_token(std::string_view term, uint32_t docid, uint32_t pos) {
-  Term& t = data_[std::string(term)];
-  if (t.docids.empty() || t.docids.back() != docid) {
+  auto [it, inserted] = data_.try_emplace(std::string(term));
+  Term& t = it->second;
+  const bool new_doc = t.docids.empty() || t.docids.back() != docid;
+  if (new_doc) {
     if (!t.docids.empty() && docid < t.docids.back()) t.sorted = false;
     t.docids.push_back(docid);
     t.freqs.push_back(0);
@@ -20,6 +60,13 @@ void SpimiTermBuffer::add_token(std::string_view term, uint32_t docid, uint32_t 
   ++t.freqs.back();
   if (has_positions_) t.positions_flat.push_back(pos);
   ++total_tokens_;
+
+  if (spill_threshold_bytes_ != 0) {
+    account_token(it->first, inserted, new_doc);
+    if (live_bytes_ >= spill_threshold_bytes_ && spill_status_.ok()) {
+      spill_status_ = spill_to_run();
+    }
+  }
 }
 
 namespace {
@@ -90,20 +137,65 @@ TermPostings SpimiTermBuffer::to_postings(std::string term, Term&& t) const {
   return tp;
 }
 
-void SpimiTermBuffer::for_each_term_sorted(const std::function<void(TermPostings&&)>& fn) {
+std::vector<const std::string*> SpimiTermBuffer::sorted_keys() const {
   std::vector<const std::string*> keys;
   keys.reserve(data_.size());
   for (const auto& [term, _] : data_) keys.push_back(&term);
   std::sort(keys.begin(), keys.end(),
             [](const std::string* a, const std::string* b) { return *a < *b; });
+  return keys;
+}
 
-  for (const std::string* key : keys) {
+void SpimiTermBuffer::drain_sorted(const std::function<void(TermPostings&&)>& fn) {
+  for (const std::string* key : sorted_keys()) {
     auto it = data_.find(*key);
     Term term = std::move(it->second);
     TermPostings tp = to_postings(*key, std::move(term));
     data_.erase(it);  // release this term's arrays before building the next
     fn(std::move(tp));
   }
+  live_bytes_ = 0;
+}
+
+Status SpimiTermBuffer::drain_to_writer(RunWriter* w) {
+  Status st = Status::OK();
+  drain_sorted([&](TermPostings&& tp) {
+    if (st.ok()) st = w->write_term(tp);
+  });
+  return st;
+}
+
+Status SpimiTermBuffer::spill_to_run() {
+  const std::string path = MakeRunPath();
+  RunWriter w;
+  SNII_RETURN_IF_ERROR(w.open(path));
+  run_paths_.push_back(path);  // tracked for cleanup even if a later step fails
+  SNII_RETURN_IF_ERROR(drain_to_writer(&w));
+  // drain_sorted erases every entry but leaves the bucket array at its grown
+  // capacity; swap in a fresh map so that capacity is returned to the allocator
+  // and the next fill restarts from a small table (keeps peak RSS bounded).
+  std::unordered_map<std::string, Term>().swap(data_);
+  return w.close();
+}
+
+void SpimiTermBuffer::merge_runs(const std::function<void(TermPostings&&)>& fn) {
+  // Flush whatever is still resident as one final sorted run so the k-way merge
+  // sees a uniform set of run files (and never holds two term sources at once).
+  if (!data_.empty()) {
+    Status s = spill_to_run();
+    if (!s.ok() && spill_status_.ok()) spill_status_ = s;
+  }
+  if (!spill_status_.ok()) return;  // a spill failed earlier; emit nothing
+  Status s = MergeRuns(run_paths_, has_positions_, fn);
+  if (!s.ok() && spill_status_.ok()) spill_status_ = s;
+}
+
+void SpimiTermBuffer::for_each_term_sorted(const std::function<void(TermPostings&&)>& fn) {
+  if (run_paths_.empty() && spill_status_.ok()) {
+    drain_sorted(fn);  // pure in-memory path: byte-for-byte the legacy behavior
+    return;
+  }
+  merge_runs(fn);
 }
 
 std::vector<TermPostings> SpimiTermBuffer::finalize_sorted() {
@@ -111,6 +203,11 @@ std::vector<TermPostings> SpimiTermBuffer::finalize_sorted() {
   out.reserve(data_.size());
   for_each_term_sorted([&out](TermPostings&& tp) { out.push_back(std::move(tp)); });
   return out;
+}
+
+void SpimiTermBuffer::cleanup_runs() {
+  for (const std::string& p : run_paths_) std::remove(p.c_str());
+  run_paths_.clear();
 }
 
 }  // namespace snii::writer

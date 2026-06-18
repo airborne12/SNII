@@ -50,6 +50,7 @@ struct Args {
   uint32_t repeat = 1;  // --oss: re-measure each query N times for a distribution
   bool resources = false;     // measure index size / build CPU / peak RSS
   std::string engine = "both";  // --resources scope: snii | clucene | none | both
+  uint32_t spill_mib = 0;     // SNII SPIMI spill threshold in MiB (0 = unlimited)
 };
 
 Args parse_args(int argc, char** argv) {
@@ -83,6 +84,9 @@ Args parse_args(int argc, char** argv) {
       a.resources = true;
     } else if (flag == "--engine") {
       a.engine = next("--engine");
+    } else if (flag == "--spill-mib") {
+      a.spill_mib =
+          static_cast<uint32_t>(std::strtoul(next("--spill-mib"), nullptr, 10));
     } else {
       std::fprintf(stderr, "unknown argument: %s\n", flag.c_str());
       std::exit(2);
@@ -456,11 +460,21 @@ double peak_rss_mib() {
 
 double mib(uint64_t bytes) { return static_cast<double>(bytes) / (1024.0 * 1024.0); }
 
+// Applies the SNII spill threshold (MiB -> bytes) to a SniiAdapter only; the
+// generic overload is a no-op so CLucene and other engines ignore the flag.
+void apply_spill(bench::SniiAdapter& idx, uint32_t spill_mib) {
+  idx.set_spill_threshold_bytes(static_cast<size_t>(spill_mib) * 1024u * 1024u);
+}
+template <typename Adapter>
+void apply_spill(Adapter&, uint32_t) {}
+
 // Builds one engine over the corpus, reporting its on-disk index size and the
 // CPU it took. Returns nothing; peak RSS is read at process exit by the caller.
 template <typename Adapter>
-void build_and_report(const char* name, const bench::Corpus& corpus) {
+void build_and_report(const char* name, const bench::Corpus& corpus,
+                      uint32_t spill_mib) {
   Adapter idx;
+  apply_spill(idx, spill_mib);
   const double c0 = cpu_seconds();
   const auto w0 = std::chrono::steady_clock::now();
   idx.build_and_open(corpus);
@@ -480,11 +494,16 @@ int run_resources_mode(const Args& args, const bench::Corpus& corpus) {
   std::printf("=== resource comparison (engine=%s) ===\n", args.engine.c_str());
   std::printf("  corpus held in memory; peak RSS includes it (use --engine none "
               "for the baseline)\n");
+  if (args.spill_mib != 0) {
+    std::printf("  SNII spill threshold: %u MiB (out-of-core spill + k-way "
+                "merge)\n",
+                args.spill_mib);
+  }
   const bool snii = args.engine == "snii" || args.engine == "both";
   const bool clu = args.engine == "clucene" || args.engine == "both";
   try {
-    if (snii) build_and_report<bench::SniiAdapter>("SNII", corpus);
-    if (clu) build_and_report<bench::CluceneAdapter>("CLucene", corpus);
+    if (snii) build_and_report<bench::SniiAdapter>("SNII", corpus, args.spill_mib);
+    if (clu) build_and_report<bench::CluceneAdapter>("CLucene", corpus, 0);
   } catch (const std::exception& e) {
     std::fprintf(stderr, "FATAL: resource build failed: %s\n", e.what());
     return 1;

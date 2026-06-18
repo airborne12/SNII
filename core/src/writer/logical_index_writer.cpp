@@ -380,6 +380,10 @@ Status LogicalIndexWriter::build_blocks() {
       if (streamed.ok()) streamed = process_term(tp, &st);
     });
     SNII_RETURN_IF_ERROR(streamed);
+    // The streaming callback cannot return a Status, so a spill/merge I/O error
+    // is latched inside the source; surface it here so a failed out-of-core
+    // build does not masquerade as an empty-but-successful index.
+    SNII_RETURN_IF_ERROR(term_source_->status());
   } else {
     for (const auto& tp : terms_) SNII_RETURN_IF_ERROR(process_term(tp, &st));
   }

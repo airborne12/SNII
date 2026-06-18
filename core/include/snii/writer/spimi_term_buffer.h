@@ -6,6 +6,8 @@
 #include <unordered_map>
 #include <vector>
 
+#include "snii/common/status.h"
+
 namespace snii::writer {
 
 // One term's posting list: docids ascending, with parallel freqs and (when
@@ -19,8 +21,19 @@ struct TermPostings {
 
 // In-memory SPIMI (Single-Pass In-Memory Indexing) accumulator for one logical
 // index. Records term occurrences and produces lexicographically sorted terms
-// with ascending-docid posting lists. (Spill / k-way merge for out-of-core
-// builds can wrap this later; the on-disk run format is identical.)
+// with ascending-docid posting lists.
+//
+// SPILL / K-WAY MERGE (out-of-core, bounds input RAM): when a non-zero
+// spill_threshold_bytes is set, the live in-memory size is tracked as tokens
+// arrive; once it exceeds the threshold the buffer SORTS its current terms,
+// writes a self-describing sorted RUN to a temp file, and CLEARS memory. Because
+// tokens arrive in globally ascending docid order, a term that reappears in a
+// later run only covers strictly-later docids, so concatenating its postings in
+// run order during the final k-way merge keeps docids ascending. for_each_term_
+// sorted flushes the residual buffer as a final run, then k-way merges all runs
+// materializing only ONE merged term at a time -> peak memory stays bounded by
+// the threshold (plus the widest single term), NOT by total postings. With the
+// default threshold 0 (unlimited) the path is exactly the in-memory behavior.
 //
 // Internal representation is FLAT per-term parallel arrays (docids/freqs and a
 // single positions_flat vector), NOT a per-doc node-graph: this avoids the
@@ -29,7 +42,14 @@ struct TermPostings {
 // from freqs (positions are stored in document order).
 class SpimiTermBuffer {
  public:
-  explicit SpimiTermBuffer(bool has_positions);
+  // spill_threshold_bytes == 0 means unlimited (pure in-memory, default). A
+  // positive value caps the live buffer size; crossing it triggers a spill.
+  explicit SpimiTermBuffer(bool has_positions, size_t spill_threshold_bytes = 0);
+
+  ~SpimiTermBuffer();
+
+  SpimiTermBuffer(const SpimiTermBuffer&) = delete;
+  SpimiTermBuffer& operator=(const SpimiTermBuffer&) = delete;
 
   // Records one token: `term` occurs in `docid` at `pos`. For a given term,
   // docids are expected to arrive in non-decreasing order, and positions within
@@ -40,6 +60,11 @@ class SpimiTermBuffer {
   size_t unique_terms() const;
   uint64_t total_tokens() const { return total_tokens_; }
   bool has_positions() const { return has_positions_; }
+
+  // OK unless a spill / merge I/O or corruption error occurred. The streaming
+  // for_each_term_sorted swallows such errors (its callback signature has no
+  // return); callers MUST check this after draining to detect a failed build.
+  Status status() const { return spill_status_; }
 
   // Materializes all terms sorted lexicographically; each term's docids are
   // ascending. Convenience wrapper around for_each_term_sorted that keeps the
@@ -70,9 +95,29 @@ class SpimiTermBuffer {
   // per-doc lists), sorting by docid first if `t.sorted` is false.
   TermPostings to_postings(std::string term, Term&& t) const;
 
+  // Returns the sorted keys of the current in-memory data_ (lexicographic).
+  std::vector<const std::string*> sorted_keys() const;
+  // Streams the in-memory terms in sorted order, draining data_ (the legacy
+  // single-pass path; used both by the no-spill case and to emit the final run).
+  void drain_sorted(const std::function<void(TermPostings&&)>& fn);
+  // Spills the current buffer to a fresh sorted run file and clears memory.
+  Status spill_to_run();
+  // Writes all current terms (sorted) to an already-open RunWriter, draining.
+  Status drain_to_writer(class RunWriter* w);
+  // Approximate live byte cost a token adds for `term` (per the threshold model).
+  void account_token(const std::string& term, bool new_term, bool new_doc);
+  // Final k-way merge over the spilled runs (+ the residual flushed as a run).
+  void merge_runs(const std::function<void(TermPostings&&)>& fn);
+  // Deletes every temp run file; called from the destructor (RAII cleanup).
+  void cleanup_runs();
+
   bool has_positions_;
+  size_t spill_threshold_bytes_;  // 0 => unlimited (no spilling)
+  size_t live_bytes_ = 0;         // tracked live cost of data_ vs the threshold
   uint64_t total_tokens_ = 0;
   std::unordered_map<std::string, Term> data_;
+  std::vector<std::string> run_paths_;  // spilled run temp files (deleted in dtor)
+  Status spill_status_;                 // first spill error, surfaced at finalize
 };
 
 }  // namespace snii::writer

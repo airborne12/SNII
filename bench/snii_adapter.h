@@ -24,6 +24,11 @@ class SniiAdapter {
   SniiAdapter(const SniiAdapter&) = delete;
   SniiAdapter& operator=(const SniiAdapter&) = delete;
 
+  // Sets the SPIMI spill threshold in bytes (0 = unlimited / pure in-memory).
+  // When non-zero, the build bounds input RAM by spilling sorted runs to disk
+  // and k-way-merging them, so peak RSS stops scaling with total postings.
+  void set_spill_threshold_bytes(size_t bytes) { spill_threshold_bytes_ = bytes; }
+
   // Builds the index at a temporary path and opens it for reading. Throws
   // std::runtime_error on any failure (writer, reader, or open_index).
   void build_and_open(const Corpus& c);
@@ -42,6 +47,7 @@ class SniiAdapter {
 
  private:
   std::string path_;
+  size_t spill_threshold_bytes_ = 0;  // 0 = unlimited (in-memory build)
   std::unique_ptr<snii::io::LocalFileReader> local_;
   std::unique_ptr<snii::io::MeteredFileReader> metered_;
   std::unique_ptr<snii::reader::SniiSegmentReader> segment_;
