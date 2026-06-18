@@ -53,6 +53,28 @@ window:
 ### 1.5 收益
 filter（docid-only term）与**所有短语**的 .frq 字节 **−30~50%**（freq 区不过网）。直接命中「读取字节数」指标。
 
+### 1.6 精细化：posting 级 dd/freq 分组（实测后修订，取代 1.1 的每窗布局）
+
+**实测发现**（5M，bench 加 `request_bytes` 精确字节后）：1.1 的「每窗内」可分离布局让 posting 仍是 `[win0=dd0+fq0][win1=dd1+fq1]…` 交错，docid-only 必须按窗口逐个取 dd 前缀（gap=0 碎片化）。后果：
+- **精确字节大降**（短语 request_bytes 0.98MB vs CLucene 10.77MB，11×；高频 term 1.37 vs 2.82MB）——直连 S3 / 带宽场景大赢。
+- **但 1MB FileCache 下 remote_bytes 不降**（dd 与 freq 共享同一 1MB 块）；且 docid-only 的 read_at 暴增（高频 term 3→4532，虽批量进 3 轮、不增轮次，但违反设计「降 read_at」初衷）。
+
+**修订布局**——dd/freq 分离提到 **posting 级**，窗口编解码元数据上提到 prelude：
+```
+windowed .frq payload = [prelude][dd-block][freq-block]
+  dd-block   = dd_region_0 ++ dd_region_1 ++ … ++ dd_region_{N-1}   # 各窗 dd 区连续，各自 raw/zstd
+  freq-block = freq_region_0 ++ … ++ freq_region_{N-1}             # has_freq 时；各窗 freq 区连续
+prelude 每窗行携带完整定位/编解码元数据（窗口本身不再自描述）：
+  last_docid, win_base, doc_count, max_freq, max_norm,
+  dd_off(在 dd-block 内偏移), dd_disk_len, dd_uncomp_len, win_mode_dd, crc_dd,
+  freq_off(在 freq-block 内偏移), freq_disk_len, freq_uncomp_len, win_mode_freq, crc_freq
+frq_docs_len = prelude_len + dd_block_len   # docs-only 前缀 = [prelude][dd-block]，连续
+```
+读取：
+- **docid-only term / 短语**：读 `[frq_off, frq_off+prelude_len+dd_block_len)` —— **一段连续 dd 块**（读全部窗口 dd），按 prelude 的 (dd_off, dd_disk_len, win_mode_dd, crc_dd) 逐窗解码。read_at↓（少数连续范围）、range_gets↓、字节↓（dd 块 < 整 posting），**FileCache 下也省块**。短语跳读时仍可只取命中窗口的 dd 子段。
+- **scoring**：额外读 freq-block（连续），按 (freq_off, freq_disk_len) 解 freq。
+三个指标（read_at / range_gets / 字节）全赢，符合设计优先级（先降轮次与请求数，再降字节）。
+
 ## 2. #2 同-term 多窗口 coalesce_gap（降 Range GET 数）
 
 `BatchRangeFetcher` 已支持 `coalesce_gap`，但所有调用点用默认 0（仅严格相邻才合并）。同一 term 的多个选中窗口在 .frq POD 内近乎连续；取同一 term 多窗口时传入小 `coalesce_gap`（如 16KB），让近邻窗口并成一个物理 GET。以极小过读换更少 Range GET（设计更高优先级指标 line 86）。改动：term/phrase/scoring 多窗口 fetch 处构造 `BatchRangeFetcher(reader, kSameTermCoalesceGap)`。
