@@ -24,43 +24,44 @@
 - `frq_prelude` 列：有 `last_docid_delta(C)`、`frq_window_len(D，per-window doc 数)`、`prx_cum_off(E，per-window .prx 字节累积偏移)`、`max_freq/max_norm`、`win_crc32c`；**缺 `.frq` 的 per-window 字节偏移列**（仅 .prx 有 E）。
 - `phrase_query`：对每个 term 读整段 `[prelude][window]`（frq_len 字节）全解码再交集，不用 prelude 选窗口。
 
-## 4. 格式改动：frq_prelude v2
+## 4. 格式：frq_prelude（一次定型，含两级子块跳读）
 
-提升 `kFrqPreludeVersion` 1→2，**新增 `.frq` per-window 字节偏移列**（对称于 E 的 `prx_cum_off`），并定义可选 super-block 目录：
+> SNII 从零开始、无前向兼容负担：prelude 直接就是支持子块跳读的正确格式，不做版本迭代。
+> 现有的单窗口 prelude 实现直接替换为下面的两级（super-block → window）可跳读结构。
+
+prelude 含一个 **super-block 粗目录** + 每个 super-block 自包含的 **window 目录块**，使 reader 两级二分跳读、且无需读完整 prelude：
 
 ```
-prelude (v2):
+prelude:
   header:
-    u8   ver (=2)
-    u8   flags(bit0 has_freq, bit1 has_prx, bit2 has_sb)
-    VInt N            # .frq 窗口数
-    VInt M            # .prx 窗口数 (has_prx)
-    VInt G            # super-block 分组大小（窗口/super-block；has_sb 时存在）
-    VInt col_len[]
-    u32  crc32c
-  columns:
-    B   max_freq[N]            (varint32)   # 既有
-    B2  max_norm[N]            (u8)         # 既有
-    C   last_docid_delta[N]    (varint32)   # 既有：每窗口末 docid 的 delta（累积=绝对末 docid；前一窗口末 docid = 本窗口 win_base）
-    D   frq_doc_count[N]       (varint32)   # 既有 frq_window_len，语义=每窗口 doc 数（解码用）
-    Foff frq_cum_off[N+1]      (varint64)   # 新增：每窗口 .frq 字节累积偏移（相对 window_start=frq_off+prelude_len）；窗口 w 范围=[Foff[w],Foff[w+1])
-    E   prx_cum_off[M+1]       (varint64)   # 既有（扩为 N+1/M+1 含尾，使最后一窗口范围可定）
-    H   win_crc32c[N]          (fixed32)    # 既有
-    SB  super-block 目录        (has_sb)     # 新增（见下）
+    u8   flags(bit0 has_freq, bit1 has_prx)
+    VInt N             # .frq 窗口总数（windowed term；slim/inline 无 prelude）
+    VInt G             # 每 super-block 的窗口数（如 64）
+    VInt n_super       # = ceil(N / G)
+    VInt sbdir_len     # super-block 目录字节长（使 reader 可只读目录）
+    u32  crc32c        # 覆盖 header + super-block 目录（window 块各自带 win_crc）
+
+  super_block_dir[n_super]:        # 小而常驻：每 super-block 一行
+    VInt sb_last_docid_delta       # 该 super-block 末窗口末 docid 的 delta（累积=绝对）
+    VInt sb_block_off              # 该 super-block 的 window 目录块在 prelude 内的字节偏移
+    VInt sb_block_len
+
+  window_dir (n_super 个自包含块，每块 ≤G 个窗口的行)：
+    per window w (行式，自包含，便于按块独立读取)：
+      VInt last_docid_delta        # 本窗口末 docid 的 delta（块内累积=绝对；前一窗口末 docid=win_base）
+      VInt doc_count               # 窗口 doc 数（frq_pod 解码需要）
+      VInt frq_off                 # 本窗口 .frq payload 在 .frq region 内的字节偏移（相对 window_start=frq_off+prelude_len）
+      VInt frq_len
+      VInt prx_off                 # 本窗口 .prx payload 字节偏移（has_prx）
+      VInt prx_len
+      VInt max_freq                # 窗口内最大 tf（WAND block-max）
+      u8   max_norm                # 窗口内 score-max 对应 norm（WAND）
+      u32  win_crc32c
 ```
 
-**Super-block 目录（SB，可选，超大 term）**：当 N 超过 `kSuperBlockThreshold`（如 1024 窗口）时，按每 G 窗口分组（如 G=64），记录每个 super-block 的粗信息，使 reader 不必读完整 prelude：
+**为何行式而非纯列式**：源规格提"列式 prelude"，但子块跳读要求按窗口/super-block 独立定位字节，行式 + super-block 分块更直接（reader 只读目录 + 命中块 + 命中窗口）。WAND 的 `max_freq` 仍可按行扫描，能力等价。
 
-```
-SB:
-  VInt n_super   # = ceil(N / G)
-  per super-block s:
-    VInt last_docid_delta_s   # super-block s 末 docid 的 delta（累积=绝对）
-    VInt frq_off_s            # super-block s 首窗口的 .frq 字节偏移（= Foff[s*G]）
-    VInt prx_off_s            # 同 .prx
-```
-
-兼容：v2 prelude 与 v1 不互通；windowed term 格式变化 → 需重建索引（v1 库可接受）。slim/inline term 不受影响。
+`N ≤ G` 时只有 1 个 super-block（小 term 退化为单块，读全 prelude，无额外开销）。DictEntry `flags.enc=windowed`，`has_sb` 恒置位（prelude 即两级目录），`prelude_len` 覆盖整个 prelude。
 
 ## 5. 写入改动：多窗口 + prelude/SB（logical_index_writer）
 
@@ -75,18 +76,22 @@ windowed term（df ≥ kSlimDfThreshold=512）的 posting 按 `kFrqBaseUnit`(256
 
 ## 6. 读取改动
 
-### 6.1 frq_prelude reader
-新增访问器：`frq_window_offset(w)`/`frq_window_len_bytes(w)`（从 Foff）、`prx_window_offset(w)`/`len`（从 E）、`win_base(w)`（C 累积）、`doc_count(w)`（D）、`super_block(s)`（SB）。
+### 6.1 frq_prelude reader（两级）
+- `open(prelude_slice)`：解析 header + super-block 目录（小、常驻），校验 crc；window 行块按需解析。
+- `locate_super_block(docid)`：在 super_block_dir 的 `sb_last_docid` 上二分 → super-block 序号 + 其 window 块的字节范围。
+- `WindowMeta window(w)`：返回 last_docid / win_base（前窗末 docid）/ doc_count / frq_off / frq_len / prx_off / prx_len / max_freq / max_norm。
+- `locate_window(docid)`：两级——先 super-block 二分，再块内 window 二分 → 覆盖该 docid 的窗口序号。
+- n_super 小且常驻时可一次解析全部窗口；超大 term 仅按需解析命中 super-block 的 window 块。
 
-### 6.2 phrase_query（核心改动：窗口跳读）
-现状「读全段 → 全解码 → 交集」改为「读 prelude → 候选驱动选窗口 → 批量取命中窗口 → 交集」：
+### 6.2 phrase_query（核心改动：两级跳读）
+现状「读全段 → 全解码 → 交集」改为「读 prelude → 候选驱动两级定位窗口 → 批量取命中窗口 → 交集」：
 1. lookup 各 term → DictEntry + frq_base/prx_base。inline/slim term 照旧（小，直接解码）。
-2. 对每个 windowed term，第 1 轮批量读其 **prelude**（小；若 has_sb 且 prelude 大，先读 SB+相关 prelude 切片）。解析窗口目录（C/D/Foff/E）。
+2. 第 1 轮：批量读各 windowed term 的 **prelude header + super-block 目录**（小）。
 3. 选 **lead term = df 最小者**；读其全部窗口（小）得候选 docid 序列。
-4. 对其余 term：对候选 docid 在其 prelude `last_docid` 列二分，定位覆盖窗口集合（去重）。第 2 轮 `BatchRangeFetcher` 批量并发取这些窗口的 `.frq`(+`.prx`) 子 range。
+4. 对其余 term：对每个候选 docid 两级定位（super-block 二分 → window 二分）得覆盖窗口集合（去重）；按需读取命中 super-block 的 window 块以拿到这些窗口的 `frq_off/len`、`prx_off/len`。第 2 轮 `BatchRangeFetcher` 批量并发取这些窗口的 `.frq`(+`.prx`) 子 range。
 5. 解码命中窗口，取候选 doc 的 freq/positions，做位置邻接交集（沿用现有 `PhraseInDoc`）。
 
-效果：高频词只读「覆盖候选 doc 的窗口」而非整段 → 字节数从 O(df) 降到 O(候选数×窗口大小)。轮次 ≈ 2（preludes 批量 + 选中窗口批量），保持低轮次。
+效果：超高频词只读「覆盖候选 doc 的窗口」而非整段 → 字节数从 O(df) 降到 O(候选数×窗口大小)；super-block 目录使连完整 prelude 都不必读。轮次 ≈ 2–3（目录 + 命中 window 块 + 命中窗口，各批量），保持低轮次。
 
 ### 6.3 term_query（不变）
 纯 term 枚举需全部 docid → 仍读全部窗口（批量并发，字节与现状相同）。多窗口不劣化（现 5M term SNII 已快 5.1×）。
@@ -104,9 +109,9 @@ windowed term（df ≥ kSlimDfThreshold=512）的 posting 按 `kFrqBaseUnit`(256
 
 ## 8. 实现分期（每期闭环、TDD、对抗审查）
 
-1. **格式**：frq_prelude v2（加 `frq_cum_off` 列 + 访问器 + SB 结构 + 测试）。
-2. **写入**：logical_index_writer 多窗口 + prelude/SB 构建（read-back 自校验：用 prelude 定位每窗口并解码一致）。
-3. **读取**：phrase_query 窗口跳读（差分测试 vs 全读/oracle，含多窗口高频词短语）。
-4. **验证**：全量测试 + 5M `--oss` 重测短语，更新基准报告。
+1. **格式**：frq_prelude 重写为两级（super-block 目录 + window 行块）可跳读结构（替换现单窗口实现）+ 访问器（`super_block(s)`、`window(w)`：last_docid/win_base/doc_count/frq_off/frq_len/prx_off/prx_len/max_freq/max_norm）+ round-trip/损坏/越界测试。
+2. **写入**：logical_index_writer 多窗口（256-doc unit）+ super-block 分组 + prelude 构建（read-back 自校验：用 prelude 定位每窗口并解码一致）。
+3. **读取**：phrase_query 两级跳读（super-block 二分 → window 二分 → 批量取命中窗口）；差分测试 vs 全读参考/oracle，含多窗口超高频词短语。BM25 WAND 现按真实多窗口剪枝。
+4. **验证**：全量测试全绿 + 5M `--oss` 重测短语（预期反超 CLucene），更新基准报告。
 
-（super-block SB 目录可作为第 1/3 期内的子项；若 prelude 单读已足够小，可先实现 per-window 跳读，再补 SB 粗目录避免读全 prelude。）
+一次实现完整的两级跳读（super-block + window），不分步骤交付半成品。
