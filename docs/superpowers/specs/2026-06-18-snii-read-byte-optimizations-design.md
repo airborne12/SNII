@@ -1,6 +1,6 @@
 # SNII 读取字节数优化设计（#1–#5）
 
-- 状态：设计待评审（实现前）
+- 状态：已实现并实测（commits 至 49，238 core 测试全绿）
 - 日期：2026-06-18
 - 关联：扩展 [`2026-06-18-snii-subblock-skipping-design.md`](2026-06-18-snii-subblock-skipping-design.md)；源规格 [`../../design/SNII-design-spec.source.md`](../../design/SNII-design-spec.source.md) §倒排表设计 / §Scoring
 - 依据：设计覆盖审计（111 设计点，~92% 已实现）找出的剩余「读取字节数」优化项
@@ -8,72 +8,47 @@
 
 ## 0. 背景
 
-设计文档三大评估指标之一是**读取字节数**（line 47-56）。审计发现：核心已实现，但仍有 5 项已设计/可做的字节与请求优化未落地。本设计覆盖全部 5 项。优先级遵循源规格 line 86：**先降串行轮次与远端请求数，其次才是字节数**——故 #2（降 GET 数）与 #1（降字节）并重。
+设计文档三大评估指标之一是**读取字节数**（line 47-56）。审计发现核心已实现，但 `dd_part_len`（源规格 line 496/501：bitmap/docid-only 跳过 freq）等省字节设计当时只在内存 CPU 跳过、未在网络上跳过：docid-only term 与所有短语仍把每窗 freq_part（占 30-60% 字节）整段拉下来再丢弃。本设计覆盖 #1–#5。优先级遵循源规格 line 86：**先降串行轮次与远端请求数，其次才是字节数**。
 
-当前 frq 窗口落盘布局（`frq_pod.h`）：
-```
-window: u8 win_mode(0=raw/1=zstd); VInt uncomp_len; [VInt comp_len if zstd];
-        VInt dd_part_len; u32 crc; payload(raw 或 zstd 整体压缩) = dd_part ++ freq_part
-  dd_part = VInt n ++ PFOR_runs(doc_delta);  freq_part = PFOR_runs(freq)
-```
-问题：zstd 窗口把 `dd_part ++ freq_part` **整体压成一个 blob**，无法只取 dd 前缀解压；且 `dd_part_len` 藏在 header 内（取回整窗后才知道）。故 docid-only / 短语查询当前把每窗 freq_part（占 30-60% 字节）整段拉下来再内存丢弃。
+**为什么 freq-skip 必须做到 posting 级**（关键设计约束）：要让 docid-only 不取 freq，dd 数据必须能独立 fetch+decode。仅在「每窗内」分离 dd/freq（`[win0=dd0+fq0][win1=dd1+fq1]…`）不够——posting 里 dd 与 freq 仍交错，docid-only 必须逐窗取 dd 前缀，导致两个问题：① **read_at 碎片化**（高频 term 一窗一读 → 数千次逻辑读，虽批量进同样轮次，但违反设计「降 read_at」初衷）；② **1MB FileCache 下不省字节**（dd 与 freq 共享同一 1MB 块，块对齐后跳 freq 等于没跳）。因此 dd/freq 必须分离到 **posting 级**，使 docid-only 读**一段连续 dd 块**——三个指标（read_at / range_gets / 字节）同时降，FileCache 与直连 S3 下都省。
 
-## 1. #1 dd_part_len 网络级 freq-skip（最大字节优化）
+## 1. #1 freq-skip：posting 级 dd/freq 分组（最大字节优化）
 
-### 1.1 格式：窗口 dd/freq 区独立编码
-窗口 payload 改为 **两个独立编码区**，各自 raw/zstd（按区大小自适应），header 记录 dd 区落盘长度，使 `[header + dd_region]` 成为可独立 fetch+decode 的前缀：
-```
-window:
-  u8   win_mode_dd     # dd 区编码：0=raw / 1=zstd
-  u8   win_mode_freq   # freq 区编码（has_freq 时）
-  VInt dd_uncomp_len   # dd 区解压字节
-  VInt dd_disk_len     # dd 区落盘字节（=raw 时==uncomp）
-  VInt freq_uncomp_len # has_freq 时
-  VInt freq_disk_len   # has_freq 时
-  u32  crc_dd          # 覆盖 header + dd 区落盘字节（使 docs-only 取回即可独立校验）
-  bytes dd_region      # raw 或 zstd(dd_part)
-  [u32  crc_freq        # 覆盖 freq 区落盘字节]
-  [bytes freq_region]   # raw 或 zstd(freq_part)
-```
-`frq_docs_len` = `[header + crc_dd + dd_region]` 的总落盘字节（docid-only 前缀长度）。整窗 `frq_len` 不变（含 freq 区）。
-
-### 1.2 prelude / DictEntry 暴露 docs 前缀长度
-- frq_prelude window 行新增 `frq_docs_len`（每窗 docs-only 前缀落盘字节）。
-- slim DictEntry 新增 `frq_docs_len`（单窗 slim 的 docs-only 前缀）。inline 形态字节已内嵌、不走网络、无需改。
-
-### 1.3 写入
-`build_frq_window` 分别编码 dd 区、freq 区（各自 `should_compress`），写两段 header 列 + 两段 crc + 两区；返回/记录 `frq_docs_len`。writer 把每窗 `frq_docs_len` 填入 prelude 行 / slim DictEntry。
-
-### 1.4 读取（按需取 freq）
-- `term_query`（**docid-only**）：每窗只 fetch `[frq_off, frq_off+frq_docs_len)`，用 `read_frq_window_docs` 解 dd 区。**不取 freq 区**。
-- `phrase_query`：.frq 每窗只 fetch `frq_docs_len`（短语只需 docid+positions，不需 freq）；.prx 照常全取。
-- `scoring_query`：fetch 整窗 `frq_len`（需要 freq 打分）——不变。
-- 新增解码入口：`read_frq_window_docs` 从 `[header+dd_region]` 解 docids（freq 区缺失时正确处理）；保留 `read_frq_window`（docs+freq）供 scoring。
-
-### 1.5 收益
-filter（docid-only term）与**所有短语**的 .frq 字节 **−30~50%**（freq 区不过网）。直接命中「读取字节数」指标。
-
-### 1.6 精细化：posting 级 dd/freq 分组（实测后修订，取代 1.1 的每窗布局）
-
-**实测发现**（5M，bench 加 `request_bytes` 精确字节后）：1.1 的「每窗内」可分离布局让 posting 仍是 `[win0=dd0+fq0][win1=dd1+fq1]…` 交错，docid-only 必须按窗口逐个取 dd 前缀（gap=0 碎片化）。后果：
-- **精确字节大降**（短语 request_bytes 0.98MB vs CLucene 10.77MB，11×；高频 term 1.37 vs 2.82MB）——直连 S3 / 带宽场景大赢。
-- **但 1MB FileCache 下 remote_bytes 不降**（dd 与 freq 共享同一 1MB 块）；且 docid-only 的 read_at 暴增（高频 term 3→4532，虽批量进 3 轮、不增轮次，但违反设计「降 read_at」初衷）。
-
-**修订布局**——dd/freq 分离提到 **posting 级**，窗口编解码元数据上提到 prelude：
+### 1.1 格式：`[prelude][dd-block][freq-block]`
+windowed term 的 `.frq` payload 把所有窗口的 dd 区连续排在前、freq 区连续排在后；窗口本身不再自描述，编解码元数据全部上提到 prelude：
 ```
 windowed .frq payload = [prelude][dd-block][freq-block]
   dd-block   = dd_region_0 ++ dd_region_1 ++ … ++ dd_region_{N-1}   # 各窗 dd 区连续，各自 raw/zstd
   freq-block = freq_region_0 ++ … ++ freq_region_{N-1}             # has_freq 时；各窗 freq 区连续
-prelude 每窗行携带完整定位/编解码元数据（窗口本身不再自描述）：
-  last_docid, win_base, doc_count, max_freq, max_norm,
-  dd_off(在 dd-block 内偏移), dd_disk_len, dd_uncomp_len, win_mode_dd, crc_dd,
-  freq_off(在 freq-block 内偏移), freq_disk_len, freq_uncomp_len, win_mode_freq, crc_freq
-frq_docs_len = prelude_len + dd_block_len   # docs-only 前缀 = [prelude][dd-block]，连续
+  dd_region  = raw 或 zstd( VInt n ++ PFOR_runs(doc_delta) )        # 按区大小自适应 raw/zstd
+  freq_region= raw 或 zstd( PFOR_runs(freq) )
 ```
-读取：
-- **docid-only term / 短语**：读 `[frq_off, frq_off+prelude_len+dd_block_len)` —— **一段连续 dd 块**（读全部窗口 dd），按 prelude 的 (dd_off, dd_disk_len, win_mode_dd, crc_dd) 逐窗解码。read_at↓（少数连续范围）、range_gets↓、字节↓（dd 块 < 整 posting），**FileCache 下也省块**。短语跳读时仍可只取命中窗口的 dd 子段。
-- **scoring**：额外读 freq-block（连续），按 (freq_off, freq_disk_len) 解 freq。
-三个指标（read_at / range_gets / 字节）全赢，符合设计优先级（先降轮次与请求数，再降字节）。
+dd/freq 各区独立编码（各自 raw/zstd），各带 crc，可单独取回校验。`frq_docs_len = prelude_len + dd_block_len`（docs-only 前缀 = `[prelude][dd-block]`，连续可一段读取）。
+
+### 1.2 prelude 携带每窗完整定位/编解码元数据
+frq_prelude 每窗行（在两级 super-block/window 目录之上）携带：
+```
+last_docid, win_base, doc_count, max_freq, max_norm,
+dd_off(在 dd-block 内偏移), dd_disk_len, dd_uncomp_len, win_mode_dd, crc_dd,
+freq_off(在 freq-block 内偏移), freq_disk_len, freq_uncomp_len, win_mode_freq, crc_freq
+```
+prelude reader 暴露 `dd_block_len()` / `freq_block_len()`，并校验各 dd 区在 dd-block 内连续平铺、各 freq 区在 freq-block 内连续平铺（拒绝缝隙/越界/长度不一致）。slim DictEntry 的单窗 `[dd_region][freq_region]` 同样记 dd/freq region 元数据，`frq_docs_len = dd 区落盘长度`；inline 字节已内嵌、不走网络、无需改。
+
+### 1.3 写入
+`build_dd_region` / `build_freq_region` 分别编码每窗 dd、freq 区（各自 `should_compress`）。`BuildWindowedPosting` 把所有 dd 区拼成 dd-block、所有 freq 区拼成 freq-block，逐窗填 prelude 行（offset/len/mode/crc）；`build_windowed_entry` 落盘 `[prelude][dd-block][freq-block]`，置 `frq_docs_len = prelude_len + dd_block_len`。
+
+### 1.4 读取（按需取 freq）
+- `term_query`（**docid-only**）：读 `[frq_off, frq_off+prelude_len+dd_block_len)` —— **一段连续 dd 块**，按 prelude 的 (dd_off, dd_disk_len, win_mode_dd, crc_dd) 逐窗解码。**不取 freq-block**。
+- `phrase_query`：读 dd-block（docid）+ `.prx`（positions），跳 freq-block（短语不需 freq）；子块跳读时只取命中窗口的 dd 子段（coalesce 合并）。
+- `scoring_query`：额外读连续 freq-block，按 (freq_off, freq_disk_len, crc_freq) 解 freq；选择性 WAND（#5）只取存活窗口的 dd+freq 子段。
+- 解码入口：`decode_dd_region`（从 dd 区切片解 docids）/ `decode_freq_region`（从 freq 区切片解 freqs）。
+
+### 1.5 收益（已实测）
+docid-only term 与所有短语读**一段连续 dd 块**，跳过整个 freq-block：
+- read_at 不再碎片化（高频 term 连续读，read_at 小）；range_gets 降；
+- 字节降且 **FileCache 下也省块**（freq-block 的块完全不触及）。
+
+5M 实测（CLucene→SNII，`ALL DOCIDS MATCH`）：TERM high-df read_at 43→3、remote_bytes 4.2→3.1MB、request_bytes 2.82→1.37MB(2×)；PHRASE request_bytes 10.77→0.96MB(**11×**)。真实 OSS（`--oss --repeat`）：TERM high-df 中位 50ms vs CLucene 427ms(8.5×)、PHRASE 107ms vs 667ms(6.2×)。
 
 ## 2. #2 同-term 多窗口 coalesce_gap（降 Range GET 数）
 
@@ -91,12 +66,12 @@ frq_docs_len = prelude_len + dd_block_len   # docs-only 前缀 = [prelude][dd-bl
 
 现 `BuildWindowedCursor`（scoring）经 `read_windowed_posting` 读**全部窗口**，WAND 只跳「打分」不跳「读取」。改为两遍：① 只读各 windowed term 的 prelude（block-max 列）；② 用 block-max 上界 + 运行中 top-K 阈值 θ，仅 batch-fetch `max_score ≥ θ` 可能进 top-K 的窗口（复用 phrase 的 `windowed_window_range`/`decode_window_slices`）。top-K 读 O(存活窗口) 而非 O(df)。依赖 #3 真实 max_norm 才有效。
 
-## 6. 实现分期（每期 TDD + 对抗审查 + bench 实测字节）
+## 6. 实现分期（每期 TDD + 对抗审查 + bench 实测字节，均已落地）
 
-- **Phase A（格式 + 写入）**：#1 窗口 dd/freq 独立编码 + prelude `frq_docs_len` 列 + slim `frq_docs_len` + #3 真实 max_norm + #4 自适应窗口。read-back 自校验：docs-only 前缀可独立解出 docids 且与全窗一致；max_norm 非 0 且为窗内最紧。全量测试绿。
-- **Phase B（读端字节跳过）**：#1 reader（term docid-only + phrase 只取 docs 前缀）+ #2 coalesce_gap。差分测试：term/phrase docid 与全读/oracle 一致；**断言 remote_bytes 显著下降**（短语 .frq 字节较跳读前再降）。
-- **Phase C（选择性 scoring）**：#5。差分测试：scoring top-K 与全读 exhaustive 完全一致（含并列）；断言只读存活窗口（range_gets/bytes < 全窗）。
-- **验证**：全量测试 + `snii_bench` 成本模型轨重测，确认 PHRASE / TERM 的 remote_bytes 下降、docids 仍三方匹配；OSS 轨可选实测。
+- **格式 + 写入**：区级 frq_pod（`build_dd_region`/`build_freq_region`/`decode_dd_region`/`decode_freq_region`）+ prelude 每窗携带 dd/freq region 元数据 + slim DictEntry region 元数据；posting 落盘 `[prelude][dd-block][freq-block]`；#3 真实 max_norm + #4 自适应窗口（1024-doc，df≥8192）。read-back 自校验：docs-only 连续 dd 块独立解出 docids 且与全窗一致。
+- **读端字节跳过**：term docid-only + phrase 读连续 dd 块、跳 freq-block + #2 同-term coalesce_gap。差分测试：term/phrase docid 与全读/oracle 一致；断言 read_at / range_gets / request_bytes 三降。
+- **选择性 scoring（#5）**：`scoring_query_wand_selective` 仅取 block-max 可入 top-K 的窗口。差分测试：top-K 与 exhaustive/eager 完全一致（含并列、k=1），且小-k 高频读更少窗口/字节。
+- **验证**：238 测试全绿；成本模型轨 100K/1M/5M + 真实 OSS `--oss --repeat` 实测（见 `../../benchmark-results.md`）；bench 增 `request_bytes`（精确字节）区分 FileCache 块对齐。
 
 ## 7. 正确性不变量
 
