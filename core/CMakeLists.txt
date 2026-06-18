@@ -35,6 +35,16 @@ find_path(XXHASH_INCLUDE_DIR xxhash.h PATHS ${_dt_installed_candidates}
   PATH_SUFFIXES include NO_DEFAULT_PATH REQUIRED)
 target_include_directories(snii PUBLIC ${XXHASH_INCLUDE_DIR})
 
+# S3 / OSS backend (optional). When OFF, s3_object_store.cpp is still picked up by
+# the GLOB above but compiles to an empty TU (its body is #ifdef SNII_WITH_S3),
+# so core links NO aws and stays aws-free by default. When ON, link aws-sdk-cpp
+# and define the macro PUBLIC so the header body and tests are enabled too.
+if(SNII_WITH_S3)
+  find_package(AwsSdk REQUIRED)
+  target_compile_definitions(snii PUBLIC SNII_WITH_S3)
+  target_link_libraries(snii PUBLIC snii_aws)
+endif()
+
 if(SNII_BUILD_TESTS)
   enable_testing()
   add_subdirectory(tests)

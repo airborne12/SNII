@@ -31,7 +31,10 @@ Status LocalFileReader::open(const std::string& path) {
 
 Status LocalFileReader::read_at(uint64_t offset, size_t len, std::vector<uint8_t>* out) {
   if (fd_ < 0) return Status::IoError("read_at on unopened file");
-  if (offset + len > size_) return Status::Corruption("read_at past end of file");
+  // Non-wrapping bounds check (offset+len could overflow uint64 on a corrupt arg).
+  if (offset > size_ || len > size_ - offset) {
+    return Status::Corruption("read_at past end of file");
+  }
   out->resize(len);
   size_t done = 0;
   while (done < len) {
