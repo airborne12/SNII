@@ -67,11 +67,12 @@ struct TermPostings {
   std::vector<std::vector<uint32_t>> positions;  // positions[i] for docids[i]
 };
 
-// Decodes a full slim/inline posting (single window, win_base=0) from slices.
-Status DecodeFullPosting(Slice frq_window, Slice prx_window, TermPostings* out) {
-  ByteSource fsrc(frq_window);
-  SNII_RETURN_IF_ERROR(
-      snii::format::read_frq_window_docs(&fsrc, /*win_base=*/0, &out->docids));
+// Decodes a full slim/inline posting (single dd region, win_base=0) from slices.
+// dd_region is the entry's dd region on-disk bytes; entry.dd_meta drives decode.
+Status DecodeFullPosting(const DictEntry& entry, Slice dd_region, Slice prx_window,
+                         TermPostings* out) {
+  SNII_RETURN_IF_ERROR(snii::format::decode_dd_region(dd_region, entry.dd_meta,
+                                                      /*win_base=*/0, &out->docids));
   ByteSource psrc(prx_window);
   SNII_RETURN_IF_ERROR(snii::format::read_prx_window(&psrc, &out->positions));
   if (out->positions.size() != out->docids.size()) {
@@ -117,14 +118,23 @@ bool PhraseInDoc(const std::vector<const TermPostings*>& posts, uint32_t docid) 
   return false;
 }
 
-// Resolves the docs-only .frq fetch length for a slim pod_ref window: the
-// recorded docs-only prefix (frq_docs_len) when present and valid, else the full
-// window (defensive fallback). Validates frq_docs_len <= win_len (anti-DoS).
+// Resolves the dd-region (docs-only) fetch length for a slim pod_ref: frq_docs_len
+// (the dd region on-disk length) when valid, else the full window (defensive
+// fallback). Validates frq_docs_len <= win_len (anti-DoS).
 Status SlimFrqDocsLen(const DictEntry& entry, uint64_t win_len, uint64_t* out) {
   if (entry.frq_docs_len > win_len) {
     return Status::Corruption("phrase_query: slim frq_docs_len exceeds frq window");
   }
   *out = entry.frq_docs_len > 0 ? entry.frq_docs_len : win_len;
+  return Status::OK();
+}
+
+// Returns the inline entry's dd region slice ([0, dd_meta.disk_len)).
+Status InlineDdRegion(const DictEntry& entry, Slice* out) {
+  if (entry.dd_meta.disk_len > entry.frq_bytes.size()) {
+    return Status::Corruption("phrase_query: inline dd region exceeds frq bytes");
+  }
+  *out = Slice(entry.frq_bytes.data(), static_cast<size_t>(entry.dd_meta.disk_len));
   return Status::OK();
 }
 
@@ -188,9 +198,12 @@ Status OpenPreludes(const snii::io::BatchRangeFetcher& fetcher,
 Status MaterializeFlat(const snii::io::BatchRangeFetcher& fetcher, const TermPlan& p,
                        TermPostings* out) {
   if (p.pod_ref) {
-    return DecodeFullPosting(fetcher.get(p.frq_handle), fetcher.get(p.prx_handle), out);
+    return DecodeFullPosting(p.entry, fetcher.get(p.frq_handle),
+                             fetcher.get(p.prx_handle), out);
   }
-  return DecodeFullPosting(Slice(p.entry.frq_bytes), Slice(p.entry.prx_bytes), out);
+  Slice dd_region;
+  SNII_RETURN_IF_ERROR(InlineDdRegion(p.entry, &dd_region));
+  return DecodeFullPosting(p.entry, dd_region, Slice(p.entry.prx_bytes), out);
 }
 
 // Fully materializes a windowed term (driver path): decode every window. Phrase
@@ -246,24 +259,26 @@ Status SelectCoveringWindows(const FrqPreludeReader& prelude,
 Status MaterializeWindowedSkipped(const LogicalIndexReader& idx, const TermPlan& p,
                                   const std::vector<uint32_t>& windows,
                                   TermPostings* out) {
-  // Same-term multi-window batch: coalesce near-contiguous windows into fewer GETs.
+  // Same-term multi-window batch: coalesce near-contiguous dd sub-ranges (and prx)
+  // into fewer GETs. The dd regions live contiguously in the dd-block, so selected
+  // windows' dd sub-ranges merge well under the coalesce gap.
   snii::io::BatchRangeFetcher fetcher(idx.reader(),
                                       snii::reader::kSameTermCoalesceGap);
-  std::vector<std::pair<size_t, size_t>> handles;  // (frq_handle, prx_handle)
+  std::vector<std::pair<size_t, size_t>> handles;  // (dd_handle, prx_handle)
   std::vector<WindowMeta> metas;
   handles.reserve(windows.size());
   metas.reserve(windows.size());
   for (uint32_t w : windows) {
     snii::reader::WindowAbsRange r;
-    // Phrase needs positions, not freqs: fetch only the docs-only .frq prefix.
+    // Phrase needs positions, not freqs: fetch only the dd sub-range + .prx window.
     SNII_RETURN_IF_ERROR(snii::reader::windowed_window_range(
         idx, p.entry, p.frq_base, p.prx_base, p.prelude, w,
         /*want_positions=*/true, /*want_freq=*/false, &r));
     WindowMeta m;
     SNII_RETURN_IF_ERROR(p.prelude.window(w, &m));
-    const size_t fh = fetcher.add(r.frq_off, static_cast<size_t>(r.frq_len));
+    const size_t dh = fetcher.add(r.dd_off, static_cast<size_t>(r.dd_len));
     const size_t ph = fetcher.add(r.prx_off, static_cast<size_t>(r.prx_len));
-    handles.emplace_back(fh, ph);
+    handles.emplace_back(dh, ph);
     metas.push_back(m);
   }
   if (fetcher.pending() > 0) SNII_RETURN_IF_ERROR(fetcher.fetch());
@@ -272,8 +287,9 @@ Status MaterializeWindowedSkipped(const LogicalIndexReader& idx, const TermPlan&
     std::vector<uint32_t> docids, freqs;
     std::vector<std::vector<uint32_t>> pos;
     SNII_RETURN_IF_ERROR(snii::reader::decode_window_slices(
-        metas[k], fetcher.get(handles[k].first), fetcher.get(handles[k].second),
-        /*want_positions=*/true, /*want_freq=*/false, &docids, &freqs, &pos));
+        metas[k], fetcher.get(handles[k].first), Slice(),
+        fetcher.get(handles[k].second), /*want_positions=*/true,
+        /*want_freq=*/false, &docids, &freqs, &pos));
     for (size_t i = 0; i < docids.size(); ++i) {
       out->docids.push_back(docids[i]);
       out->positions.push_back(std::move(pos[i]));

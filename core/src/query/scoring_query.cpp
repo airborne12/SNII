@@ -139,15 +139,25 @@ Status ScoreDecoded(const snii::stats::SniiStatsProvider& stats,
   return Status::OK();
 }
 
-// Decodes a slim/inline term's single .frq window into docids/freqs.
+// Decodes a slim/inline term's single .frq window ([dd_region][freq_region]) into
+// docids/freqs using the entry's region metadata.
 Status DecodeSlim(const LogicalIndexReader& idx, const DictEntry& entry,
                   uint64_t frq_base, std::vector<uint32_t>* docids,
                   std::vector<uint32_t>* freqs) {
   std::vector<uint8_t> owned;
   Slice window;
   SNII_RETURN_IF_ERROR(FetchSlimWindowBytes(idx, entry, frq_base, &owned, &window));
-  ByteSource src(window);
-  return snii::format::read_frq_window(&src, /*win_base=*/0, docids, freqs);
+  const uint64_t dd_len = entry.dd_meta.disk_len;
+  if (dd_len > window.size()) {
+    return Status::Corruption("scoring_query: slim dd region exceeds window");
+  }
+  Slice dd_region = window.subslice(0, static_cast<size_t>(dd_len));
+  SNII_RETURN_IF_ERROR(snii::format::decode_dd_region(dd_region, entry.dd_meta,
+                                                      /*win_base=*/0, docids));
+  Slice freq_region = window.subslice(static_cast<size_t>(dd_len),
+                                      window.size() - static_cast<size_t>(dd_len));
+  return snii::format::decode_freq_region(freq_region, entry.freq_meta, docids->size(),
+                                          freqs);
 }
 
 // Builds the cursor for a windowed term: tiles all windows for exact scores and
@@ -365,14 +375,17 @@ Status MaterializeWindow(LazyTermCursor* c, uint32_t w) {
   SNII_RETURN_IF_ERROR(snii::reader::windowed_window_range(
       *c->idx, c->entry, c->frq_base, c->prx_base, c->prelude, w,
       /*want_positions=*/false, /*want_freq=*/true, &r));
-  snii::io::BatchRangeFetcher fetcher(c->idx->reader());
-  const size_t h = fetcher.add(r.frq_off, static_cast<size_t>(r.frq_len));
+  // Scoring needs docids + freqs: fetch the window's dd sub-range AND freq sub-range.
+  snii::io::BatchRangeFetcher fetcher(c->idx->reader(),
+                                      snii::reader::kSameTermCoalesceGap);
+  const size_t dh = fetcher.add(r.dd_off, static_cast<size_t>(r.dd_len));
+  const size_t fh = fetcher.add(r.freq_off, static_cast<size_t>(r.freq_len));
   SNII_RETURN_IF_ERROR(fetcher.fetch());
   std::vector<uint32_t> docids;
   std::vector<uint32_t> freqs;
   std::vector<std::vector<uint32_t>> pos;
   SNII_RETURN_IF_ERROR(snii::reader::decode_window_slices(
-      meta, fetcher.get(h), Slice(), /*want_positions=*/false,
+      meta, fetcher.get(dh), fetcher.get(fh), Slice(), /*want_positions=*/false,
       /*want_freq=*/true, &docids, &freqs, &pos));
   if (docids.size() != c->win_start[w + 1] - c->win_start[w]) {
     return Status::Corruption("scoring_query: selective window doc-count drift");

@@ -9,6 +9,7 @@
 #include "snii/encoding/byte_sink.h"
 #include "snii/encoding/byte_source.h"
 #include "snii/format/format_constants.h"
+#include "snii/format/frq_pod.h"
 
 // DictEntry —— on-disk encoding/decoding of a dict entry.
 //
@@ -24,13 +25,21 @@
 //   max_freq    varint   # only when tier>=T2
 //   locator:
 //     pod_ref: frq_off_delta varint, frq_len varint,
-//              [prelude_len varint when enc=windowed],
-//              [frq_docs_len varint when enc=slim] # docs-only prefix of the
-//                  single slim window; lets a docid-only reader fetch only
-//                  [frq_off, frq_off+frq_docs_len). Windowed entries carry the
-//                  per-window frq_docs_len in the prelude instead.
+//              [prelude_len varint when enc=windowed] # windowed entries carry the
+//                  per-window region metadata in the prelude instead.
+//              [slim region meta when enc=slim]:
+//                  frq_docs_len varint  # == dd region on-disk length; the
+//                      docs-only prefix [frq_off, frq_off+frq_docs_len) (the single
+//                      dd region) a docid-only reader fetches without the freq region.
+//                  win_mode u8 (bit0 dd_zstd, bit1 freq_zstd)
+//                  dd_uncomp_len varint, crc_dd u32
+//                  [freq_uncomp_len varint, crc_freq u32 when tier>=T2]
+//                  # The single slim window is [dd_region][freq_region]; dd_disk_len
+//                  # = frq_docs_len, freq_disk_len = frq_len - frq_docs_len.
 //              [prx_off_delta varint, prx_len varint when tier>=T2]
-//     inline:  frq_len varint, frq_bytes u8[],
+//     inline:  frq_len varint, frq_bytes u8[],   # frq_bytes = [dd_region][freq_region]
+//              slim region meta (as above, sans frq_docs_len which == dd disk len
+//                  carried as inline_dd_disk_len varint),
 //              [prx_len varint, prx_bytes u8[] when tier>=T2]
 //   --- entry body ends ---
 //
@@ -59,12 +68,20 @@ struct DictEntry {
   uint64_t frq_off_delta = 0;
   uint64_t frq_len = 0;
   uint64_t prelude_len = 0;     // only when enc=windowed
-  uint64_t frq_docs_len = 0;    // only when enc=slim pod_ref: docs-only prefix length
+  uint64_t frq_docs_len = 0;    // only when enc=slim pod_ref: dd region on-disk length
   uint64_t prx_off_delta = 0;   // only when tier>=T2
   uint64_t prx_len = 0;       // only when tier>=T2
 
+  // slim/inline single-window region codecs. The window is [dd_region][freq_region]
+  // (no self-describing header). dd_meta drives the docs-only decode; freq_meta the
+  // scoring decode (only when tier>=T2). For slim pod_ref dd_meta.disk_len ==
+  // frq_docs_len; for inline it is stored as inline_dd_disk_len.
+  FrqRegionMeta dd_meta;
+  FrqRegionMeta freq_meta;       // only when tier>=T2
+  uint64_t inline_dd_disk_len = 0;  // only for inline: dd region on-disk length
+
   // inline payload.
-  std::vector<uint8_t> frq_bytes;
+  std::vector<uint8_t> frq_bytes;  // = [dd_region][freq_region]
   std::vector<uint8_t> prx_bytes;  // only when tier>=T2
 };
 

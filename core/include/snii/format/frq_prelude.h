@@ -8,11 +8,19 @@
 #include "snii/encoding/byte_sink.h"
 
 // FrqPrelude: a TWO-LEVEL (super-block -> window) skippable directory that
-// precedes a windowed .frq posting. These bytes belong to the .frq payload
-// domain (see design spec section 4): the windowed .frq payload is
-//   [prelude][frq window 0][frq window 1]...
-// and DictEntry records prelude_len so a reader can range-fetch the prelude
-// first, then range-fetch only the windows that cover candidate docids.
+// precedes a windowed .frq posting whose payload is laid out (PHASE D, design
+// 1.6) with dd and freq regions GROUPED at posting level:
+//   windowed .frq payload = [prelude][dd-block][freq-block]
+//     dd-block   = dd_region_0 ++ dd_region_1 ++ ... ++ dd_region_{N-1}
+//     freq-block = freq_region_0 ++ ... ++ freq_region_{N-1}   (iff has_freq)
+// Windows are NOT self-describing: each window's full codec metadata (region
+// offsets, on-disk/uncompressed lengths, modes, crcs) lives in the prelude rows.
+// The docs-only prefix [prelude][dd-block] is therefore ONE contiguous run a
+// docid-only / phrase reader fetches in a single range, skipping the freq-block.
+//
+// DictEntry records prelude_len, frq_len (whole payload) and frq_docs_len
+// (= prelude_len + dd_block_len) so a reader can range-fetch the prelude first,
+// then fetch either the contiguous dd-block (docs-only) or both blocks (scoring).
 //
 // On-disk layout (strict; all multi-byte fixed fields little-endian, VInt =
 // LEB128 via snii/encoding):
@@ -27,48 +35,36 @@
 //     VInt sb_last_docid_delta # cumulative across super-blocks => absolute last
 //                              #   docid of the super-block's last window
 //     VInt sb_block_off        # byte offset of this super-block's window block,
-//                              #   measured from the start of the window_dir
-//                              #   region (i.e. relative to the byte right after
-//                              #   the trailing crc of the super_block_dir)
+//                              #   measured from the start of the window_dir region
 //     VInt sb_block_len        # byte length of this super-block's window block
 //   window_dir: n_super self-contained blocks, each holding <=G window rows.
 //     per window row:
-//       VInt last_docid_delta  # cumulative WITHIN the block => absolute last
-//                              #   docid; the previous window's absolute last
-//                              #   docid is win_base (first window of first
-//                              #   block: win_base = 0)
+//       VInt last_docid_delta  # cumulative WITHIN the block => absolute last docid
+//                              #   (previous window's absolute last docid = win_base;
+//                              #    first window of first block: win_base = 0)
 //       VInt doc_count         # number of docs in the window (frq_pod needs it)
-//       VInt frq_off           # byte offset of the window .frq payload within
-//                              #   the .frq region, relative to window_start
-//                              #   (window_start = entry.frq_off + prelude_len)
-//       VInt frq_len           # byte length of the window .frq payload
-//       VInt frq_docs_len      # byte length of the window's docs-only prefix
-//                              #   ([flags..crc_dd..dd_region]); a docs-only
-//                              #   reader fetches [frq_off, frq_off+frq_docs_len)
-//                              #   and decodes docids without the freq region.
-//                              #   frq_docs_len <= frq_len.
+//       u8   win_mode          # bit0 dd_zstd, bit1 freq_zstd
+//       VInt dd_off            # dd_region byte offset within the dd-block
+//       VInt dd_disk_len       # dd_region on-disk byte length
+//       VInt dd_uncomp_len     # dd_region plaintext byte length
+//       u32  crc_dd            # crc32c of the dd_region on-disk bytes
+//       VInt freq_off          # freq_region offset within the freq-block (has_freq)
+//       VInt freq_disk_len     # freq_region on-disk byte length (has_freq)
+//       VInt freq_uncomp_len   # freq_region plaintext byte length (has_freq)
+//       u32  crc_freq          # crc32c of the freq_region on-disk bytes (has_freq)
 //       VInt prx_off           # .prx payload byte offset (present iff has_prx)
 //       VInt prx_len           # .prx payload byte length (present iff has_prx)
 //       VInt max_freq          # window max term frequency (WAND block-max)
 //       u8   max_norm          # window score-max norm (WAND); 0 acceptable
-//       u32  win_crc32c        # crc32c of the window .frq payload bytes
 //
-// Reconstructing win_base / absolute last_docid (READER CONTRACT):
-//   The writer computes, for every window in term order, the running absolute
-//   last docid. Within a super-block's window block, each row stores the delta
-//   of its absolute last docid from the PREVIOUS window's absolute last docid
-//   (the previous window may live in the previous block; the first window of the
-//   whole term uses 0 as its previous). super_block_dir.sb_last_docid is that
-//   running value at the super-block boundary, so the reader can seed each
-//   block's cumulative sum from the previous super-block's sb_last_docid. Thus:
-//     win_base(w)      = absolute last_docid(w-1)  (0 for w==0)
-//     last_docid(w)    = win_base(w) + last_docid_delta(w)
-//   This makes super-block binary search (over sb_last_docid) followed by
-//   in-block window binary search (over last_docid) locate the window covering
-//   any docid without decoding the .frq windows.
+// Reconstructing win_base / absolute last_docid (READER CONTRACT) is unchanged:
+// the writer chains absolute last docids across windows; each row stores the delta
+// of its absolute last docid from the previous window, and sb_last_docid seeds
+// each block, so super-block binary search then in-block window binary search
+// locate the window covering any docid without decoding the .frq blocks.
 //
-// The trailing crc32c only covers header + super_block_dir; every window row
-// carries its own win_crc32c, and the .frq window payload carries its own crc.
+// The trailing crc32c covers only header + super_block_dir; every region carries
+// its own crc (crc_dd / crc_freq) in the row.
 namespace snii::format {
 
 namespace frq_prelude_flags {
@@ -76,25 +72,46 @@ inline constexpr uint8_t kHasFreq = 1u << 0;
 inline constexpr uint8_t kHasPrx = 1u << 1;
 }  // namespace frq_prelude_flags
 
-// Absolute, decoded metadata for one window (as the reader exposes it).
+// Per-window codec mode bits (win_mode byte).
+namespace frq_win_mode {
+inline constexpr uint8_t kDdZstd = 1u << 0;
+inline constexpr uint8_t kFreqZstd = 1u << 1;
+inline constexpr uint8_t kKnownBits = kDdZstd | kFreqZstd;
+}  // namespace frq_win_mode
+
+// Absolute, decoded metadata for one window (as the reader exposes it). The dd /
+// freq region locators are offsets WITHIN the dd-block / freq-block respectively
+// (both blocks follow the prelude). The reader derives the dd-block length from
+// the last window's dd_off + dd_disk_len.
 struct WindowMeta {
   uint32_t last_docid = 0;  // absolute last docid in the window
   uint64_t win_base = 0;    // absolute last docid of the previous window (0 for w==0)
   uint32_t doc_count = 0;
-  uint64_t frq_off = 0;  // relative to window_start (= entry.frq_off + prelude_len)
-  uint64_t frq_len = 0;
-  uint64_t frq_docs_len = 0;  // docs-only prefix byte length (<= frq_len)
+
+  // dd_region locator (within the dd-block).
+  bool dd_zstd = false;
+  uint64_t dd_off = 0;
+  uint64_t dd_disk_len = 0;
+  uint64_t dd_uncomp_len = 0;
+  uint32_t crc_dd = 0;
+
+  // freq_region locator (within the freq-block); valid only when has_freq.
+  bool freq_zstd = false;
+  uint64_t freq_off = 0;
+  uint64_t freq_disk_len = 0;
+  uint64_t freq_uncomp_len = 0;
+  uint32_t crc_freq = 0;
+
   uint64_t prx_off = 0;  // valid only when has_prx
   uint64_t prx_len = 0;  // valid only when has_prx
   uint32_t max_freq = 0;
   uint8_t max_norm = 0;
-  uint32_t win_crc = 0;
 };
 
-// Builder input: one fully-computed WindowMeta per window, in term order, plus
-// the super-block grouping factor. The writer fills last_docid (absolute),
-// doc_count, the offsets/lens, max_freq, max_norm and win_crc; win_base is
-// derived during build (so callers may leave it 0). group_size must be >= 1.
+// Builder input: one fully-computed WindowMeta per window, in term order, plus the
+// super-block grouping factor. The writer fills last_docid (absolute), doc_count,
+// the region locators/crcs, prx locator, max_freq and max_norm; win_base is derived
+// during build (so callers may leave it 0). group_size must be >= 1.
 struct FrqPreludeColumns {
   bool has_freq = true;
   bool has_prx = false;
@@ -108,10 +125,10 @@ struct FrqPreludeColumns {
 // >= the previous window's).
 Status build_frq_prelude(const FrqPreludeColumns& cols, ByteSink* out);
 
-// Reads and verifies a prelude buffer, exposing two-level skip access. The
-// reader parses the header + super_block_dir on open (verifying the trailing
-// crc) and eagerly decodes every window block into owned WindowMeta rows (the
-// prelude is small relative to the postings). It does not retain the input.
+// Reads and verifies a prelude buffer, exposing two-level skip access. The reader
+// parses the header + super_block_dir on open (verifying the trailing crc) and
+// eagerly decodes every window block into owned WindowMeta rows (the prelude is
+// small relative to the postings). It does not retain the input.
 class FrqPreludeReader {
  public:
   // Parses + verifies the prelude. crc mismatch / truncation / inconsistent
@@ -122,6 +139,13 @@ class FrqPreludeReader {
   uint32_t n_super_blocks() const { return n_super_; }
   bool has_freq() const { return has_freq_; }
   bool has_prx() const { return has_prx_; }
+
+  // Total on-disk byte length of the dd-block (== sum of dd_disk_len; the docs-only
+  // prefix after the prelude). 0 when there are no windows.
+  uint64_t dd_block_len() const { return dd_block_len_; }
+  // Total on-disk byte length of the freq-block (== sum of freq_disk_len). 0 when
+  // !has_freq or no windows.
+  uint64_t freq_block_len() const { return freq_block_len_; }
 
   // Returns the absolute WindowMeta for window w. Out-of-range => InvalidArgument.
   Status window(uint32_t w, WindowMeta* out) const;
@@ -137,6 +161,8 @@ class FrqPreludeReader {
   bool has_prx_ = false;
   uint32_t group_size_ = 1;
   uint32_t n_super_ = 0;
+  uint64_t dd_block_len_ = 0;
+  uint64_t freq_block_len_ = 0;
   // Absolute last docid at each super-block boundary (size n_super_).
   std::vector<uint64_t> sb_last_docid_;
   // All windows decoded with absolute fields, in term order (size N).

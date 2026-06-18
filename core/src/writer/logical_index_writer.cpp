@@ -34,18 +34,30 @@ constexpr int kAutoZstd = -1;
 // Windows per super-block in the two-level prelude directory (design section 5).
 constexpr uint32_t kPreludeGroupSize = 64;
 
-// Builds a single .frq window (docs/freqs slice) with the given win_base. Also
-// reports the window's docs-only prefix length (frq_docs_len) so the writer can
-// record it in the prelude row / slim DictEntry for later wire-level freq-skip.
-Status MakeFrqWindow(const std::vector<uint32_t>& docids,
+using snii::format::FrqRegionMeta;
+
+// Encodes one window's dd region (and freq region when has_freq) into separate
+// buffers, returning their codec metadata. The dd region is the docs-only data;
+// the freq region is the skippable suffix. Used for both the grouped windowed
+// layout (regions concatenated into posting-level blocks) and the single-window
+// slim/inline layout ([dd_region][freq_region]).
+Status EncodeRegions(const std::vector<uint32_t>& docids,
                      const std::vector<uint32_t>& freqs, uint64_t win_base,
-                     std::vector<uint8_t>* out, uint64_t* frq_docs_len) {
-  ByteSink sink;
-  snii::format::FrqWindowLayout layout;
-  SNII_RETURN_IF_ERROR(snii::format::build_frq_window(
-      docids, freqs, win_base, /*has_freq=*/true, kAutoZstd, &sink, &layout));
-  *out = sink.buffer();
-  if (frq_docs_len != nullptr) *frq_docs_len = layout.frq_docs_len;
+                     bool has_freq, std::vector<uint8_t>* dd_out, FrqRegionMeta* dd_meta,
+                     std::vector<uint8_t>* freq_out, FrqRegionMeta* freq_meta) {
+  ByteSink dd_sink;
+  SNII_RETURN_IF_ERROR(
+      snii::format::build_dd_region(docids, win_base, kAutoZstd, &dd_sink, dd_meta));
+  *dd_out = dd_sink.buffer();
+  if (!has_freq) {
+    *freq_out = std::vector<uint8_t>();
+    *freq_meta = FrqRegionMeta{};
+    return Status::OK();
+  }
+  ByteSink freq_sink;
+  SNII_RETURN_IF_ERROR(
+      snii::format::build_freq_region(freqs, kAutoZstd, &freq_sink, freq_meta));
+  *freq_out = freq_sink.buffer();
   return Status::OK();
 }
 
@@ -96,10 +108,10 @@ uint32_t AdaptiveWindowDocs(uint32_t df) {
 }
 
 // Builds the two-level .frq prelude for a windowed term and returns its bytes.
-Status BuildPrelude(const std::vector<WindowMeta>& windows, bool has_prx,
+Status BuildPrelude(const std::vector<WindowMeta>& windows, bool has_freq, bool has_prx,
                     std::vector<uint8_t>* out) {
   FrqPreludeColumns cols;
-  cols.has_freq = true;
+  cols.has_freq = has_freq;
   cols.has_prx = has_prx;
   cols.group_size = kPreludeGroupSize;
   cols.windows = windows;
@@ -113,20 +125,44 @@ void AppendBytes(std::vector<uint8_t>* dst, const std::vector<uint8_t>& src) {
   dst->insert(dst->end(), src.begin(), src.end());
 }
 
-// One windowed term's serialized windows: the concatenated frq/prx payloads and
-// the per-window metadata (offsets relative to the start of each region).
+// One windowed term's grouped .frq layout (design 1.6): all dd regions form the
+// dd-block, all freq regions form the freq-block. The final .frq payload is
+// [prelude][dd-block][freq-block]; .prx stays per-window concatenated. Per-window
+// metadata (region offsets/lens/modes/crcs) is recorded for the prelude.
 struct WindowedPosting {
-  std::vector<uint8_t> frq_bytes;          // [win0 frq][win1 frq]...
-  std::vector<uint8_t> prx_bytes;          // [win0 prx][win1 prx]... (empty if !has_prx)
+  std::vector<uint8_t> dd_block;   // dd_region_0 ++ dd_region_1 ++ ...
+  std::vector<uint8_t> freq_block; // freq_region_0 ++ ... (empty if !has_freq)
+  std::vector<uint8_t> prx_bytes;  // [win0 prx][win1 prx]... (empty if !has_prx)
   std::vector<WindowMeta> windows;
 };
 
-// Splits a windowed term's postings into base-unit-aligned windows (size chosen
-// by df via AdaptiveWindowDocs), building each window's .frq (and .prx) payload
-// and accumulating per-window metadata with offsets relative to the start of the
-// frq/prx regions (window_start). Records each window's docs-only prefix length
-// (frq_docs_len) and WAND max_norm (smallest encoded norm in the window).
-Status BuildWindowedPosting(const TermPostings& tp, bool has_prx,
+// Fills a window's region locator fields in m from its dd/freq region metas and
+// the running dd-block / freq-block offsets, then appends the region bytes to the
+// blocks. has_freq controls whether the freq region is laid out.
+void LayoutWindowRegions(const FrqRegionMeta& dd_meta, const std::vector<uint8_t>& dd_bytes,
+                         const FrqRegionMeta& freq_meta,
+                         const std::vector<uint8_t>& freq_bytes, bool has_freq,
+                         WindowedPosting* out, WindowMeta* m) {
+  m->dd_zstd = dd_meta.zstd;
+  m->dd_off = static_cast<uint64_t>(out->dd_block.size());
+  m->dd_disk_len = dd_meta.disk_len;
+  m->dd_uncomp_len = dd_meta.uncomp_len;
+  m->crc_dd = dd_meta.crc;
+  AppendBytes(&out->dd_block, dd_bytes);
+  if (!has_freq) return;
+  m->freq_zstd = freq_meta.zstd;
+  m->freq_off = static_cast<uint64_t>(out->freq_block.size());
+  m->freq_disk_len = freq_meta.disk_len;
+  m->freq_uncomp_len = freq_meta.uncomp_len;
+  m->crc_freq = freq_meta.crc;
+  AppendBytes(&out->freq_block, freq_bytes);
+}
+
+// Splits a windowed term's postings into base-unit-aligned windows (size chosen by
+// df via AdaptiveWindowDocs). Each window's dd/freq regions are encoded separately
+// and grouped: all dd regions into the dd-block, all freq regions into the
+// freq-block. Records per-window region metadata + WAND max_norm.
+Status BuildWindowedPosting(const TermPostings& tp, bool has_freq, bool has_prx,
                             const std::vector<uint8_t>& norms, WindowedPosting* out) {
   const uint32_t unit = AdaptiveWindowDocs(static_cast<uint32_t>(tp.docids.size()));
   const size_t n = tp.docids.size();
@@ -136,21 +172,18 @@ Status BuildWindowedPosting(const TermPostings& tp, bool has_prx,
     const std::vector<uint32_t> docs(tp.docids.begin() + start, tp.docids.begin() + end);
     const std::vector<uint32_t> freqs(tp.freqs.begin() + start, tp.freqs.begin() + end);
 
-    std::vector<uint8_t> frq_win;
-    uint64_t frq_docs_len = 0;
-    SNII_RETURN_IF_ERROR(MakeFrqWindow(docs, freqs, win_base, &frq_win, &frq_docs_len));
+    std::vector<uint8_t> dd_bytes, freq_bytes;
+    FrqRegionMeta dd_meta, freq_meta;
+    SNII_RETURN_IF_ERROR(EncodeRegions(docs, freqs, win_base, has_freq, &dd_bytes,
+                                       &dd_meta, &freq_bytes, &freq_meta));
 
     WindowMeta m;
     m.last_docid = docs.back();
     m.win_base = win_base;
     m.doc_count = static_cast<uint32_t>(docs.size());
-    m.frq_off = static_cast<uint64_t>(out->frq_bytes.size());
-    m.frq_len = static_cast<uint64_t>(frq_win.size());
-    m.frq_docs_len = frq_docs_len;
     m.max_freq = MaxOf(freqs);
     m.max_norm = WindowMaxNorm(norms, docs);
-    m.win_crc = snii::crc32c(Slice(frq_win));
-    AppendBytes(&out->frq_bytes, frq_win);
+    LayoutWindowRegions(dd_meta, dd_bytes, freq_meta, freq_bytes, has_freq, out, &m);
 
     if (has_prx) {
       const std::vector<std::vector<uint32_t>> pos(tp.positions.begin() + start,
@@ -174,6 +207,7 @@ LogicalIndexWriter::LogicalIndexWriter(const SniiIndexInput& in)
       index_suffix_(in.index_suffix),
       tier_(snii::format::tier_of(in.config)),
       has_prx_(snii::format::has_positions(in.config)),
+      has_freq_(snii::format::tier_of(in.config) >= snii::format::IndexTier::kT2),
       has_norms_(snii::format::has_scoring(in.config)),
       doc_count_(in.doc_count),
       terms_(in.terms),
@@ -202,24 +236,29 @@ Status LogicalIndexWriter::validate() const {
   return Status::OK();
 }
 
-// Emits a windowed term: splits into kFrqBaseUnit windows, builds a two-level
-// prelude, and lays out [prelude][win0 frq][win1 frq]... in the .frq POD and
+// Emits a windowed term: splits into base-unit windows, encodes each window's
+// dd/freq regions separately, groups them at posting level, builds a two-level
+// prelude, and lays out [prelude][dd-block][freq-block] in the .frq POD and
 // [win0 prx][win1 prx]... in the .prx POD. Sets enc=windowed + has_sb.
+// frq_docs_len = prelude_len + dd_block_len is the contiguous docs-only prefix.
 Status LogicalIndexWriter::build_windowed_entry(const TermPostings& tp, uint64_t frq_base,
                                                 uint64_t prx_base, DictEntry* e) {
   WindowedPosting wp;
-  SNII_RETURN_IF_ERROR(BuildWindowedPosting(tp, has_prx_, encoded_norms_, &wp));
+  SNII_RETURN_IF_ERROR(BuildWindowedPosting(tp, has_freq_, has_prx_, encoded_norms_, &wp));
   std::vector<uint8_t> prelude;
-  SNII_RETURN_IF_ERROR(BuildPrelude(wp.windows, has_prx_, &prelude));
+  SNII_RETURN_IF_ERROR(BuildPrelude(wp.windows, has_freq_, has_prx_, &prelude));
 
   e->kind = DictEntryKind::kPodRef;
   e->enc = DictEntryEnc::kWindowed;
   e->has_sb = true;  // prelude is always a two-level skip directory.
   e->prelude_len = static_cast<uint64_t>(prelude.size());
+  e->frq_docs_len =
+      e->prelude_len + static_cast<uint64_t>(wp.dd_block.size());  // [prelude][dd-block]
 
   const uint64_t frq_off = static_cast<uint64_t>(frq_pod_.size());
   AppendBytes(&frq_pod_, prelude);
-  AppendBytes(&frq_pod_, wp.frq_bytes);
+  AppendBytes(&frq_pod_, wp.dd_block);
+  AppendBytes(&frq_pod_, wp.freq_block);
   e->frq_off_delta = frq_off - frq_base;
   e->frq_len = static_cast<uint64_t>(frq_pod_.size()) - frq_off;
   if (has_prx_) {
@@ -231,28 +270,35 @@ Status LogicalIndexWriter::build_windowed_entry(const TermPostings& tp, uint64_t
   return Status::OK();
 }
 
-// Emits a slim term as a single .frq window (win_base=0): inline when the
-// encoded bytes are tiny, otherwise a slim pod_ref (no prelude).
+// Emits a slim term as a single .frq window (win_base=0) laid out [dd][freq]:
+// inline when the encoded bytes are tiny, otherwise a slim pod_ref (no prelude).
+// The dd region is the docs-only prefix; the freq region (when has_freq) is the
+// skippable suffix. Region codecs are recorded in the DictEntry.
 Status LogicalIndexWriter::build_slim_entry(const TermPostings& tp, uint64_t frq_base,
                                             uint64_t prx_base, DictEntry* e) {
-  std::vector<uint8_t> frq_win;
-  uint64_t frq_docs_len = 0;
-  SNII_RETURN_IF_ERROR(MakeFrqWindow(tp.docids, tp.freqs, /*win_base=*/0, &frq_win,
-                                     &frq_docs_len));
+  std::vector<uint8_t> dd_bytes, freq_bytes;
+  FrqRegionMeta dd_meta, freq_meta;
+  SNII_RETURN_IF_ERROR(EncodeRegions(tp.docids, tp.freqs, /*win_base=*/0, has_freq_,
+                                     &dd_bytes, &dd_meta, &freq_bytes, &freq_meta));
+  std::vector<uint8_t> frq_win = dd_bytes;  // [dd_region][freq_region]
+  AppendBytes(&frq_win, freq_bytes);
   std::vector<uint8_t> prx_win;
   if (has_prx_) SNII_RETURN_IF_ERROR(MakePrxWindow(tp.positions, &prx_win));
 
+  e->enc = DictEntryEnc::kSlim;
+  e->dd_meta = dd_meta;
+  e->freq_meta = freq_meta;
+
   if (frq_win.size() <= snii::format::kDefaultInlineThreshold) {
     e->kind = DictEntryKind::kInline;
-    e->enc = DictEntryEnc::kSlim;
+    e->inline_dd_disk_len = dd_meta.disk_len;
     e->frq_bytes = std::move(frq_win);
     if (has_prx_) e->prx_bytes = std::move(prx_win);
     return Status::OK();
   }
 
   e->kind = DictEntryKind::kPodRef;
-  e->enc = DictEntryEnc::kSlim;
-  e->frq_docs_len = frq_docs_len;  // docs-only prefix of the single slim window
+  e->frq_docs_len = dd_meta.disk_len;  // docs-only prefix = the single dd region
   const uint64_t frq_off = static_cast<uint64_t>(frq_pod_.size());
   AppendBytes(&frq_pod_, frq_win);
   e->frq_off_delta = frq_off - frq_base;

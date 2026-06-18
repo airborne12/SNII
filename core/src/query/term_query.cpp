@@ -20,16 +20,17 @@ using snii::reader::LogicalIndexReader;
 
 namespace {
 
-// Decodes the docids of one slim .frq window from raw window bytes. The writer
-// builds slim/inline windows with win_base=0.
-Status DecodeSlimDocs(Slice window, std::vector<uint32_t>* docids) {
-  ByteSource src(window);
-  return snii::format::read_frq_window_docs(&src, /*win_base=*/0, docids);
+// Decodes the docids of one slim/inline .frq window's dd region (win_base=0). The
+// dd_region slice is exactly the entry's dd region on-disk bytes; entry.dd_meta
+// drives the decode.
+Status DecodeSlimDocs(const DictEntry& entry, Slice dd_region,
+                      std::vector<uint32_t>* docids) {
+  return snii::format::decode_dd_region(dd_region, entry.dd_meta, /*win_base=*/0, docids);
 }
 
-// Decodes a windowed term's full docid sequence by tiling all its windows
-// through the two-level prelude. Docid-only: each window fetches ONLY its
-// docs-only prefix (want_freq=false), so the freq region never crosses the wire.
+// Decodes a windowed term's full docid sequence by reading the contiguous
+// [prelude][dd-block] prefix (want_freq=false), so the freq-block never crosses
+// the wire.
 Status DecodeWindowedDocs(const LogicalIndexReader& idx, const DictEntry& entry,
                           uint64_t frq_base, uint64_t prx_base,
                           std::vector<uint32_t>* docids) {
@@ -41,9 +42,9 @@ Status DecodeWindowedDocs(const LogicalIndexReader& idx, const DictEntry& entry,
   return Status::OK();
 }
 
-// Resolves the docs-only fetch length for a slim pod_ref window: the recorded
-// docs-only prefix (frq_docs_len) when present and valid, else the whole window
-// (defensive fallback for malformed entries). Validates frq_docs_len <= win_len.
+// Resolves the dd-region (docs-only) fetch length for a slim pod_ref: frq_docs_len
+// (the dd region on-disk length). Validates it <= the full window. A defensive
+// fallback to the full window covers malformed (frq_docs_len==0) entries.
 Status SlimDocsFetchLen(const DictEntry& entry, uint64_t win_len, uint64_t* out) {
   if (entry.frq_docs_len > win_len) {
     return Status::Corruption("term_query: slim frq_docs_len exceeds frq window");
@@ -66,18 +67,24 @@ Status term_query(const LogicalIndexReader& idx, std::string_view term,
   SNII_RETURN_IF_ERROR(idx.lookup(term, &found, &entry, &frq_base, &prx_base));
   if (!found) return Status::OK();
 
-  // Inline entry: the single frq window bytes live inside the DictEntry.
+  // Inline entry: the single frq window bytes ([dd][freq]) live in the DictEntry.
+  // The dd region is the docs-only prefix [0, dd_meta.disk_len).
   if (entry.kind == DictEntryKind::kInline) {
-    return DecodeSlimDocs(Slice(entry.frq_bytes), docids);
+    if (entry.dd_meta.disk_len > entry.frq_bytes.size()) {
+      return Status::Corruption("term_query: inline dd region exceeds frq bytes");
+    }
+    return DecodeSlimDocs(entry, Slice(entry.frq_bytes.data(),
+                                       static_cast<size_t>(entry.dd_meta.disk_len)),
+                          docids);
   }
 
-  // Windowed pod_ref: tile every window via the two-level prelude.
+  // Windowed pod_ref: read the contiguous [prelude][dd-block] prefix.
   if (entry.enc == DictEntryEnc::kWindowed) {
     return DecodeWindowedDocs(idx, entry, frq_base, prx_base, docids);
   }
 
-  // Slim pod_ref: one .frq window after the (absent) prelude. Docid-only: fetch
-  // ONLY the docs-only prefix (frq_docs_len) instead of the full window.
+  // Slim pod_ref: [dd_region][freq_region] after the (absent) prelude. Docid-only:
+  // fetch ONLY the dd region (frq_docs_len) instead of the full window.
   uint64_t win_abs = 0;
   uint64_t win_len = 0;
   SNII_RETURN_IF_ERROR(idx.resolve_frq_window(entry, frq_base, &win_abs, &win_len));
@@ -86,7 +93,7 @@ Status term_query(const LogicalIndexReader& idx, std::string_view term,
   snii::io::BatchRangeFetcher fetcher(idx.reader());
   const size_t h = fetcher.add(win_abs, static_cast<size_t>(docs_len));
   SNII_RETURN_IF_ERROR(fetcher.fetch());
-  return DecodeSlimDocs(fetcher.get(h), docids);
+  return DecodeSlimDocs(entry, fetcher.get(h), docids);
 }
 
 }  // namespace snii::query

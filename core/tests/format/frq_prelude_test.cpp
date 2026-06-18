@@ -25,23 +25,31 @@ namespace {
 
 // Builds N windows that tile a docid space in fixed strides, with deterministic
 // per-window metadata. doc_count is `stride`; absolute last docid of window w is
-// (w+1)*stride - 1 so windows are contiguous and strictly ascending.
+// (w+1)*stride - 1 so windows are contiguous and strictly ascending. dd and freq
+// region offsets are CONTIGUOUS prefix sums (the prelude validates this).
 FrqPreludeColumns MakeColumns(uint32_t n, uint32_t group_size, uint32_t stride,
                               bool has_prx) {
   FrqPreludeColumns cols;
   cols.has_freq = true;
   cols.has_prx = has_prx;
   cols.group_size = group_size;
-  uint64_t frq_running = 0;
-  uint64_t prx_running = 0;
+  uint64_t dd_running = 0, freq_running = 0, prx_running = 0;
   for (uint32_t w = 0; w < n; ++w) {
     WindowMeta m;
     m.last_docid = (w + 1) * stride - 1;
     m.doc_count = stride;
-    m.frq_off = frq_running;
-    m.frq_len = 10 + w;  // arbitrary but unique-ish
-    m.frq_docs_len = 6 + (w % 4);  // docs-only prefix, always <= frq_len
-    frq_running += m.frq_len;
+    m.dd_zstd = (w % 2) == 0;
+    m.dd_off = dd_running;
+    m.dd_disk_len = 8 + w;
+    m.dd_uncomp_len = m.dd_disk_len + 2;  // arbitrary >= disk_len for zstd rows
+    m.crc_dd = 0xDD000000u + w;
+    dd_running += m.dd_disk_len;
+    m.freq_zstd = (w % 3) == 0;
+    m.freq_off = freq_running;
+    m.freq_disk_len = 5 + (w % 4);
+    m.freq_uncomp_len = m.freq_disk_len + 1;
+    m.crc_freq = 0xEE000000u + w;
+    freq_running += m.freq_disk_len;
     if (has_prx) {
       m.prx_off = prx_running;
       m.prx_len = 7 + (w % 5);
@@ -49,7 +57,6 @@ FrqPreludeColumns MakeColumns(uint32_t n, uint32_t group_size, uint32_t stride,
     }
     m.max_freq = w * 3 + 1;
     m.max_norm = static_cast<uint8_t>((w * 13 + 3) & 0xFF);
-    m.win_crc = 0xCAFE0000u + w;
     cols.windows.push_back(m);
   }
   return cols;
@@ -76,12 +83,18 @@ void ExpectRoundTrip(const FrqPreludeColumns& cols) {
     EXPECT_EQ(got.last_docid, exp.last_docid) << "ldd w=" << w;
     EXPECT_EQ(got.win_base, expect_win_base) << "win_base w=" << w;
     EXPECT_EQ(got.doc_count, exp.doc_count) << "doc_count w=" << w;
-    EXPECT_EQ(got.frq_off, exp.frq_off) << "frq_off w=" << w;
-    EXPECT_EQ(got.frq_len, exp.frq_len) << "frq_len w=" << w;
-    EXPECT_EQ(got.frq_docs_len, exp.frq_docs_len) << "frq_docs_len w=" << w;
+    EXPECT_EQ(got.dd_zstd, exp.dd_zstd) << "dd_zstd w=" << w;
+    EXPECT_EQ(got.dd_off, exp.dd_off) << "dd_off w=" << w;
+    EXPECT_EQ(got.dd_disk_len, exp.dd_disk_len) << "dd_disk_len w=" << w;
+    EXPECT_EQ(got.dd_uncomp_len, exp.dd_uncomp_len) << "dd_uncomp_len w=" << w;
+    EXPECT_EQ(got.crc_dd, exp.crc_dd) << "crc_dd w=" << w;
+    EXPECT_EQ(got.freq_zstd, exp.freq_zstd) << "freq_zstd w=" << w;
+    EXPECT_EQ(got.freq_off, exp.freq_off) << "freq_off w=" << w;
+    EXPECT_EQ(got.freq_disk_len, exp.freq_disk_len) << "freq_disk_len w=" << w;
+    EXPECT_EQ(got.freq_uncomp_len, exp.freq_uncomp_len) << "freq_uncomp_len w=" << w;
+    EXPECT_EQ(got.crc_freq, exp.crc_freq) << "crc_freq w=" << w;
     EXPECT_EQ(got.max_freq, exp.max_freq) << "max_freq w=" << w;
     EXPECT_EQ(got.max_norm, exp.max_norm) << "max_norm w=" << w;
-    EXPECT_EQ(got.win_crc, exp.win_crc) << "win_crc w=" << w;
     if (cols.has_prx) {
       EXPECT_EQ(got.prx_off, exp.prx_off) << "prx_off w=" << w;
       EXPECT_EQ(got.prx_len, exp.prx_len) << "prx_len w=" << w;
@@ -174,18 +187,24 @@ TEST(FrqPrelude, LocateWindowAgainstLinearScan) {
   cols.group_size = 4;
   // Non-contiguous absolute last docids with gaps: 50, 130, 131, 400, 900.
   const uint32_t lasts[] = {50, 130, 131, 400, 900};
-  uint64_t frq_running = 0, prx_running = 0;
+  uint64_t dd_running = 0, freq_running = 0, prx_running = 0;
   for (uint32_t v : lasts) {
     WindowMeta m;
     m.last_docid = v;
     m.doc_count = 5;
-    m.frq_off = frq_running;
-    m.frq_len = 12;
-    frq_running += 12;
+    m.dd_off = dd_running;
+    m.dd_disk_len = 12;
+    m.dd_uncomp_len = 12;
+    m.crc_dd = v;
+    dd_running += 12;
+    m.freq_off = freq_running;
+    m.freq_disk_len = 6;
+    m.freq_uncomp_len = 6;
+    m.crc_freq = v + 1;
+    freq_running += 6;
     m.prx_off = prx_running;
     m.prx_len = 6;
     prx_running += 6;
-    m.win_crc = v;
     cols.windows.push_back(m);
   }
   ByteSink sink;
@@ -234,16 +253,33 @@ TEST(FrqPrelude, BuildNonMonotonicRejected) {
   EXPECT_EQ(build_frq_prelude(cols, &sink).code(), StatusCode::kInvalidArgument);
 }
 
-// A window row whose frq_docs_len exceeds frq_len is rejected on open (anti-DoS:
-// the docs-only prefix can never be longer than the full window).
-TEST(FrqPrelude, FrqDocsLenExceedsFrqLenRejected) {
+// A non-contiguous dd region offset is rejected on open (anti-DoS: the grouped
+// dd-block requires each region to start where the previous ended).
+TEST(FrqPrelude, NonContiguousDdRegionRejected) {
   FrqPreludeColumns cols = MakeColumns(/*n=*/5, /*group_size=*/4, /*stride=*/256, false);
-  cols.windows[2].frq_docs_len = cols.windows[2].frq_len + 100;  // impossible prefix
+  cols.windows[2].dd_off += 100;  // gap before window 2's dd region
   ByteSink sink;
   ASSERT_TRUE(build_frq_prelude(cols, &sink).ok());  // builder does not validate
   FrqPreludeReader reader;
   Status s = FrqPreludeReader::open(sink.view(), &reader);
   EXPECT_EQ(s.code(), StatusCode::kCorruption);
+}
+
+// The reader reports dd_block_len / freq_block_len as the sums of per-window region
+// disk lengths (the contiguous block sizes a reader range-fetches).
+TEST(FrqPrelude, BlockLengthsAreRegionSums) {
+  FrqPreludeColumns cols = MakeColumns(/*n=*/6, /*group_size=*/4, /*stride=*/256, true);
+  ByteSink sink;
+  ASSERT_TRUE(build_frq_prelude(cols, &sink).ok());
+  FrqPreludeReader reader;
+  ASSERT_TRUE(FrqPreludeReader::open(sink.view(), &reader).ok());
+  uint64_t dd_sum = 0, freq_sum = 0;
+  for (const auto& m : cols.windows) {
+    dd_sum += m.dd_disk_len;
+    freq_sum += m.freq_disk_len;
+  }
+  EXPECT_EQ(reader.dd_block_len(), dd_sum);
+  EXPECT_EQ(reader.freq_block_len(), freq_sum);
 }
 
 // CRC corruption inside the header / super_block_dir is detected by open().

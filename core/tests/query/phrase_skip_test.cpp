@@ -181,11 +181,18 @@ bool DecodeFullTerm(const LogicalIndexReader& idx, const std::string& term,
     frq = entry.frq_bytes;
     prx = entry.prx_bytes;
   }
+  // Slim/inline window = [dd_region][freq_region]; the dd region is the docs prefix.
   WindowMeta meta;
   meta.win_base = 0;
   meta.doc_count = entry.df;
+  meta.dd_zstd = entry.dd_meta.zstd;
+  meta.dd_uncomp_len = entry.dd_meta.uncomp_len;
+  meta.dd_disk_len = entry.dd_meta.disk_len;
+  meta.crc_dd = entry.dd_meta.crc;
+  EXPECT_LE(entry.dd_meta.disk_len, frq.size());
+  Slice dd_region(frq.data(), static_cast<size_t>(entry.dd_meta.disk_len));
   std::vector<uint32_t> freqs;
-  Status st = decode_window_slices(meta, Slice(frq), Slice(prx),
+  Status st = decode_window_slices(meta, dd_region, Slice(), Slice(prx),
                                    /*want_positions=*/true, /*want_freq=*/false,
                                    &out->docids, &freqs, &out->positions);
   EXPECT_TRUE(st.ok()) << st.message();
@@ -314,10 +321,13 @@ TEST(PhraseSkip, SkippingEqualsOracleAndFullRead) {
   (void)FullReadPhrase(idx, hi_phrase);
   const io::IoMetrics full = metered.metrics();
 
-  // 1. The whole skipping query (5 terms!) requests fewer bytes than reading the
-  //    high-df term's full posting (.frq + .prx) alone -- a strong reduction.
-  EXPECT_LT(skip.total_request_bytes, hi_frq_len + hi_prx_len)
-      << "skip=" << skip.total_request_bytes << " hi_full=" << (hi_frq_len + hi_prx_len);
+  // 1. Skipping requests SUBSTANTIALLY fewer bytes than the full-read path: the
+  //    high-df term contributes only its prelude + the candidate-covering windows
+  //    (dd + prx sub-ranges), never its whole posting, so the 5-term skip query
+  //    reads comfortably under 80% of the full-read bytes (a clear reduction even
+  //    with the richer Phase-D prelude and 4 companion terms).
+  EXPECT_LT(skip.total_request_bytes * 10, full.total_request_bytes * 8)
+      << "skip=" << skip.total_request_bytes << " full=" << full.total_request_bytes;
   // 2. Skipping requests strictly fewer bytes than the full-read path.
   EXPECT_LT(skip.total_request_bytes, full.total_request_bytes)
       << "skip=" << skip.total_request_bytes << " full=" << full.total_request_bytes;

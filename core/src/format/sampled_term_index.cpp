@@ -131,19 +131,21 @@ Status SampledTermIndexReader::locate(std::string_view target, bool* maybe_prese
   if (sample_terms_.empty()) {
     return Status::OK();  // empty index: always out of range.
   }
-  // target < min_term → out of range.
+  // target < min_term (first block's first term) -> before the first block, so it
+  // cannot exist in any block. NOTE: a target GREATER than the last sample term is
+  // NOT out of range -- sample_terms_ holds each block's FIRST term, so the LAST
+  // block can contain terms greater than its first term. Such a target routes to
+  // the last block (upper_bound -> end()), where find_term confirms presence.
   if (target < std::string_view(sample_terms_.front())) {
     return Status::OK();
   }
-  // target > max_term → out of range.
-  if (target > std::string_view(sample_terms_.back())) {
-    return Status::OK();
-  }
-  // Last sample_term <= target: step back one position after upper_bound.
+  // Last sample_term <= target: step back one position after upper_bound. For a
+  // target past every sample term, upper_bound returns end() and idx = n-1 (the
+  // last block), which is correct.
   auto it = std::upper_bound(
       sample_terms_.begin(), sample_terms_.end(), target,
       [](std::string_view t, const std::string& s) { return t < std::string_view(s); });
-  const auto idx = (it - sample_terms_.begin()) - 1;  // it must be > begin (< min already excluded).
+  const auto idx = (it - sample_terms_.begin()) - 1;  // it > begin (< min excluded).
   *maybe_present = true;
   *block_ordinal = static_cast<uint32_t>(idx);
   return Status::OK();

@@ -126,6 +126,7 @@ class LogicalIndexWriter {
   std::string index_suffix_;
   snii::format::IndexTier tier_;
   bool has_prx_;
+  bool has_freq_;  // tier >= T2: a freq region is encoded per window
   bool has_norms_;
   uint32_t doc_count_;
   const std::vector<TermPostings>& terms_;

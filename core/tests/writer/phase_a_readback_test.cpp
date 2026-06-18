@@ -169,10 +169,12 @@ TEST(PhaseAReadBack, DocsPrefixTilesAndMaxNormTightAndQueriesAgree) {
   ASSERT_TRUE(prelude.window(0, &w0).ok());
   EXPECT_EQ(w0.doc_count, snii::format::kAdaptiveWindowDocs);
 
-  const uint64_t window_start = prelude_abs + hot.prelude_len;
+  // The grouped layout puts all dd regions in the dd-block right after the prelude.
+  const uint64_t dd_block_start = prelude_abs + hot.prelude_len;
   std::vector<uint32_t> tiled;
   uint64_t summed = 0;
   uint64_t expect_win_base = 0;
+  uint64_t expect_dd_off = 0;
   uint32_t doc_cursor = 0;
   bool any_nonzero_max_norm = false;
 
@@ -180,28 +182,22 @@ TEST(PhaseAReadBack, DocsPrefixTilesAndMaxNormTightAndQueriesAgree) {
     WindowMeta m;
     ASSERT_TRUE(prelude.window(w, &m).ok());
     EXPECT_EQ(m.win_base, expect_win_base) << "win_base w=" << w;
-    ASSERT_GT(m.frq_docs_len, 0u) << "w=" << w;
-    ASSERT_LE(m.frq_docs_len, m.frq_len) << "w=" << w;
+    ASSERT_GT(m.dd_disk_len, 0u) << "w=" << w;
+    // (a) dd regions are contiguous in the dd-block (the docs-only run is one range).
+    EXPECT_EQ(m.dd_off, expect_dd_off) << "dd_off contiguity w=" << w;
 
-    // Full-window docids.
-    std::vector<uint8_t> full_bytes;
-    ASSERT_TRUE(local.read_at(window_start + m.frq_off, m.frq_len, &full_bytes).ok());
-    Slice full_slice(full_bytes);
-    ByteSource full_src(full_slice);
-    std::vector<uint32_t> full_docs;
-    ASSERT_TRUE(read_frq_window_docs(&full_src, m.win_base, &full_docs).ok());
-    ASSERT_EQ(full_docs.size(), m.doc_count) << "w=" << w;
-
-    // (a) docs-only PREFIX slice alone (freq region bytes absent) decodes the
-    // SAME docids as the full window.
-    std::vector<uint8_t> prefix_bytes;
-    ASSERT_TRUE(local.read_at(window_start + m.frq_off, m.frq_docs_len, &prefix_bytes).ok());
-    Slice prefix_slice(prefix_bytes);
-    ByteSource prefix_src(prefix_slice);
-    std::vector<uint32_t> prefix_docs;
-    ASSERT_TRUE(read_frq_window_docs(&prefix_src, m.win_base, &prefix_docs).ok())
-        << "prefix decode w=" << w;
-    EXPECT_EQ(prefix_docs, full_docs) << "prefix vs full w=" << w;
+    // Decode the window's dd region ALONE (the freq region bytes are NOT fetched).
+    FrqRegionMeta dd_meta;
+    dd_meta.zstd = m.dd_zstd;
+    dd_meta.uncomp_len = m.dd_uncomp_len;
+    dd_meta.disk_len = m.dd_disk_len;
+    dd_meta.crc = m.crc_dd;
+    std::vector<uint8_t> dd_bytes;
+    ASSERT_TRUE(local.read_at(dd_block_start + m.dd_off, m.dd_disk_len, &dd_bytes).ok());
+    std::vector<uint32_t> dd_docs;
+    ASSERT_TRUE(decode_dd_region(Slice(dd_bytes), dd_meta, m.win_base, &dd_docs).ok())
+        << "dd decode w=" << w;
+    ASSERT_EQ(dd_docs.size(), m.doc_count) << "w=" << w;
 
     // (c) max_norm equals the tightest (smallest encoded) norm in the window.
     const uint32_t exp_min_norm = WindowMinNorm(norms, doc_cursor, doc_cursor + m.doc_count);
@@ -211,9 +207,12 @@ TEST(PhaseAReadBack, DocsPrefixTilesAndMaxNormTightAndQueriesAgree) {
     // (b) tiling: doc_counts sum and concatenated docids stay ascending.
     summed += m.doc_count;
     expect_win_base = m.last_docid;
+    expect_dd_off += m.dd_disk_len;
     doc_cursor += m.doc_count;
-    tiled.insert(tiled.end(), full_docs.begin(), full_docs.end());
+    tiled.insert(tiled.end(), dd_docs.begin(), dd_docs.end());
   }
+  // The dd-block length equals the sum of per-window dd region lengths.
+  EXPECT_EQ(prelude.dd_block_len(), expect_dd_off);
 
   // (b) windows tile the whole posting [0, doc_count).
   EXPECT_EQ(summed, c.doc_count);

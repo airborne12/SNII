@@ -24,6 +24,13 @@ uint8_t make_flags(const FrqPreludeColumns& cols) {
   return flags;
 }
 
+uint8_t make_win_mode(const WindowMeta& m, bool has_freq) {
+  uint8_t mode = 0;
+  if (m.dd_zstd) mode |= frq_win_mode::kDdZstd;
+  if (has_freq && m.freq_zstd) mode |= frq_win_mode::kFreqZstd;
+  return mode;
+}
+
 // Validates builder input: non-null sink, group_size>=1, sane count, and
 // non-decreasing absolute last_docid across windows.
 Status validate_input(const FrqPreludeColumns& cols, ByteSink* out) {
@@ -44,20 +51,27 @@ Status validate_input(const FrqPreludeColumns& cols, ByteSink* out) {
 
 // Encodes one window row into a per-block sink. last_docid_delta is the row's
 // absolute last_docid minus prev_last (the previous window's absolute last).
-void encode_window_row(const WindowMeta& m, bool has_prx, uint64_t prev_last,
-                       ByteSink* block) {
+void encode_window_row(const WindowMeta& m, bool has_freq, bool has_prx,
+                       uint64_t prev_last, ByteSink* block) {
   block->put_varint64(static_cast<uint64_t>(m.last_docid) - prev_last);
   block->put_varint64(m.doc_count);
-  block->put_varint64(m.frq_off);
-  block->put_varint64(m.frq_len);
-  block->put_varint64(m.frq_docs_len);
+  block->put_u8(make_win_mode(m, has_freq));
+  block->put_varint64(m.dd_off);
+  block->put_varint64(m.dd_disk_len);
+  block->put_varint64(m.dd_uncomp_len);
+  block->put_fixed32(m.crc_dd);
+  if (has_freq) {
+    block->put_varint64(m.freq_off);
+    block->put_varint64(m.freq_disk_len);
+    block->put_varint64(m.freq_uncomp_len);
+    block->put_fixed32(m.crc_freq);
+  }
   if (has_prx) {
     block->put_varint64(m.prx_off);
     block->put_varint64(m.prx_len);
   }
   block->put_varint64(m.max_freq);
   block->put_u8(m.max_norm);
-  block->put_fixed32(m.win_crc);
 }
 
 // One super-block's serialized window block plus its directory fields.
@@ -78,7 +92,8 @@ std::vector<SuperBlock> encode_super_blocks(const FrqPreludeColumns& cols) {
     const size_t end = std::min(n, start + g);
     SuperBlock sb;
     for (size_t w = start; w < end; ++w) {
-      encode_window_row(cols.windows[w], cols.has_prx, prev_last, &sb.block);
+      encode_window_row(cols.windows[w], cols.has_freq, cols.has_prx, prev_last,
+                        &sb.block);
       prev_last = cols.windows[w].last_docid;
     }
     sb.last_docid = prev_last;
@@ -212,32 +227,48 @@ Status decode_super_block_dir(Slice dir, const Header& h,
   return Status::OK();
 }
 
+// Validates a per-window codec mode byte against the known bits.
+Status check_win_mode(uint8_t mode, bool has_freq) {
+  if ((mode & ~frq_win_mode::kKnownBits) != 0) {
+    return Status::Corruption("frq_prelude: unknown win_mode bits");
+  }
+  if (!has_freq && (mode & frq_win_mode::kFreqZstd) != 0) {
+    return Status::Corruption("frq_prelude: freq mode set without has_freq");
+  }
+  return Status::OK();
+}
+
 // Decodes one window row, advancing prev_last to this window's absolute last.
-Status decode_window_row(ByteSource* src, bool has_prx, uint64_t* prev_last,
-                         WindowMeta* m) {
-  uint64_t ldd = 0;
+Status decode_window_row(ByteSource* src, bool has_freq, bool has_prx,
+                         uint64_t* prev_last, WindowMeta* m) {
+  uint64_t ldd = 0, doc_count = 0;
   SNII_RETURN_IF_ERROR(src->get_varint64(&ldd));
-  uint64_t doc_count = 0, frq_off = 0, frq_len = 0, frq_docs_len = 0, max_freq = 0;
   SNII_RETURN_IF_ERROR(src->get_varint64(&doc_count));
-  SNII_RETURN_IF_ERROR(src->get_varint64(&frq_off));
-  SNII_RETURN_IF_ERROR(src->get_varint64(&frq_len));
-  SNII_RETURN_IF_ERROR(src->get_varint64(&frq_docs_len));
-  if (frq_docs_len > frq_len) {
-    return Status::Corruption("frq_prelude: frq_docs_len exceeds frq_len");
+  uint8_t mode = 0;
+  SNII_RETURN_IF_ERROR(src->get_u8(&mode));
+  SNII_RETURN_IF_ERROR(check_win_mode(mode, has_freq));
+  m->dd_zstd = (mode & frq_win_mode::kDdZstd) != 0;
+  m->freq_zstd = has_freq && (mode & frq_win_mode::kFreqZstd) != 0;
+  SNII_RETURN_IF_ERROR(src->get_varint64(&m->dd_off));
+  SNII_RETURN_IF_ERROR(src->get_varint64(&m->dd_disk_len));
+  SNII_RETURN_IF_ERROR(src->get_varint64(&m->dd_uncomp_len));
+  SNII_RETURN_IF_ERROR(src->get_fixed32(&m->crc_dd));
+  if (has_freq) {
+    SNII_RETURN_IF_ERROR(src->get_varint64(&m->freq_off));
+    SNII_RETURN_IF_ERROR(src->get_varint64(&m->freq_disk_len));
+    SNII_RETURN_IF_ERROR(src->get_varint64(&m->freq_uncomp_len));
+    SNII_RETURN_IF_ERROR(src->get_fixed32(&m->crc_freq));
   }
   if (has_prx) {
     SNII_RETURN_IF_ERROR(src->get_varint64(&m->prx_off));
     SNII_RETURN_IF_ERROR(src->get_varint64(&m->prx_len));
   }
+  uint64_t max_freq = 0;
   SNII_RETURN_IF_ERROR(src->get_varint64(&max_freq));
   SNII_RETURN_IF_ERROR(src->get_u8(&m->max_norm));
-  SNII_RETURN_IF_ERROR(src->get_fixed32(&m->win_crc));
   m->win_base = *prev_last;
   m->last_docid = static_cast<uint32_t>(*prev_last + ldd);
   m->doc_count = static_cast<uint32_t>(doc_count);
-  m->frq_off = frq_off;
-  m->frq_len = frq_len;
-  m->frq_docs_len = frq_docs_len;
   m->max_freq = static_cast<uint32_t>(max_freq);
   *prev_last = m->last_docid;
   return Status::OK();
@@ -251,7 +282,7 @@ Status decode_one_block(Slice block, const Header& h, uint64_t sb_last_docid,
   ByteSource src(block);
   for (size_t i = 0; i < row_count; ++i) {
     WindowMeta m;
-    SNII_RETURN_IF_ERROR(decode_window_row(&src, h.has_prx, prev_last, &m));
+    SNII_RETURN_IF_ERROR(decode_window_row(&src, h.has_freq, h.has_prx, prev_last, &m));
     windows->push_back(m);
   }
   if (!src.eof()) {
@@ -290,6 +321,39 @@ Status decode_all_blocks(Slice window_region, const Header& h,
   return Status::OK();
 }
 
+// Validates the dd/freq region locators tile the dd-block / freq-block contiguously
+// (each region starts where the previous one ended) and returns the block lengths.
+// Contiguity makes the docs-only prefix one solid run and bounds the read range.
+Status validate_region_layout(const Header& h, const std::vector<WindowMeta>& windows,
+                              uint64_t* dd_block_len, uint64_t* freq_block_len) {
+  uint64_t dd_expect = 0;
+  uint64_t freq_expect = 0;
+  for (const WindowMeta& m : windows) {
+    if (m.dd_off != dd_expect) {
+      return Status::Corruption("frq_prelude: dd region not contiguous");
+    }
+    if (m.dd_disk_len > m.dd_uncomp_len && !m.dd_zstd) {
+      return Status::Corruption("frq_prelude: raw dd region length inconsistent");
+    }
+    if (dd_expect + m.dd_disk_len < dd_expect) {
+      return Status::Corruption("frq_prelude: dd block length overflow");
+    }
+    dd_expect += m.dd_disk_len;
+    if (h.has_freq) {
+      if (m.freq_off != freq_expect) {
+        return Status::Corruption("frq_prelude: freq region not contiguous");
+      }
+      if (freq_expect + m.freq_disk_len < freq_expect) {
+        return Status::Corruption("frq_prelude: freq block length overflow");
+      }
+      freq_expect += m.freq_disk_len;
+    }
+  }
+  *dd_block_len = dd_expect;
+  *freq_block_len = freq_expect;
+  return Status::OK();
+}
+
 }  // namespace
 
 Status FrqPreludeReader::open(Slice prelude, FrqPreludeReader* out) {
@@ -322,7 +386,9 @@ Status FrqPreludeReader::open(Slice prelude, FrqPreludeReader* out) {
   out->sb_last_docid_.clear();
   out->sb_last_docid_.reserve(rows.size());
   for (const SbDirRow& r : rows) out->sb_last_docid_.push_back(r.last_docid);
-  return decode_all_blocks(window_region, h, rows, &out->windows_);
+  SNII_RETURN_IF_ERROR(decode_all_blocks(window_region, h, rows, &out->windows_));
+  return validate_region_layout(h, out->windows_, &out->dd_block_len_,
+                                &out->freq_block_len_);
 }
 
 Status FrqPreludeReader::window(uint32_t w, WindowMeta* out) const {

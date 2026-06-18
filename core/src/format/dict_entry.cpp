@@ -51,13 +51,32 @@ void write_stats(const DictEntry& e, IndexTier tier, ByteSink* sink) {
   sink->put_varint64(e.max_freq);
 }
 
+// Per-window codec mode byte shared by slim/inline single-window regions.
+uint8_t pack_win_mode(const DictEntry& e) {
+  uint8_t mode = 0;
+  if (e.dd_meta.zstd) mode |= 1u << 0;   // dd_zstd
+  if (e.freq_meta.zstd) mode |= 1u << 1; // freq_zstd
+  return mode;
+}
+
+// Writes the slim/inline region codec metadata (dd always; freq when tier>=T2).
+void write_region_meta(const DictEntry& e, IndexTier tier, ByteSink* sink) {
+  sink->put_u8(pack_win_mode(e));
+  sink->put_varint64(e.dd_meta.uncomp_len);
+  sink->put_fixed32(e.dd_meta.crc);
+  if (!tier_has_stats(tier)) return;
+  sink->put_varint64(e.freq_meta.uncomp_len);
+  sink->put_fixed32(e.freq_meta.crc);
+}
+
 void write_pod_ref(const DictEntry& e, IndexTier tier, ByteSink* sink) {
   sink->put_varint64(e.frq_off_delta);
   sink->put_varint64(e.frq_len);
   if (e.enc == DictEntryEnc::kWindowed) {
     sink->put_varint64(e.prelude_len);
   } else {
-    sink->put_varint64(e.frq_docs_len);  // slim pod_ref: docs-only prefix length
+    sink->put_varint64(e.frq_docs_len);  // slim pod_ref: dd region on-disk length
+    write_region_meta(e, tier, sink);
   }
   if (!tier_has_stats(tier)) return;
   sink->put_varint64(e.prx_off_delta);
@@ -67,6 +86,8 @@ void write_pod_ref(const DictEntry& e, IndexTier tier, ByteSink* sink) {
 void write_inline(const DictEntry& e, IndexTier tier, ByteSink* sink) {
   sink->put_varint64(static_cast<uint64_t>(e.frq_bytes.size()));
   sink->put_bytes(Slice(e.frq_bytes));
+  sink->put_varint64(e.inline_dd_disk_len);
+  write_region_meta(e, tier, sink);
   if (!tier_has_stats(tier)) return;
   sink->put_varint64(static_cast<uint64_t>(e.prx_bytes.size()));
   sink->put_bytes(Slice(e.prx_bytes));
@@ -108,6 +129,32 @@ Status read_stats(ByteSource* src, IndexTier tier, DictEntry* out) {
   return Status::OK();
 }
 
+// Reads the slim/inline region codec metadata (mode/uncomp/crc) and fills the
+// dd/freq region disk_len from the supplied total/split lengths.
+Status read_region_meta(ByteSource* src, IndexTier tier, uint64_t dd_disk_len,
+                        uint64_t freq_disk_len, DictEntry* out) {
+  uint8_t mode = 0;
+  SNII_RETURN_IF_ERROR(src->get_u8(&mode));
+  if ((mode & ~0x3u) != 0) {
+    return Status::Corruption("dict_entry: unknown win_mode bits");
+  }
+  out->dd_meta.zstd = (mode & (1u << 0)) != 0;
+  out->dd_meta.disk_len = dd_disk_len;
+  SNII_RETURN_IF_ERROR(src->get_varint64(&out->dd_meta.uncomp_len));
+  SNII_RETURN_IF_ERROR(src->get_fixed32(&out->dd_meta.crc));
+  if (!tier_has_stats(tier)) {
+    if (mode & (1u << 1)) {
+      return Status::Corruption("dict_entry: freq mode set without freq tier");
+    }
+    return Status::OK();
+  }
+  out->freq_meta.zstd = (mode & (1u << 1)) != 0;
+  out->freq_meta.disk_len = freq_disk_len;
+  SNII_RETURN_IF_ERROR(src->get_varint64(&out->freq_meta.uncomp_len));
+  SNII_RETURN_IF_ERROR(src->get_fixed32(&out->freq_meta.crc));
+  return Status::OK();
+}
+
 Status read_pod_ref(ByteSource* src, IndexTier tier, DictEntry* out) {
   SNII_RETURN_IF_ERROR(src->get_varint64(&out->frq_off_delta));
   SNII_RETURN_IF_ERROR(src->get_varint64(&out->frq_len));
@@ -118,6 +165,8 @@ Status read_pod_ref(ByteSource* src, IndexTier tier, DictEntry* out) {
     if (out->frq_docs_len > out->frq_len) {
       return Status::Corruption("dict_entry: frq_docs_len exceeds frq_len");
     }
+    SNII_RETURN_IF_ERROR(read_region_meta(src, tier, out->frq_docs_len,
+                                          out->frq_len - out->frq_docs_len, out));
   }
   if (!tier_has_stats(tier)) return Status::OK();
   SNII_RETURN_IF_ERROR(src->get_varint64(&out->prx_off_delta));
@@ -136,6 +185,14 @@ Status read_byte_blob(ByteSource* src, std::vector<uint8_t>* out) {
 
 Status read_inline(ByteSource* src, IndexTier tier, DictEntry* out) {
   SNII_RETURN_IF_ERROR(read_byte_blob(src, &out->frq_bytes));
+  SNII_RETURN_IF_ERROR(src->get_varint64(&out->inline_dd_disk_len));
+  if (out->inline_dd_disk_len > out->frq_bytes.size()) {
+    return Status::Corruption("dict_entry: inline_dd_disk_len exceeds frq_bytes");
+  }
+  const uint64_t freq_disk_len =
+      static_cast<uint64_t>(out->frq_bytes.size()) - out->inline_dd_disk_len;
+  SNII_RETURN_IF_ERROR(
+      read_region_meta(src, tier, out->inline_dd_disk_len, freq_disk_len, out));
   if (!tier_has_stats(tier)) return Status::OK();
   SNII_RETURN_IF_ERROR(read_byte_blob(src, &out->prx_bytes));
   return Status::OK();

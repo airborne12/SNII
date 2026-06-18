@@ -183,12 +183,12 @@ void WriteCorpus(const Corpus& c, const std::string& path) {
   ASSERT_TRUE(cw.finish().ok());
 }
 
-// Per-window byte totals of a windowed term, summed across all its windows:
-// full = sum(frq_len) (pre-PhaseB full-window path); docs = sum(frq_docs_len)
-// (PhaseB docid-only / phrase path). Also returns prelude_len and window count.
+// Grouped-block byte totals of a windowed term (design 1.6): docs = dd-block
+// length (sum of per-window dd_disk_len); full = dd-block + freq-block lengths
+// (what scoring reads). Also returns prelude_len and window count.
 struct FrqByteTotals {
-  uint64_t full = 0;        // sum of per-window frq_len
-  uint64_t docs = 0;        // sum of per-window frq_docs_len
+  uint64_t full = 0;        // dd-block + freq-block on-disk bytes
+  uint64_t docs = 0;        // dd-block on-disk bytes (the contiguous docs-only run)
   uint64_t prelude_len = 0;
   uint32_t windows = 0;
 };
@@ -205,12 +205,8 @@ FrqByteTotals MeasureFrqTotals(const LogicalIndexReader& idx, const std::string&
   FrqPreludeReader prelude;
   EXPECT_TRUE(fetch_windowed_prelude(idx, entry, frq_base, &prelude).ok());
   t.windows = prelude.n_windows();
-  for (uint32_t w = 0; w < t.windows; ++w) {
-    WindowMeta m;
-    EXPECT_TRUE(prelude.window(w, &m).ok());
-    t.full += m.frq_len;
-    t.docs += m.frq_docs_len;
-  }
+  t.docs = prelude.dd_block_len();
+  t.full = prelude.dd_block_len() + prelude.freq_block_len();
   return t;
 }
 

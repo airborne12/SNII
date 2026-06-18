@@ -70,9 +70,12 @@ TEST(SampledTermIndex, LocateBetweenReturnsLowerOrdinal) {
   EXPECT_TRUE(maybe_present);
   EXPECT_EQ(ord, 0u);
 
-  // "zzz" > "omega"(3) is outside [min,max] (> max_term) → out of range.
+  // "zzz" > "omega"(3, the LAST block's first term) routes to the last block: the
+  // last block can hold terms greater than its first term, so locate must return a
+  // candidate (find_term then confirms). This is a router, not an exact set.
   ASSERT_TRUE(reader.locate("zzz", &maybe_present, &ord).ok());
-  EXPECT_FALSE(maybe_present);
+  EXPECT_TRUE(maybe_present);
+  EXPECT_EQ(ord, 3u);
 }
 
 // target < min_term → maybe_present=false (not-present signal).
@@ -87,16 +90,20 @@ TEST(SampledTermIndex, LocateBelowMinIsOutOfRange) {
   EXPECT_FALSE(maybe_present);
 }
 
-// target > max_term → maybe_present=false.
-TEST(SampledTermIndex, LocateAboveMaxIsOutOfRange) {
+// target > the last block's first term routes to the LAST block (that block may
+// contain terms greater than its first term; find_term confirms presence). The
+// router must NOT reject such a target, or present tail-of-last-block terms would
+// be falsely reported absent.
+TEST(SampledTermIndex, LocateAboveLastFirstTermRoutesToLastBlock) {
   const std::vector<std::string> terms = {"banana", "cherry", "mango"};
   auto bytes = BuildIndex(terms);
   auto reader = OpenOrDie(bytes);
 
-  bool maybe_present = true;
+  bool maybe_present = false;
   uint32_t ord = 0;
   ASSERT_TRUE(reader.locate("zebra", &maybe_present, &ord).ok());
-  EXPECT_FALSE(maybe_present);
+  EXPECT_TRUE(maybe_present);
+  EXPECT_EQ(ord, 2u);
 }
 
 // target == min_term / == max_term boundary cases should both hit and be in-range.
@@ -129,11 +136,13 @@ TEST(SampledTermIndex, SingleBlock) {
   EXPECT_TRUE(maybe_present);
   EXPECT_EQ(ord, 0u);
 
-  // "solz" > "solo" → out of range (> max_term).
+  // "solz" > "solo" routes to the single (last) block: that block may hold terms
+  // greater than its first term, so locate returns block 0 (find_term confirms).
   ASSERT_TRUE(reader.locate("solz", &maybe_present, &ord).ok());
-  EXPECT_FALSE(maybe_present);
+  EXPECT_TRUE(maybe_present);
+  EXPECT_EQ(ord, 0u);
 
-  // "sola" < "solo" → out of range (< min_term).
+  // "sola" < "solo" → before the first block, so it cannot exist (out of range).
   ASSERT_TRUE(reader.locate("sola", &maybe_present, &ord).ok());
   EXPECT_FALSE(maybe_present);
 }

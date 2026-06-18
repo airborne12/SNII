@@ -3,73 +3,72 @@
 #include <cstdint>
 #include <vector>
 
+#include "snii/common/slice.h"
 #include "snii/common/status.h"
 #include "snii/encoding/byte_sink.h"
-#include "snii/encoding/byte_source.h"
 
-// .frq window (FrqPod): doc/freq postings data, columnar + PFOR (see docs/design SNII "frq design").
+// .frq region codec (FrqPod): doc-delta (dd) and freq postings, columnar + PFOR
+// (see docs/design SNII "frq design" and the read-byte-optimizations design 1.6).
 //
-// A window contains n ascending docs (base unit=256, combinable as 256/512/1024/2048). win_base is provided by the caller:
-// first window=0, non-first window=last docid of the previous window. dd[0]=first_docid-win_base; dd[i]=docid[i]-docid[i-1].
+// PHASE D (posting-level dd/freq grouping): windows are NO LONGER self-describing.
+// A windowed .frq payload is laid out as
+//   [prelude][dd-block][freq-block]
+// where the dd-block concatenates every window's dd_region and the freq-block
+// concatenates every window's freq_region. Each region is independently encoded
+// (raw or zstd, chosen by size) and the per-window codec metadata (mode, lengths,
+// crc, offsets) is hoisted into the frq_prelude rows -- the region bytes carry NO
+// header. This makes the docs-only prefix ([prelude][dd-block]) ONE contiguous
+// run a docid-only / phrase reader can fetch in a single range, skipping the
+// freq-block entirely.
 //
-// SEPARABLE on-disk byte layout (dd region and freq region are independently
-// encoded so a docs-only reader can fetch + decode just the dd prefix):
-//   u8   flags         # bit0 dd_zstd, bit1 has_freq, bit2 freq_zstd
-//   VInt dd_uncomp_len # dd region uncompressed byte count (written for raw too)
-//   VInt dd_disk_len   # dd region on-disk byte count (== dd_uncomp_len when raw)
-//   [VInt freq_uncomp_len   # present only when has_freq]
-//   [VInt freq_disk_len     # present only when has_freq]
-//   u32  crc_dd        # covers [flags .. dd_region] (header bytes + dd region)
-//   bytes dd_region    # raw or zstd of dd_part
-//   [u32  crc_freq     # present only when has_freq; covers freq_region]
-//   [bytes freq_region # present only when has_freq; raw or zstd of freq_part]
-//
-// dd_part   = VInt n ++ PFOR_runs(doc_delta)   # n is the doc count, making the window self-describing
-// freq_part = PFOR_runs(freq)                  # present only when has_freq=true
-// PFOR runs are segmented at 256 docs (kFrqBaseUnit); a partial segment writes the remainder.
-//
-// frq_docs_len = byte length of the docs-only prefix [flags .. crc_dd .. dd_region].
-// This prefix is an independently fetchable + decodable slice (read_frq_window_docs
-// works given only these bytes, with the freq region absent). The full window
-// length is frq_docs_len + [crc_freq + freq_region] when has_freq.
-//
-// Multi-byte fixed-width fields are little-endian; variable-length integers reuse snii/encoding/varint; PFOR reuses snii/encoding/pfor.
-// Each region carries its own crc32c; corruption in either region is detectable.
+// dd_region plaintext   = VInt n ++ PFOR_runs(doc_delta)   # n = doc count
+//   dd[0] = first_docid - win_base; dd[i] = docid[i] - docid[i-1]; win_base is the
+//   previous window's last docid (first window = 0).
+// freq_region plaintext = PFOR_runs(freq)                  # present iff has_freq
+// PFOR runs are segmented at 256 docs (kFrqBaseUnit); a partial segment writes the
+// remainder. Variable-length integers reuse snii/encoding/varint; PFOR reuses
+// snii/encoding/pfor; crc32c covers each region's ON-DISK bytes.
 namespace snii::format {
 
-// Result of build_frq_window: the docs-only prefix length so the writer can
-// record it (prelude row / slim DictEntry) for later wire-level freq-skipping.
-struct FrqWindowLayout {
-  uint64_t frq_docs_len = 0;  // [flags .. crc_dd .. dd_region] byte length
-  uint64_t frq_len = 0;       // full window byte length (prefix + freq region)
+// Codec metadata for ONE encoded region (dd or freq), hoisted into the prelude.
+// The region's on-disk bytes are pure payload (no header); these fields drive the
+// decode. crc covers the on-disk (disk_len) bytes.
+struct FrqRegionMeta {
+  bool zstd = false;        // true => disk bytes are zstd(plaintext); false => raw
+  uint64_t uncomp_len = 0;  // plaintext byte length (== disk_len when raw)
+  uint64_t disk_len = 0;    // on-disk byte length of this region
+  uint32_t crc = 0;         // crc32c of the on-disk (disk_len) bytes
 };
 
-// Build a .frq window and append it to sink.
-// docids_ascending: ascending docids within this window (single doc or empty window allowed).
-// freqs: must have the same length as docids when has_freq=true; ignored when has_freq=false (pass empty).
-// win_base: base docid (first window=0, non-first window=last docid of the previous window); requires docids[0] >= win_base.
-// zstd_level_or_neg_for_auto:
-//   <0  → auto: use ZSTD (default level) when a region is large enough, otherwise raw (decided per region).
-//   0   → force raw (no compression).
-//   >0  → force ZSTD at the given level.
-// out_layout (optional): receives the docs-only prefix length and full length.
-// Non-ascending docids / freq length mismatch / first_docid < win_base / null sink returns InvalidArgument.
-Status build_frq_window(const std::vector<uint32_t>& docids_ascending,
-                        const std::vector<uint32_t>& freqs, uint64_t win_base, bool has_freq,
-                        int zstd_level_or_neg_for_auto, ByteSink* sink,
-                        FrqWindowLayout* out_layout = nullptr);
+// Encodes a window's dd_region plaintext (VInt n ++ PFOR_runs(doc_delta)) into raw
+// or zstd (per zstd_level_or_neg_for_auto), APPENDS the on-disk bytes to out, and
+// fills meta (mode/uncomp_len/disk_len/crc). The region carries no header.
+// docids_ascending: ascending docids in this window (single doc or empty allowed).
+// win_base: previous window's last docid (first window = 0); requires docids[0] >= win_base.
+// zstd_level_or_neg_for_auto: <0 auto (zstd when large enough, else raw); 0 force
+//   raw; >0 force zstd at that level.
+// Non-ascending docids / first_docid < win_base / null out returns InvalidArgument.
+Status build_dd_region(const std::vector<uint32_t>& docids_ascending, uint64_t win_base,
+                       int zstd_level_or_neg_for_auto, ByteSink* out, FrqRegionMeta* meta);
 
-// docs-only path: decode ONLY the dd region to reconstruct docids, verifying
-// crc_dd. Works even when the freq region bytes are absent from the slice (i.e.
-// given only the docs-only prefix [flags .. crc_dd .. dd_region]).
-// crc mismatch / invalid flags / truncation / decompression failure all return a non-OK Status.
-Status read_frq_window_docs(ByteSource* source, uint64_t win_base,
-                            std::vector<uint32_t>* docids);
+// Encodes a window's freq_region plaintext (PFOR_runs(freq)) into raw or zstd,
+// APPENDS the on-disk bytes to out, and fills meta. Empty freqs yields a zero-length
+// region. Null out returns InvalidArgument.
+Status build_freq_region(const std::vector<uint32_t>& freqs,
+                         int zstd_level_or_neg_for_auto, ByteSink* out, FrqRegionMeta* meta);
 
-// scoring path: decode both docids and freqs, verifying both crc_dd and crc_freq.
-// freqs decoded from a has_freq=false window will be empty.
-// crc mismatch / invalid flags / truncation / decompression failure all return a non-OK Status.
-Status read_frq_window(ByteSource* source, uint64_t win_base, std::vector<uint32_t>* docids,
-                       std::vector<uint32_t>* freqs);
+// Decodes a dd_region from its on-disk slice (exactly disk_len bytes) + meta +
+// win_base, reconstructing ascending docids. Verifies meta.crc against the slice.
+// crc mismatch / wrong slice length / truncation / decompression / oversized count
+// all return a non-OK Status. The freq region is irrelevant here (docs-only path).
+Status decode_dd_region(Slice dd_disk, const FrqRegionMeta& meta, uint64_t win_base,
+                        std::vector<uint32_t>* docids);
+
+// Decodes a freq_region from its on-disk slice (exactly disk_len bytes) + meta,
+// producing doc_count freqs. Verifies meta.crc. doc_count == 0 yields empty freqs
+// (and requires a zero-length region). crc mismatch / wrong slice length / etc.
+// return a non-OK Status.
+Status decode_freq_region(Slice freq_disk, const FrqRegionMeta& meta, size_t doc_count,
+                          std::vector<uint32_t>* freqs);
 
 }  // namespace snii::format

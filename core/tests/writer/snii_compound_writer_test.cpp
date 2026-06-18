@@ -74,6 +74,16 @@ TermPostings MakeTerm(const std::string& term, const std::vector<uint32_t>& doci
   return tp;
 }
 
+// Builds a FrqRegionMeta for a window's dd region from its WindowMeta.
+FrqRegionMeta DdMetaOf(const WindowMeta& m) {
+  FrqRegionMeta r;
+  r.zstd = m.dd_zstd;
+  r.uncomp_len = m.dd_uncomp_len;
+  r.disk_len = m.dd_disk_len;
+  r.crc = m.crc_dd;
+  return r;
+}
+
 // Index 0: ~30 docs. Vocab includes a HIGH-df term (df=600 > 512 -> windowed)
 // and several LOW-df terms (-> slim/inline). Terms must be lexicographically
 // sorted.
@@ -232,23 +242,22 @@ TEST(SniiCompoundWriter, ReadBackSelfValidation) {
     ASSERT_TRUE(DictBlockReader::open(block, IndexTier::kT2, true, &br).ok());
 
     // Absolute .frq offset = frq_pod.offset + frq_base + frq_off_delta. The
-    // windowed payload is [prelude][win0 frq][win1 frq]...; parse the two-level
-    // prelude, then tile every window (each decoded with its prelude win_base)
-    // to reconstruct the full posting.
+    // windowed payload is [prelude][dd-block][freq-block]; parse the two-level
+    // prelude, then decode every window's dd region from the dd-block (each with
+    // its prelude win_base) to reconstruct the full posting (docs-only path).
     uint64_t frq_abs = refs.frq_pod.offset + br.frq_base() + common_entry.frq_off_delta;
     Slice prelude_bytes(file.data() + frq_abs, common_entry.prelude_len);
     FrqPreludeReader prelude;
     ASSERT_TRUE(FrqPreludeReader::open(prelude_bytes, &prelude).ok());
-    const uint64_t window_start = frq_abs + common_entry.prelude_len;
+    const uint64_t dd_block_start = frq_abs + common_entry.prelude_len;
     std::vector<uint32_t> got_docs;
     uint32_t summed = 0;
     for (uint32_t w = 0; w < prelude.n_windows(); ++w) {
       WindowMeta m;
       ASSERT_TRUE(prelude.window(w, &m).ok());
-      Slice win(file.data() + window_start + m.frq_off, m.frq_len);
-      ByteSource fsrc(win);
+      Slice dd(file.data() + dd_block_start + m.dd_off, m.dd_disk_len);
       std::vector<uint32_t> wdocs;
-      ASSERT_TRUE(read_frq_window_docs(&fsrc, m.win_base, &wdocs).ok());
+      ASSERT_TRUE(decode_dd_region(dd, DdMetaOf(m), m.win_base, &wdocs).ok());
       ASSERT_EQ(wdocs.size(), m.doc_count);
       summed += m.doc_count;
       got_docs.insert(got_docs.end(), wdocs.begin(), wdocs.end());
@@ -265,9 +274,10 @@ TEST(SniiCompoundWriter, ReadBackSelfValidation) {
     ASSERT_TRUE(found_apple);
     EXPECT_EQ(apple_entry.df, 4u);
     EXPECT_EQ(apple_entry.kind, DictEntryKind::kInline);
-    ByteSource asrc(Slice(apple_entry.frq_bytes));
+    Slice apple_dd(apple_entry.frq_bytes.data(),
+                   static_cast<size_t>(apple_entry.dd_meta.disk_len));
     std::vector<uint32_t> apple_docs;
-    ASSERT_TRUE(read_frq_window_docs(&asrc, 0, &apple_docs).ok());
+    ASSERT_TRUE(decode_dd_region(apple_dd, apple_entry.dd_meta, 0, &apple_docs).ok());
     std::vector<uint32_t> expected_apple = {0, 5, 12, 20};
     EXPECT_EQ(apple_docs, expected_apple);
 
@@ -387,9 +397,9 @@ TEST(SniiCompoundWriter, MultiSuperBlockReadBack) {
   ASSERT_TRUE(FrqPreludeReader::open(Slice(prelude_bytes), &prelude).ok());
   EXPECT_GT(prelude.n_super_blocks(), 1u) << "expected >1 super-block";
 
-  // (a)+(b): tile every window via the prelude; doc_counts sum to df and the
-  // concatenated docids equal the full ascending posting [0, doc_count).
-  const uint64_t window_start = prelude_abs + hot.prelude_len;
+  // (a)+(b): decode every window's dd region from the dd-block; doc_counts sum to
+  // df and the concatenated docids equal the full ascending posting [0, doc_count).
+  const uint64_t dd_block_start = prelude_abs + hot.prelude_len;
   std::vector<uint32_t> tiled;
   uint64_t summed = 0;
   uint64_t expect_win_base = 0;
@@ -397,12 +407,10 @@ TEST(SniiCompoundWriter, MultiSuperBlockReadBack) {
     WindowMeta m;
     ASSERT_TRUE(prelude.window(w, &m).ok());
     EXPECT_EQ(m.win_base, expect_win_base) << "win_base w=" << w;
-    std::vector<uint8_t> wbytes;
-    ASSERT_TRUE(local.read_at(window_start + m.frq_off, m.frq_len, &wbytes).ok());
-    Slice wslice(wbytes);
-    ByteSource fsrc(wslice);
+    std::vector<uint8_t> ddbytes;
+    ASSERT_TRUE(local.read_at(dd_block_start + m.dd_off, m.dd_disk_len, &ddbytes).ok());
     std::vector<uint32_t> wdocs;
-    ASSERT_TRUE(read_frq_window_docs(&fsrc, m.win_base, &wdocs).ok());
+    ASSERT_TRUE(decode_dd_region(Slice(ddbytes), DdMetaOf(m), m.win_base, &wdocs).ok());
     ASSERT_EQ(wdocs.size(), m.doc_count) << "w=" << w;
     summed += m.doc_count;
     expect_win_base = m.last_docid;
