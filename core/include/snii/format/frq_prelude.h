@@ -42,6 +42,11 @@
 //                              #   the .frq region, relative to window_start
 //                              #   (window_start = entry.frq_off + prelude_len)
 //       VInt frq_len           # byte length of the window .frq payload
+//       VInt frq_docs_len      # byte length of the window's docs-only prefix
+//                              #   ([flags..crc_dd..dd_region]); a docs-only
+//                              #   reader fetches [frq_off, frq_off+frq_docs_len)
+//                              #   and decodes docids without the freq region.
+//                              #   frq_docs_len <= frq_len.
 //       VInt prx_off           # .prx payload byte offset (present iff has_prx)
 //       VInt prx_len           # .prx payload byte length (present iff has_prx)
 //       VInt max_freq          # window max term frequency (WAND block-max)
@@ -78,6 +83,7 @@ struct WindowMeta {
   uint32_t doc_count = 0;
   uint64_t frq_off = 0;  // relative to window_start (= entry.frq_off + prelude_len)
   uint64_t frq_len = 0;
+  uint64_t frq_docs_len = 0;  // docs-only prefix byte length (<= frq_len)
   uint64_t prx_off = 0;  // valid only when has_prx
   uint64_t prx_len = 0;  // valid only when has_prx
   uint32_t max_freq = 0;

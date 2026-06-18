@@ -25,6 +25,10 @@
 //   locator:
 //     pod_ref: frq_off_delta varint, frq_len varint,
 //              [prelude_len varint when enc=windowed],
+//              [frq_docs_len varint when enc=slim] # docs-only prefix of the
+//                  single slim window; lets a docid-only reader fetch only
+//                  [frq_off, frq_off+frq_docs_len). Windowed entries carry the
+//                  per-window frq_docs_len in the prelude instead.
 //              [prx_off_delta varint, prx_len varint when tier>=T2]
 //     inline:  frq_len varint, frq_bytes u8[],
 //              [prx_len varint, prx_bytes u8[] when tier>=T2]
@@ -54,8 +58,9 @@ struct DictEntry {
   // pod_ref locator.
   uint64_t frq_off_delta = 0;
   uint64_t frq_len = 0;
-  uint64_t prelude_len = 0;   // only when enc=windowed
-  uint64_t prx_off_delta = 0; // only when tier>=T2
+  uint64_t prelude_len = 0;     // only when enc=windowed
+  uint64_t frq_docs_len = 0;    // only when enc=slim pod_ref: docs-only prefix length
+  uint64_t prx_off_delta = 0;   // only when tier>=T2
   uint64_t prx_len = 0;       // only when tier>=T2
 
   // inline payload.

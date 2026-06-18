@@ -50,6 +50,7 @@ void encode_window_row(const WindowMeta& m, bool has_prx, uint64_t prev_last,
   block->put_varint64(m.doc_count);
   block->put_varint64(m.frq_off);
   block->put_varint64(m.frq_len);
+  block->put_varint64(m.frq_docs_len);
   if (has_prx) {
     block->put_varint64(m.prx_off);
     block->put_varint64(m.prx_len);
@@ -216,10 +217,14 @@ Status decode_window_row(ByteSource* src, bool has_prx, uint64_t* prev_last,
                          WindowMeta* m) {
   uint64_t ldd = 0;
   SNII_RETURN_IF_ERROR(src->get_varint64(&ldd));
-  uint64_t doc_count = 0, frq_off = 0, frq_len = 0, max_freq = 0;
+  uint64_t doc_count = 0, frq_off = 0, frq_len = 0, frq_docs_len = 0, max_freq = 0;
   SNII_RETURN_IF_ERROR(src->get_varint64(&doc_count));
   SNII_RETURN_IF_ERROR(src->get_varint64(&frq_off));
   SNII_RETURN_IF_ERROR(src->get_varint64(&frq_len));
+  SNII_RETURN_IF_ERROR(src->get_varint64(&frq_docs_len));
+  if (frq_docs_len > frq_len) {
+    return Status::Corruption("frq_prelude: frq_docs_len exceeds frq_len");
+  }
   if (has_prx) {
     SNII_RETURN_IF_ERROR(src->get_varint64(&m->prx_off));
     SNII_RETURN_IF_ERROR(src->get_varint64(&m->prx_len));
@@ -232,6 +237,7 @@ Status decode_window_row(ByteSource* src, bool has_prx, uint64_t* prev_last,
   m->doc_count = static_cast<uint32_t>(doc_count);
   m->frq_off = frq_off;
   m->frq_len = frq_len;
+  m->frq_docs_len = frq_docs_len;
   m->max_freq = static_cast<uint32_t>(max_freq);
   *prev_last = m->last_docid;
   return Status::OK();

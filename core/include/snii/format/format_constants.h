@@ -65,9 +65,6 @@ inline constexpr uint8_t kOffsetsRef = 1u << 4;   // v1 always 0
 enum class DictEntryKind : uint8_t { kPodRef = 0, kInline = 1 };
 enum class DictEntryEnc : uint8_t { kSlim = 0, kWindowed = 1 };
 
-// ---- .frq window compression mode ----
-enum class FrqWinMode : uint8_t { kRaw = 0, kZstd = 1 };
-
 // ---- .prx window codec (codec byte bit0-5) ----
 enum class PrxCodec : uint8_t { kRaw = 0, kZstd = 1 /* bit7 cont-reserved */ };
 
@@ -75,6 +72,13 @@ enum class PrxCodec : uint8_t { kRaw = 0, kZstd = 1 /* bit7 cont-reserved */ };
 inline constexpr uint32_t kFrqBaseUnit = 256;             // window base unit
 inline constexpr uint32_t kSlimDfThreshold = 512;         // df < this → slim
 inline constexpr uint32_t kDefaultInlineThreshold = 256;  // slim encoded bytes ≤ this → inline
+// Adaptive window sizing (design #4): high-df windowed terms use larger windows
+// to cut prelude rows + per-window header/crc overhead. Windows remain a whole
+// multiple of kFrqBaseUnit so .prx alignment and win_base/last_docid semantics
+// are preserved. A term whose df >= kAdaptiveWindowDfThreshold splits into
+// kAdaptiveWindowDocs-sized windows instead of kFrqBaseUnit-sized ones.
+inline constexpr uint32_t kAdaptiveWindowDfThreshold = 8192;  // df >= this -> larger windows
+inline constexpr uint32_t kAdaptiveWindowDocs = 1024;         // larger window size (4 * base unit)
 inline constexpr uint32_t kDefaultTargetDictBlockBytes = 64 * 1024;
 inline constexpr uint32_t kXFilterL0MaxBytes = 256 * 1024;       // ≤ this size is resident in L0
 inline constexpr uint32_t kXFilterMaxTermCount = 32u * 1024 * 1024;  // > this count may omit XF

@@ -28,6 +28,7 @@ DictEntry MakePodRefSlim(std::string term, uint32_t df) {
   e.max_freq = 7;             // written only when tier>=T2
   e.frq_off_delta = 4096;
   e.frq_len = 333;
+  e.frq_docs_len = 200;       // slim pod_ref: docs-only prefix (<= frq_len)
   e.prx_off_delta = 8192;     // written only when positions are stored
   e.prx_len = 512;            // written only when positions are stored
   return e;
@@ -82,6 +83,7 @@ TEST(DictEntry, PodRefSlimTier1RoundTrip) {
   ExpectCommon(in, out);
   EXPECT_EQ(out.frq_off_delta, in.frq_off_delta);
   EXPECT_EQ(out.frq_len, in.frq_len);
+  EXPECT_EQ(out.frq_docs_len, in.frq_docs_len);  // slim docs-only prefix preserved
   // tier1: ttf/max_freq/prx are not written; decode restores them to default 0.
   EXPECT_EQ(out.ttf_delta, 0u);
   EXPECT_EQ(out.max_freq, 0u);
@@ -92,10 +94,23 @@ TEST(DictEntry, PodRefSlimTier2RoundTrip) {
   DictEntry in = MakePodRefSlim("banana", 100);
   DictEntry out = RoundTrip(in, "", IndexTier::kT2);
   ExpectCommon(in, out);
+  EXPECT_EQ(out.frq_docs_len, in.frq_docs_len);
   EXPECT_EQ(out.ttf_delta, in.ttf_delta);
   EXPECT_EQ(out.max_freq, in.max_freq);
   EXPECT_EQ(out.prx_off_delta, in.prx_off_delta);
   EXPECT_EQ(out.prx_len, in.prx_len);
+}
+
+// A slim pod_ref whose frq_docs_len exceeds frq_len is rejected on decode.
+TEST(DictEntry, PodRefSlimFrqDocsLenExceedsFrqLenRejected) {
+  DictEntry in = MakePodRefSlim("kiwi", 50);
+  in.frq_docs_len = in.frq_len + 1;  // impossible prefix
+  ByteSink sink;
+  ASSERT_TRUE(encode_dict_entry(in, "", IndexTier::kT2, &sink).ok());
+  ByteSource src(sink.view());
+  DictEntry out;
+  Status s = decode_dict_entry(&src, "", IndexTier::kT2, &out);
+  EXPECT_EQ(s.code(), StatusCode::kCorruption);
 }
 
 TEST(DictEntry, PodRefSlimTier3RoundTrip) {

@@ -54,7 +54,11 @@ void write_stats(const DictEntry& e, IndexTier tier, ByteSink* sink) {
 void write_pod_ref(const DictEntry& e, IndexTier tier, ByteSink* sink) {
   sink->put_varint64(e.frq_off_delta);
   sink->put_varint64(e.frq_len);
-  if (e.enc == DictEntryEnc::kWindowed) sink->put_varint64(e.prelude_len);
+  if (e.enc == DictEntryEnc::kWindowed) {
+    sink->put_varint64(e.prelude_len);
+  } else {
+    sink->put_varint64(e.frq_docs_len);  // slim pod_ref: docs-only prefix length
+  }
   if (!tier_has_stats(tier)) return;
   sink->put_varint64(e.prx_off_delta);
   sink->put_varint64(e.prx_len);
@@ -109,6 +113,11 @@ Status read_pod_ref(ByteSource* src, IndexTier tier, DictEntry* out) {
   SNII_RETURN_IF_ERROR(src->get_varint64(&out->frq_len));
   if (out->enc == DictEntryEnc::kWindowed) {
     SNII_RETURN_IF_ERROR(src->get_varint64(&out->prelude_len));
+  } else {
+    SNII_RETURN_IF_ERROR(src->get_varint64(&out->frq_docs_len));
+    if (out->frq_docs_len > out->frq_len) {
+      return Status::Corruption("dict_entry: frq_docs_len exceeds frq_len");
+    }
   }
   if (!tier_has_stats(tier)) return Status::OK();
   SNII_RETURN_IF_ERROR(src->get_varint64(&out->prx_off_delta));

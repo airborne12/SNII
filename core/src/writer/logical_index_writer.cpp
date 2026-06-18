@@ -34,14 +34,18 @@ constexpr int kAutoZstd = -1;
 // Windows per super-block in the two-level prelude directory (design section 5).
 constexpr uint32_t kPreludeGroupSize = 64;
 
-// Builds a single .frq window (docs/freqs slice) with the given win_base.
+// Builds a single .frq window (docs/freqs slice) with the given win_base. Also
+// reports the window's docs-only prefix length (frq_docs_len) so the writer can
+// record it in the prelude row / slim DictEntry for later wire-level freq-skip.
 Status MakeFrqWindow(const std::vector<uint32_t>& docids,
                      const std::vector<uint32_t>& freqs, uint64_t win_base,
-                     std::vector<uint8_t>* out) {
+                     std::vector<uint8_t>* out, uint64_t* frq_docs_len) {
   ByteSink sink;
+  snii::format::FrqWindowLayout layout;
   SNII_RETURN_IF_ERROR(snii::format::build_frq_window(
-      docids, freqs, win_base, /*has_freq=*/true, kAutoZstd, &sink));
+      docids, freqs, win_base, /*has_freq=*/true, kAutoZstd, &sink, &layout));
   *out = sink.buffer();
+  if (frq_docs_len != nullptr) *frq_docs_len = layout.frq_docs_len;
   return Status::OK();
 }
 
@@ -66,6 +70,29 @@ uint64_t SumOf(const std::vector<uint32_t>& v) {
   uint64_t s = 0;
   for (uint32_t x : v) s += x;
   return s;
+}
+
+// Computes a window's WAND max_norm: the encoded norm yielding the LARGEST BM25
+// length contribution (smallest length penalty), i.e. the SMALLEST encoded norm
+// among the window's docs (smaller dl => higher score). When norms are
+// unavailable (no scoring), returns 0 -- decode_norm(0)=1.0 is the smallest
+// possible dl, giving a correct (loosest) upper bound.
+uint8_t WindowMaxNorm(const std::vector<uint8_t>& norms, const std::vector<uint32_t>& docs) {
+  if (norms.empty() || docs.empty()) return 0;
+  uint8_t best = 0xFF;  // decode_norm uses the byte directly; min byte => max score
+  for (uint32_t docid : docs) {
+    if (docid >= norms.size()) continue;  // defensive: out-of-range doc has no norm
+    if (norms[docid] < best) best = norms[docid];
+  }
+  return best == 0xFF ? 0 : best;
+}
+
+// Window doc count by df: high-df windowed terms combine kFrqBaseUnit units into
+// larger (kAdaptiveWindowDocs) windows; both are whole multiples of the base
+// unit so .prx alignment and win_base/last_docid semantics are preserved.
+uint32_t AdaptiveWindowDocs(uint32_t df) {
+  return df >= snii::format::kAdaptiveWindowDfThreshold ? snii::format::kAdaptiveWindowDocs
+                                                        : snii::format::kFrqBaseUnit;
 }
 
 // Builds the two-level .frq prelude for a windowed term and returns its bytes.
@@ -94,12 +121,14 @@ struct WindowedPosting {
   std::vector<WindowMeta> windows;
 };
 
-// Splits a windowed term's postings into kFrqBaseUnit-sized windows, building
-// each window's .frq (and .prx) payload and accumulating per-window metadata
-// with offsets relative to the start of the frq/prx regions (window_start).
+// Splits a windowed term's postings into base-unit-aligned windows (size chosen
+// by df via AdaptiveWindowDocs), building each window's .frq (and .prx) payload
+// and accumulating per-window metadata with offsets relative to the start of the
+// frq/prx regions (window_start). Records each window's docs-only prefix length
+// (frq_docs_len) and WAND max_norm (smallest encoded norm in the window).
 Status BuildWindowedPosting(const TermPostings& tp, bool has_prx,
-                            WindowedPosting* out) {
-  const uint32_t unit = snii::format::kFrqBaseUnit;
+                            const std::vector<uint8_t>& norms, WindowedPosting* out) {
+  const uint32_t unit = AdaptiveWindowDocs(static_cast<uint32_t>(tp.docids.size()));
   const size_t n = tp.docids.size();
   uint64_t win_base = 0;  // absolute last docid of the previous window
   for (size_t start = 0; start < n; start += unit) {
@@ -108,7 +137,8 @@ Status BuildWindowedPosting(const TermPostings& tp, bool has_prx,
     const std::vector<uint32_t> freqs(tp.freqs.begin() + start, tp.freqs.begin() + end);
 
     std::vector<uint8_t> frq_win;
-    SNII_RETURN_IF_ERROR(MakeFrqWindow(docs, freqs, win_base, &frq_win));
+    uint64_t frq_docs_len = 0;
+    SNII_RETURN_IF_ERROR(MakeFrqWindow(docs, freqs, win_base, &frq_win, &frq_docs_len));
 
     WindowMeta m;
     m.last_docid = docs.back();
@@ -116,8 +146,9 @@ Status BuildWindowedPosting(const TermPostings& tp, bool has_prx,
     m.doc_count = static_cast<uint32_t>(docs.size());
     m.frq_off = static_cast<uint64_t>(out->frq_bytes.size());
     m.frq_len = static_cast<uint64_t>(frq_win.size());
+    m.frq_docs_len = frq_docs_len;
     m.max_freq = MaxOf(freqs);
-    m.max_norm = 0;
+    m.max_norm = WindowMaxNorm(norms, docs);
     m.win_crc = snii::crc32c(Slice(frq_win));
     AppendBytes(&out->frq_bytes, frq_win);
 
@@ -177,7 +208,7 @@ Status LogicalIndexWriter::validate() const {
 Status LogicalIndexWriter::build_windowed_entry(const TermPostings& tp, uint64_t frq_base,
                                                 uint64_t prx_base, DictEntry* e) {
   WindowedPosting wp;
-  SNII_RETURN_IF_ERROR(BuildWindowedPosting(tp, has_prx_, &wp));
+  SNII_RETURN_IF_ERROR(BuildWindowedPosting(tp, has_prx_, encoded_norms_, &wp));
   std::vector<uint8_t> prelude;
   SNII_RETURN_IF_ERROR(BuildPrelude(wp.windows, has_prx_, &prelude));
 
@@ -205,7 +236,9 @@ Status LogicalIndexWriter::build_windowed_entry(const TermPostings& tp, uint64_t
 Status LogicalIndexWriter::build_slim_entry(const TermPostings& tp, uint64_t frq_base,
                                             uint64_t prx_base, DictEntry* e) {
   std::vector<uint8_t> frq_win;
-  SNII_RETURN_IF_ERROR(MakeFrqWindow(tp.docids, tp.freqs, /*win_base=*/0, &frq_win));
+  uint64_t frq_docs_len = 0;
+  SNII_RETURN_IF_ERROR(MakeFrqWindow(tp.docids, tp.freqs, /*win_base=*/0, &frq_win,
+                                     &frq_docs_len));
   std::vector<uint8_t> prx_win;
   if (has_prx_) SNII_RETURN_IF_ERROR(MakePrxWindow(tp.positions, &prx_win));
 
@@ -219,6 +252,7 @@ Status LogicalIndexWriter::build_slim_entry(const TermPostings& tp, uint64_t frq
 
   e->kind = DictEntryKind::kPodRef;
   e->enc = DictEntryEnc::kSlim;
+  e->frq_docs_len = frq_docs_len;  // docs-only prefix of the single slim window
   const uint64_t frq_off = static_cast<uint64_t>(frq_pod_.size());
   AppendBytes(&frq_pod_, frq_win);
   e->frq_off_delta = frq_off - frq_base;

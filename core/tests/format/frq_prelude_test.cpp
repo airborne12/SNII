@@ -40,6 +40,7 @@ FrqPreludeColumns MakeColumns(uint32_t n, uint32_t group_size, uint32_t stride,
     m.doc_count = stride;
     m.frq_off = frq_running;
     m.frq_len = 10 + w;  // arbitrary but unique-ish
+    m.frq_docs_len = 6 + (w % 4);  // docs-only prefix, always <= frq_len
     frq_running += m.frq_len;
     if (has_prx) {
       m.prx_off = prx_running;
@@ -77,6 +78,7 @@ void ExpectRoundTrip(const FrqPreludeColumns& cols) {
     EXPECT_EQ(got.doc_count, exp.doc_count) << "doc_count w=" << w;
     EXPECT_EQ(got.frq_off, exp.frq_off) << "frq_off w=" << w;
     EXPECT_EQ(got.frq_len, exp.frq_len) << "frq_len w=" << w;
+    EXPECT_EQ(got.frq_docs_len, exp.frq_docs_len) << "frq_docs_len w=" << w;
     EXPECT_EQ(got.max_freq, exp.max_freq) << "max_freq w=" << w;
     EXPECT_EQ(got.max_norm, exp.max_norm) << "max_norm w=" << w;
     EXPECT_EQ(got.win_crc, exp.win_crc) << "win_crc w=" << w;
@@ -230,6 +232,18 @@ TEST(FrqPrelude, BuildNonMonotonicRejected) {
   cols.windows[2].last_docid = cols.windows[1].last_docid - 1;  // goes backwards
   ByteSink sink;
   EXPECT_EQ(build_frq_prelude(cols, &sink).code(), StatusCode::kInvalidArgument);
+}
+
+// A window row whose frq_docs_len exceeds frq_len is rejected on open (anti-DoS:
+// the docs-only prefix can never be longer than the full window).
+TEST(FrqPrelude, FrqDocsLenExceedsFrqLenRejected) {
+  FrqPreludeColumns cols = MakeColumns(/*n=*/5, /*group_size=*/4, /*stride=*/256, false);
+  cols.windows[2].frq_docs_len = cols.windows[2].frq_len + 100;  // impossible prefix
+  ByteSink sink;
+  ASSERT_TRUE(build_frq_prelude(cols, &sink).ok());  // builder does not validate
+  FrqPreludeReader reader;
+  Status s = FrqPreludeReader::open(sink.view(), &reader);
+  EXPECT_EQ(s.code(), StatusCode::kCorruption);
 }
 
 // CRC corruption inside the header / super_block_dir is detected by open().

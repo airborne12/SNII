@@ -290,12 +290,13 @@ TEST(SniiCompoundWriter, ReadBackSelfValidation) {
 
 namespace {
 
-// Oracle for the multi-super-block read-back test. "hot" is a very high-df term
-// (df=20000 -> ~79 windows of 256 -> >1 super-block at group_size=64). "spark"
-// appears at position 1 immediately after "hot" in docs where d % 9 == 0, so the
-// phrase "hot spark" holds exactly in those docs. "rare" is a tiny low-df term.
+// Oracle for the multi-super-block read-back test. "hot" is a very high-df term;
+// at df=70000 it uses adaptive 1024-doc windows (df >= kAdaptiveWindowDfThreshold)
+// -> ~69 windows -> >1 super-block at group_size=64. "spark" appears at position
+// 1 immediately after "hot" in docs where d % 9 == 0, so the phrase "hot spark"
+// holds exactly in those docs. "rare" is a tiny low-df term.
 struct BigCorpus {
-  uint32_t doc_count = 20000;
+  uint32_t doc_count = 70000;
   std::vector<uint32_t> hot_docs;     // every doc
   std::vector<uint32_t> spark_docs;   // d % 9 == 0
   std::vector<uint32_t> rare_docs = {3, 17, 99, 1000, 19999};
