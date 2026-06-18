@@ -74,13 +74,18 @@ Status SniiSegmentReader::open_index(uint64_t index_id, std::string_view suffix,
       region_reader_.find(index_id, suffix, &found, &meta_bytes));
   if (!found) return Status::NotFound("segment: logical index not found");
 
-  // Determine tier / positions capability from the per-index meta's tier:
-  // v1 stores positions whenever the .prx POD is present. Decode the meta once
-  // here to learn the SectionRefs, then derive capability from prx presence.
+  // Determine tier / positions capability from the per-index meta. v1 stores
+  // positions whenever the index is a docs-positions(+scoring) index. The .prx
+  // POD is only populated by windowed (high-df) terms, so for a scoring index
+  // whose terms are all slim (positions inlined in the DictEntry) prx_pod can be
+  // empty while every DICT block still carries the positions flag. A present
+  // norms POD implies the scoring config, which always has positions; treat that
+  // as positions-capable so block decoding stays consistent with the writer.
   PerIndexMetaReader meta;
   SNII_RETURN_IF_ERROR(PerIndexMetaReader::open(meta_bytes, &meta));
-  const bool has_positions = meta.section_refs().prx_pod.length > 0;
   const bool has_norms = meta.section_refs().norms.length > 0;
+  const bool has_positions =
+      meta.section_refs().prx_pod.length > 0 || has_norms;
   const IndexTier tier = has_norms
                              ? IndexTier::kT3
                              : (has_positions ? IndexTier::kT2 : IndexTier::kT1);
