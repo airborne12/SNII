@@ -213,12 +213,15 @@ bool build_oss_config(snii::io::S3Config* cfg) {
 
 void print_oss_metrics_row(const char* engine, double wall_ms,
                            const snii::io::IoMetrics& m) {
+  // request_bytes = exact bytes fetched from OSS (what S3FileReader actually
+  // transfers); remote_bytes = 1MiB-block-aligned cost-model count.
   std::printf("  %-8s wall_ms=%-9.1f serial_rounds=%-4llu range_gets=%-4llu "
-              "remote_bytes=%-9llu\n",
+              "remote_bytes=%-9llu request_bytes=%-9llu\n",
               engine, wall_ms,
               static_cast<unsigned long long>(m.serial_rounds),
               static_cast<unsigned long long>(m.range_gets),
-              static_cast<unsigned long long>(m.remote_bytes));
+              static_cast<unsigned long long>(m.remote_bytes),
+              static_cast<unsigned long long>(m.total_request_bytes));
 }
 
 // Prints min / median / p90 / mean of a wall-clock sample set (ms). Sorts a
