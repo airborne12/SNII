@@ -30,7 +30,11 @@ class LocalFileReader : public FileReader {
   uint64_t size_ = 0;
 };
 
-// Local-filesystem append-only FileWriter.
+// Local-filesystem append-only FileWriter. Appends accumulate in a fixed
+// userspace buffer and are flushed to the fd in large chunks, collapsing the
+// many tiny per-append ::write() syscalls of the build path (e.g. ~53k writes
+// averaging ~683 B each) into a handful of big writes. The produced file is
+// byte-identical to the unbuffered path; only the syscall count drops.
 class LocalFileWriter : public FileWriter {
  public:
   LocalFileWriter() = default;
@@ -45,8 +49,19 @@ class LocalFileWriter : public FileWriter {
   uint64_t bytes_written() const override { return bytes_written_; }
 
  private:
+  // Userspace write buffer size. 256 KiB amortizes the write() syscall cost over
+  // many appends while keeping transient RAM negligible vs the index sections.
+  static constexpr size_t kBufCapacity = 256u * 1024;
+
+  // Flushes the userspace buffer to the fd with a robust partial-write loop.
+  Status flush_buffer();
+  // Writes a raw byte span straight to the fd (used for spans larger than the
+  // buffer, bypassing a needless copy).
+  Status write_all(const uint8_t* data, size_t len);
+
   int fd_ = -1;
   uint64_t bytes_written_ = 0;
+  std::vector<uint8_t> buf_;
 };
 
 }  // namespace snii::io

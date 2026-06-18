@@ -1,6 +1,7 @@
 #pragma once
 
 #include <cstdint>
+#include <span>
 #include <vector>
 
 #include "snii/common/status.h"
@@ -31,8 +32,18 @@ namespace snii::format {
 //   0   → force raw (no compression).
 //   >0  → force ZSTD with the given level.
 // Non-ascending positions within a doc return InvalidArgument.
-Status build_prx_window(const std::vector<std::vector<uint32_t>>& per_doc_positions,
+Status build_prx_window(std::span<const std::vector<uint32_t>> per_doc_positions,
                         int zstd_level_or_negative_for_auto, ByteSink* sink);
+
+// Vector convenience overload (forwards a span view over the window's per-doc
+// lists; the writer can pass a slice of its flat positions WITHOUT deep-copying
+// the inner vectors into a fresh std::vector<std::vector<uint32_t>> per window).
+inline Status build_prx_window(
+    const std::vector<std::vector<uint32_t>>& per_doc_positions,
+    int zstd_level_or_negative_for_auto, ByteSink* sink) {
+  return build_prx_window(std::span<const std::vector<uint32_t>>(per_doc_positions),
+                          zstd_level_or_negative_for_auto, sink);
+}
 
 // Read and verify a .prx window from source, reconstructing the per-doc position list.
 // CRC mismatch / invalid codec / truncation / decompression failure all return a non-OK Status.

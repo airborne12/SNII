@@ -3,12 +3,27 @@
 #include <cstdint>
 #include <functional>
 #include <string>
+#include <string_view>
 #include <unordered_map>
 #include <vector>
 
 #include "snii/common/status.h"
 
 namespace snii::writer {
+
+// Heterogeneous (transparent) hash for a std::string-keyed map: lets add_token()
+// look up by std::string_view without materializing a std::string. The two
+// overloads MUST hash identically so a string and its view collide into the same
+// bucket; std::hash<std::string_view> over the same bytes guarantees that.
+struct TransparentStrHash {
+  using is_transparent = void;
+  size_t operator()(std::string_view sv) const noexcept {
+    return std::hash<std::string_view>{}(sv);
+  }
+  size_t operator()(const std::string& s) const noexcept {
+    return std::hash<std::string_view>{}(std::string_view(s));
+  }
+};
 
 // One term's posting list: docids ascending, with parallel freqs and (when
 // positions are enabled) per-doc position lists.
@@ -115,7 +130,10 @@ class SpimiTermBuffer {
   size_t spill_threshold_bytes_;  // 0 => unlimited (no spilling)
   size_t live_bytes_ = 0;         // tracked live cost of data_ vs the threshold
   uint64_t total_tokens_ = 0;
-  std::unordered_map<std::string, Term> data_;
+  // Transparent map: keyed by std::string but probeable by std::string_view, so
+  // the per-token hot path constructs a std::string only on first occurrence of
+  // a term (the insert branch), not on every (hit) token.
+  std::unordered_map<std::string, Term, TransparentStrHash, std::equal_to<>> data_;
   std::vector<std::string> run_paths_;  // spilled run temp files (deleted in dtor)
   Status spill_status_;                 // first spill error, surfaced at finalize
 };

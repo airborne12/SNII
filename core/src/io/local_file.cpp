@@ -51,32 +51,57 @@ Status LocalFileReader::read_at(uint64_t offset, size_t len, std::vector<uint8_t
 }
 
 LocalFileWriter::~LocalFileWriter() {
-  if (fd_ >= 0) ::close(fd_);
+  if (fd_ >= 0) ::close(fd_);  // best-effort: dtor cannot surface a flush error
 }
 
 Status LocalFileWriter::open(const std::string& path) {
   fd_ = ::open(path.c_str(), O_WRONLY | O_CREAT | O_TRUNC, 0644);
   if (fd_ < 0) return Status::IoError(errno_msg("open"));
+  buf_.reserve(kBufCapacity);
   return Status::OK();
 }
 
-Status LocalFileWriter::append(Slice data) {
-  if (fd_ < 0) return Status::IoError("append on unopened file");
+Status LocalFileWriter::write_all(const uint8_t* data, size_t len) {
   size_t done = 0;
-  while (done < data.size()) {
-    ssize_t n = ::write(fd_, data.data() + done, data.size() - done);
+  while (done < len) {
+    ssize_t n = ::write(fd_, data + done, len - done);
     if (n < 0) {
       if (errno == EINTR) continue;
       return Status::IoError(errno_msg("write"));
     }
     done += static_cast<size_t>(n);
   }
-  bytes_written_ += data.size();
+  return Status::OK();
+}
+
+Status LocalFileWriter::flush_buffer() {
+  if (buf_.empty()) return Status::OK();
+  SNII_RETURN_IF_ERROR(write_all(buf_.data(), buf_.size()));
+  buf_.clear();
+  return Status::OK();
+}
+
+Status LocalFileWriter::append(Slice data) {
+  if (fd_ < 0) return Status::IoError("append on unopened file");
+  const size_t len = data.size();
+  if (len == 0) return Status::OK();
+  // Spans larger than the buffer go straight to the fd (after flushing pending
+  // bytes) to avoid a pointless copy and an oversized buffer.
+  if (len >= kBufCapacity) {
+    SNII_RETURN_IF_ERROR(flush_buffer());
+    SNII_RETURN_IF_ERROR(write_all(data.data(), len));
+    bytes_written_ += len;
+    return Status::OK();
+  }
+  if (buf_.size() + len > kBufCapacity) SNII_RETURN_IF_ERROR(flush_buffer());
+  buf_.insert(buf_.end(), data.data(), data.data() + len);
+  bytes_written_ += len;
   return Status::OK();
 }
 
 Status LocalFileWriter::finalize() {
   if (fd_ < 0) return Status::IoError("finalize on unopened file");
+  SNII_RETURN_IF_ERROR(flush_buffer());
   if (::fsync(fd_) != 0) return Status::IoError(errno_msg("fsync"));
   if (::close(fd_) != 0) {
     fd_ = -1;

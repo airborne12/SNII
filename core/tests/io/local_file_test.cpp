@@ -61,3 +61,63 @@ TEST(LocalFile, OpenMissingFails) {
   LocalFileReader r;
   EXPECT_FALSE(r.open("/tmp/snii_io_test_does_not_exist_zzz.bin").ok());
 }
+
+// The buffered writer must produce byte-identical output regardless of how the
+// stream is chopped: tiny appends that overflow the 256 KiB buffer, a single
+// over-buffer append (the direct-to-fd fast path), and mixes of the two.
+TEST(LocalFile, BufferedAppendsByteIdentical) {
+  const std::string path = TempPath("buffered");
+  // Build a deterministic reference stream larger than the 256 KiB buffer so the
+  // buffer flushes several times and at least one big append bypasses it.
+  std::vector<uint8_t> expected;
+  expected.reserve(1u << 20);
+  uint32_t x = 0xC0FFEEu;
+  auto next = [&]() {
+    x ^= x << 13;
+    x ^= x >> 17;
+    x ^= x << 5;
+    return static_cast<uint8_t>(x);
+  };
+  for (size_t i = 0; i < (1u << 20); ++i) expected.push_back(next());
+
+  {
+    LocalFileWriter w;
+    ASSERT_TRUE(w.open(path).ok());
+    size_t off = 0;
+    // Phase 1: many small appends (700 B) -> repeated buffer overflow/flush.
+    while (off + 700 <= 600u * 1024) {
+      ASSERT_TRUE(w.append(Slice(expected.data() + off, 700)).ok());
+      off += 700;
+    }
+    // Phase 2: one append larger than the buffer (direct-to-fd path).
+    const size_t big = 300u * 1024;
+    ASSERT_TRUE(w.append(Slice(expected.data() + off, big)).ok());
+    off += big;
+    // Phase 3: drain the remainder in a final small append.
+    ASSERT_TRUE(w.append(Slice(expected.data() + off, expected.size() - off)).ok());
+    EXPECT_EQ(w.bytes_written(), expected.size());
+    ASSERT_TRUE(w.finalize().ok());
+  }
+
+  LocalFileReader r;
+  ASSERT_TRUE(r.open(path).ok());
+  ASSERT_EQ(r.size(), expected.size());
+  std::vector<uint8_t> got;
+  ASSERT_TRUE(r.read_at(0, expected.size(), &got).ok());
+  EXPECT_EQ(got, expected);
+}
+
+// Empty appends are no-ops and an unused open->finalize yields an empty file.
+TEST(LocalFile, EmptyAppendsAndFinalize) {
+  const std::string path = TempPath("empty_buf");
+  {
+    LocalFileWriter w;
+    ASSERT_TRUE(w.open(path).ok());
+    ASSERT_TRUE(w.append(Slice(nullptr, 0)).ok());
+    EXPECT_EQ(w.bytes_written(), 0u);
+    ASSERT_TRUE(w.finalize().ok());
+  }
+  LocalFileReader r;
+  ASSERT_TRUE(r.open(path).ok());
+  EXPECT_EQ(r.size(), 0u);
+}

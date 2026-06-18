@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <memory>
+#include <span>
 #include <utility>
 
 #include "snii/common/slice.h"
@@ -31,6 +32,12 @@ namespace {
 
 // Zstd "auto" sentinel for window builders (raw for tiny payloads).
 constexpr int kAutoZstd = -1;
+// Force-raw level for .frq dd/freq regions. Their plaintext is PFOR-bit-packed
+// doc-deltas/freqs -- already high-entropy, so zstd shrinks ~30 MB of input by
+// <0.1 MiB while burning ~0.4s CPU (and an extra crc pass over the compressed
+// bytes) at 5M. We force raw here and keep zstd only on .prx (which compresses
+// ~77%). Output stays self-describing: the region meta records zstd=false.
+constexpr int kRawFrqRegion = 0;
 // Windows per super-block in the two-level prelude directory (design section 5).
 constexpr uint32_t kPreludeGroupSize = 64;
 
@@ -41,13 +48,13 @@ using snii::format::FrqRegionMeta;
 // the freq region is the skippable suffix. Used for both the grouped windowed
 // layout (regions concatenated into posting-level blocks) and the single-window
 // slim/inline layout ([dd_region][freq_region]).
-Status EncodeRegions(const std::vector<uint32_t>& docids,
-                     const std::vector<uint32_t>& freqs, uint64_t win_base,
+Status EncodeRegions(std::span<const uint32_t> docids,
+                     std::span<const uint32_t> freqs, uint64_t win_base,
                      bool has_freq, std::vector<uint8_t>* dd_out, FrqRegionMeta* dd_meta,
                      std::vector<uint8_t>* freq_out, FrqRegionMeta* freq_meta) {
   ByteSink dd_sink;
   SNII_RETURN_IF_ERROR(
-      snii::format::build_dd_region(docids, win_base, kAutoZstd, &dd_sink, dd_meta));
+      snii::format::build_dd_region(docids, win_base, kRawFrqRegion, &dd_sink, dd_meta));
   *dd_out = dd_sink.buffer();
   if (!has_freq) {
     *freq_out = std::vector<uint8_t>();
@@ -56,13 +63,13 @@ Status EncodeRegions(const std::vector<uint32_t>& docids,
   }
   ByteSink freq_sink;
   SNII_RETURN_IF_ERROR(
-      snii::format::build_freq_region(freqs, kAutoZstd, &freq_sink, freq_meta));
+      snii::format::build_freq_region(freqs, kRawFrqRegion, &freq_sink, freq_meta));
   *freq_out = freq_sink.buffer();
   return Status::OK();
 }
 
 // Builds a single .prx window from a slice of per-doc position lists.
-Status MakePrxWindow(const std::vector<std::vector<uint32_t>>& positions,
+Status MakePrxWindow(std::span<const std::vector<uint32_t>> positions,
                      std::vector<uint8_t>* out) {
   ByteSink sink;
   SNII_RETURN_IF_ERROR(snii::format::build_prx_window(positions, kAutoZstd, &sink));
@@ -70,7 +77,7 @@ Status MakePrxWindow(const std::vector<std::vector<uint32_t>>& positions,
   return Status::OK();
 }
 
-uint32_t MaxOf(const std::vector<uint32_t>& v) {
+uint32_t MaxOf(std::span<const uint32_t> v) {
   uint32_t m = 0;
   for (uint32_t x : v) {
     if (x > m) m = x;
@@ -89,7 +96,7 @@ uint64_t SumOf(const std::vector<uint32_t>& v) {
 // among the window's docs (smaller dl => higher score). When norms are
 // unavailable (no scoring), returns 0 -- decode_norm(0)=1.0 is the smallest
 // possible dl, giving a correct (loosest) upper bound.
-uint8_t WindowMaxNorm(const std::vector<uint8_t>& norms, const std::vector<uint32_t>& docs) {
+uint8_t WindowMaxNorm(const std::vector<uint8_t>& norms, std::span<const uint32_t> docs) {
   if (norms.empty() || docs.empty()) return 0;
   uint8_t best = 0xFF;  // decode_norm uses the byte directly; min byte => max score
   for (uint32_t docid : docs) {
@@ -166,11 +173,17 @@ Status BuildWindowedPosting(const TermPostings& tp, bool has_freq, bool has_prx,
                             const std::vector<uint8_t>& norms, WindowedPosting* out) {
   const uint32_t unit = AdaptiveWindowDocs(static_cast<uint32_t>(tp.docids.size()));
   const size_t n = tp.docids.size();
+  // Span views over the term's flat arrays: each window is encoded straight from
+  // a subspan, with NO per-window std::vector copy of docs/freqs and NO deep copy
+  // of the per-doc position lists. Output bytes are unchanged.
+  const std::span<const uint32_t> all_docs(tp.docids);
+  const std::span<const uint32_t> all_freqs(tp.freqs);
+  const std::span<const std::vector<uint32_t>> all_pos(tp.positions);
   uint64_t win_base = 0;  // absolute last docid of the previous window
   for (size_t start = 0; start < n; start += unit) {
-    const size_t end = std::min(n, start + unit);
-    const std::vector<uint32_t> docs(tp.docids.begin() + start, tp.docids.begin() + end);
-    const std::vector<uint32_t> freqs(tp.freqs.begin() + start, tp.freqs.begin() + end);
+    const size_t len = std::min<size_t>(unit, n - start);
+    const auto docs = all_docs.subspan(start, len);
+    const auto freqs = all_freqs.subspan(start, len);
 
     std::vector<uint8_t> dd_bytes, freq_bytes;
     FrqRegionMeta dd_meta, freq_meta;
@@ -186,10 +199,8 @@ Status BuildWindowedPosting(const TermPostings& tp, bool has_freq, bool has_prx,
     LayoutWindowRegions(dd_meta, dd_bytes, freq_meta, freq_bytes, has_freq, out, &m);
 
     if (has_prx) {
-      const std::vector<std::vector<uint32_t>> pos(tp.positions.begin() + start,
-                                                   tp.positions.begin() + end);
       std::vector<uint8_t> prx_win;
-      SNII_RETURN_IF_ERROR(MakePrxWindow(pos, &prx_win));
+      SNII_RETURN_IF_ERROR(MakePrxWindow(all_pos.subspan(start, len), &prx_win));
       m.prx_off = static_cast<uint64_t>(out->prx_bytes.size());
       m.prx_len = static_cast<uint64_t>(prx_win.size());
       AppendBytes(&out->prx_bytes, prx_win);

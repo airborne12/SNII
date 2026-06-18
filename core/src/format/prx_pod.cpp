@@ -1,6 +1,7 @@
 #include "snii/format/prx_pod.h"
 
 #include <cstddef>
+#include <span>
 
 #include "snii/common/slice.h"
 #include "snii/encoding/crc32c.h"
@@ -19,7 +20,7 @@ inline constexpr int kDefaultZstdLevel = 3;
 inline constexpr uint32_t kMaxWindowUncompBytes = 256u * 1024 * 1024;
 
 // Encode per-doc position lists into a self-describing plain payload (doc_count + per-doc delta stream).
-Status encode_payload(const std::vector<std::vector<uint32_t>>& per_doc, ByteSink* out) {
+Status encode_payload(std::span<const std::vector<uint32_t>> per_doc, ByteSink* out) {
   out->put_varint32(static_cast<uint32_t>(per_doc.size()));
   for (const auto& doc : per_doc) {
     out->put_varint32(static_cast<uint32_t>(doc.size()));
@@ -122,7 +123,7 @@ Status read_framed(ByteSource* src, uint8_t* codec, uint32_t* uncomp_len, Slice*
 
 }  // namespace
 
-Status build_prx_window(const std::vector<std::vector<uint32_t>>& per_doc_positions,
+Status build_prx_window(std::span<const std::vector<uint32_t>> per_doc_positions,
                         int zstd_level_or_negative_for_auto, ByteSink* sink) {
   if (sink == nullptr) return Status::InvalidArgument("prx: null sink");
   ByteSink plain;

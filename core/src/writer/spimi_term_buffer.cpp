@@ -49,7 +49,15 @@ void SpimiTermBuffer::account_token(const std::string& term, bool new_term,
 }
 
 void SpimiTermBuffer::add_token(std::string_view term, uint32_t docid, uint32_t pos) {
-  auto [it, inserted] = data_.try_emplace(std::string(term));
+  // Probe by string_view (transparent hash/equal): a std::string is heap-built
+  // only when the term is new, not on every (hit) token. This removes one
+  // allocation + copy per token on the dominant repeated-term path.
+  auto it = data_.find(term);
+  bool inserted = false;
+  if (it == data_.end()) {
+    it = data_.emplace(std::string(term), Term{}).first;
+    inserted = true;
+  }
   Term& t = it->second;
   const bool new_doc = t.docids.empty() || t.docids.back() != docid;
   if (new_doc) {
@@ -174,7 +182,7 @@ Status SpimiTermBuffer::spill_to_run() {
   // drain_sorted erases every entry but leaves the bucket array at its grown
   // capacity; swap in a fresh map so that capacity is returned to the allocator
   // and the next fill restarts from a small table (keeps peak RSS bounded).
-  std::unordered_map<std::string, Term>().swap(data_);
+  decltype(data_)().swap(data_);
   return w.close();
 }
 

@@ -1,6 +1,7 @@
 #include "snii/format/frq_pod.h"
 
 #include <cstddef>
+#include <span>
 
 #include "snii/common/slice.h"
 #include "snii/encoding/byte_source.h"
@@ -25,7 +26,7 @@ inline constexpr uint32_t kMaxWindowDocs = 1u << 24;
 
 // Encode a uint32 array into multiple PFOR runs, each of 256 (kFrqBaseUnit) elements.
 // n / run count is not written: the number of runs is derived from total length n and kFrqBaseUnit, and the decoder computes it the same way.
-void encode_pfor_runs(const std::vector<uint32_t>& values, ByteSink* out) {
+void encode_pfor_runs(std::span<const uint32_t> values, ByteSink* out) {
   size_t n = values.size();
   for (size_t off = 0; off < n; off += kFrqBaseUnit) {
     size_t run = (n - off < kFrqBaseUnit) ? (n - off) : kFrqBaseUnit;
@@ -44,7 +45,7 @@ Status decode_pfor_runs(ByteSource* src, size_t n, std::vector<uint32_t>* out) {
 }
 
 // Verifies docids are ascending and the first entry is not below win_base.
-Status validate_docs(const std::vector<uint32_t>& docs, uint64_t win_base) {
+Status validate_docs(std::span<const uint32_t> docs, uint64_t win_base) {
   if (docs.empty()) return Status::OK();
   if (static_cast<uint64_t>(docs.front()) < win_base) {
     return Status::InvalidArgument("frq: first docid below win_base");
@@ -114,7 +115,7 @@ Status open_region(Slice disk, const FrqRegionMeta& meta, std::vector<uint8_t>* 
 
 }  // namespace
 
-Status build_dd_region(const std::vector<uint32_t>& docids_ascending, uint64_t win_base,
+Status build_dd_region(std::span<const uint32_t> docids_ascending, uint64_t win_base,
                        int zstd_level_or_neg_for_auto, ByteSink* out, FrqRegionMeta* meta) {
   if (out == nullptr || meta == nullptr) {
     return Status::InvalidArgument("frq: null dd region out");
@@ -132,7 +133,7 @@ Status build_dd_region(const std::vector<uint32_t>& docids_ascending, uint64_t w
   return emit_region(plain.view(), zstd_level_or_neg_for_auto, out, meta);
 }
 
-Status build_freq_region(const std::vector<uint32_t>& freqs,
+Status build_freq_region(std::span<const uint32_t> freqs,
                          int zstd_level_or_neg_for_auto, ByteSink* out, FrqRegionMeta* meta) {
   if (out == nullptr || meta == nullptr) {
     return Status::InvalidArgument("frq: null freq region out");

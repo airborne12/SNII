@@ -1,6 +1,7 @@
 #pragma once
 
 #include <cstdint>
+#include <span>
 #include <vector>
 
 #include "snii/common/slice.h"
@@ -48,14 +49,30 @@ struct FrqRegionMeta {
 // zstd_level_or_neg_for_auto: <0 auto (zstd when large enough, else raw); 0 force
 //   raw; >0 force zstd at that level.
 // Non-ascending docids / first_docid < win_base / null out returns InvalidArgument.
-Status build_dd_region(const std::vector<uint32_t>& docids_ascending, uint64_t win_base,
+Status build_dd_region(std::span<const uint32_t> docids_ascending, uint64_t win_base,
                        int zstd_level_or_neg_for_auto, ByteSink* out, FrqRegionMeta* meta);
+
+// Vector convenience overload (forwards a span view; no copy of the elements).
+inline Status build_dd_region(const std::vector<uint32_t>& docids_ascending,
+                              uint64_t win_base, int zstd_level_or_neg_for_auto,
+                              ByteSink* out, FrqRegionMeta* meta) {
+  return build_dd_region(std::span<const uint32_t>(docids_ascending), win_base,
+                         zstd_level_or_neg_for_auto, out, meta);
+}
 
 // Encodes a window's freq_region plaintext (PFOR_runs(freq)) into raw or zstd,
 // APPENDS the on-disk bytes to out, and fills meta. Empty freqs yields a zero-length
 // region. Null out returns InvalidArgument.
-Status build_freq_region(const std::vector<uint32_t>& freqs,
+Status build_freq_region(std::span<const uint32_t> freqs,
                          int zstd_level_or_neg_for_auto, ByteSink* out, FrqRegionMeta* meta);
+
+// Vector convenience overload (forwards a span view; no copy of the elements).
+inline Status build_freq_region(const std::vector<uint32_t>& freqs,
+                               int zstd_level_or_neg_for_auto, ByteSink* out,
+                               FrqRegionMeta* meta) {
+  return build_freq_region(std::span<const uint32_t>(freqs), zstd_level_or_neg_for_auto,
+                           out, meta);
+}
 
 // Decodes a dd_region from its on-disk slice (exactly disk_len bytes) + meta +
 // win_base, reconstructing ascending docids. Verifies meta.crc against the slice.
