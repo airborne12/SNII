@@ -11,20 +11,64 @@
 #include "snii/encoding/byte_sink.h"
 #include "snii/encoding/byte_source.h"
 #include "snii/encoding/crc32c.h"
+#include "snii/encoding/pfor.h"
 #include "snii/format/format_constants.h"
 
 using snii::ByteSink;
 using snii::ByteSource;
+using snii::pfor_encode;
 using snii::Slice;
 using snii::Status;
 using snii::StatusCode;
 using snii::format::build_prx_window;
 using snii::format::build_prx_window_flat;
+using snii::format::kFrqBaseUnit;
+using snii::format::PrxCodec;
 using snii::format::read_prx_window;
 
 namespace {
 
 using PerDoc = std::vector<std::vector<uint32_t>>;
+
+// Encodes a uint32 array as the PFOR_runs wire form the prx PFOR payload uses:
+// fixed-size runs of kFrqBaseUnit values, run count derived by the decoder from
+// the total length (so it is not stored). Mirrors the in-source encode_pfor_runs
+// so a test can hand-assemble a CRC-VALID PFOR payload and exercise the INNER
+// decode branches (sum check / trailing bytes) instead of the outer CRC/codec.
+void AppendPforRuns(const std::vector<uint32_t>& values, ByteSink* out) {
+  const size_t n = values.size();
+  for (size_t off = 0; off < n; off += kFrqBaseUnit) {
+    const size_t run = (n - off < kFrqBaseUnit) ? (n - off) : kFrqBaseUnit;
+    pfor_encode(values.data() + off, run, out);
+  }
+}
+
+// Assembles a complete CRC-valid PFOR window: codec, uncomp_len, payload, crc.
+// The payload header fields (doc_count, total_pos) are passed explicitly so a test
+// can declare values that disagree with the encoded runs, and `trailing` lets a
+// test pad the declared payload with undecodable bytes. The CRC always matches the
+// emitted frame, so reads fail (if at all) on an INNER payload check, never CRC.
+std::vector<uint8_t> MakePforWindow(uint32_t doc_count, uint32_t total_pos,
+                                    const std::vector<uint32_t>& freqs,
+                                    const std::vector<uint32_t>& deltas,
+                                    const std::vector<uint8_t>& trailing = {}) {
+  ByteSink payload;
+  payload.put_varint32(doc_count);
+  payload.put_varint32(total_pos);
+  AppendPforRuns(freqs, &payload);
+  AppendPforRuns(deltas, &payload);
+  payload.put_bytes(Slice(trailing));
+
+  ByteSink framed;
+  framed.put_u8(static_cast<uint8_t>(PrxCodec::kPfor));
+  framed.put_varint32(static_cast<uint32_t>(payload.view().size()));
+  framed.put_bytes(payload.view());
+
+  ByteSink full;
+  full.put_bytes(framed.view());
+  full.put_fixed32(snii::crc32c(framed.view()));
+  return full.buffer();
+}
 
 // Flattens per-doc lists into (flat positions, freqs) the way the accumulator
 // stores them, so the flat builder can be checked for byte-identity.
@@ -298,4 +342,78 @@ TEST(PrxPod, OversizedDocCountRejected) {
   PerDoc out;
   Status s = read_prx_window(&src, &out);
   EXPECT_EQ(s.code(), StatusCode::kCorruption) << s.message();
+}
+
+// Sanity: the MakePforWindow helper builds a window the production reader accepts,
+// so the negative variants below isolate the ONE field they tamper with (not a
+// helper bug). doc_count=2, total_pos=3, freqs sum to total_pos, deltas match.
+TEST(PrxPod, CraftedPforWindowRoundTrips) {
+  // doc0 = {5, 6} (deltas 5,1), doc1 = {9} (delta 9); pos_counts {2,1}, total 3.
+  auto bytes = MakePforWindow(/*doc_count=*/2, /*total_pos=*/3,
+                              /*freqs=*/{2, 1}, /*deltas=*/{5, 1, 9});
+  Slice s(bytes);
+  ByteSource src(s);
+  PerDoc out;
+  ASSERT_TRUE(read_prx_window(&src, &out).ok());
+  PerDoc expected = {{5, 6}, {9}};
+  EXPECT_EQ(out, expected);
+}
+
+// CRC-VALID PFOR frame whose declared total_pos disagrees with sum(pos_counts):
+// the reader must reach the INNER "pos_count sum mismatch" branch (after the cap
+// checks and after decoding the freqs runs) and return Corruption -- NOT a CRC or
+// codec rejection. freqs sum to 3 but total_pos is declared 4.
+TEST(PrxPod, PforPosCountSumMismatchRejected) {
+  auto bytes = MakePforWindow(/*doc_count=*/2, /*total_pos=*/4,
+                              /*freqs=*/{2, 1}, /*deltas=*/{5, 1, 9});
+  Slice slice(bytes);
+  ByteSource src(slice);
+  PerDoc out;
+  Status s = read_prx_window(&src, &out);
+  EXPECT_EQ(s.code(), StatusCode::kCorruption) << s.message();
+}
+
+// CRC-VALID PFOR frame with extra bytes appended INSIDE the declared payload
+// (uncomp_len covers them, so the CRC is over them too). After decode_pfor_payload
+// consumes the real doc_count/total_pos/freqs/deltas, the source is not at EOF, so
+// the INNER "trailing bytes after pfor payload" branch must fire -> Corruption.
+TEST(PrxPod, PforTrailingBytesRejected) {
+  auto bytes = MakePforWindow(/*doc_count=*/2, /*total_pos=*/3,
+                              /*freqs=*/{2, 1}, /*deltas=*/{5, 1, 9},
+                              /*trailing=*/{0xAA, 0xBB, 0xCC});
+  Slice slice(bytes);
+  ByteSource src(slice);
+  PerDoc out;
+  Status s = read_prx_window(&src, &out);
+  EXPECT_EQ(s.code(), StatusCode::kCorruption) << s.message();
+}
+
+// FLAT builder precondition: a (positions_flat, freqs) mismatch where sum(freqs)
+// overruns positions_flat would index flat[off+i] past the span end. The guard must
+// return a CLEAN InvalidArgument (never OOB / UB) at every flat codec level. Here
+// freqs sum to 5 but only 3 positions are supplied.
+TEST(PrxPod, FlatBuilderShortPositionsRejectedNotOob) {
+  std::vector<uint32_t> positions_flat = {1, 2, 3};  // 3 positions
+  std::vector<uint32_t> freqs = {2, 3};              // claims 5 positions
+  for (int level : {-1, 0, 3}) {  // pfor, raw, zstd flat encoders all guard
+    ByteSink sink;
+    Status s = build_prx_window_flat(positions_flat, freqs, level, &sink);
+    EXPECT_EQ(s.code(), StatusCode::kInvalidArgument)
+        << "level=" << level << " msg=" << s.message();
+    EXPECT_EQ(sink.size(), 0u) << "level=" << level;  // nothing emitted on reject
+  }
+}
+
+// FLAT builder precondition (other direction): sum(freqs) < positions_flat leaves
+// trailing positions unused -- also a writer-side mismatch. The guard requires
+// EXACT equality, so this is rejected too (a silently-dropped position is a bug).
+TEST(PrxPod, FlatBuilderExtraPositionsRejected) {
+  std::vector<uint32_t> positions_flat = {1, 2, 3, 4, 5};  // 5 positions
+  std::vector<uint32_t> freqs = {2, 1};                    // only addresses 3
+  for (int level : {-1, 0, 3}) {
+    ByteSink sink;
+    Status s = build_prx_window_flat(positions_flat, freqs, level, &sink);
+    EXPECT_EQ(s.code(), StatusCode::kInvalidArgument)
+        << "level=" << level << " msg=" << s.message();
+  }
 }

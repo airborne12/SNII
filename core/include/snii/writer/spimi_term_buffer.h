@@ -153,12 +153,22 @@ class SpimiTermBuffer {
   // `term_id` must be in [0, vocab_size). An out-of-range id latches an
   // InvalidArgument into status() and is ignored. For a given term, docids are
   // expected to arrive in non-decreasing order, and positions within a docid in
-  // ascending order; out-of-order docids are tolerated and sorted at finalize.
+  // ascending order; out-of-order docids (INCLUDING a REVISITED docid -- the same
+  // docid appearing again after a different one) are tolerated and reordered at
+  // finalize: SortByDocid stably sorts by docid and COALESCES same-docid groups
+  // (summing freqs, concatenating positions in document order), so the emitted
+  // postings have exactly ONE strictly-ascending entry per docid -- matching the
+  // k-way merge path and the writer's strictly-ascending precondition.
   void add_token(uint32_t term_id, uint32_t docid, uint32_t pos);
 
-  // Compatibility overload: records one token by TERM STRING. Only valid on an
+  // Compatibility overload: records one token by TERM STRING. Valid ONLY on an
   // OWNED-vocab buffer (constructed without an external vocab); interns `term`
-  // into the internal vocabulary on first occurrence, then forwards by id.
+  // into the internal vocabulary on first occurrence, then forwards by id. Called
+  // on a BORROWED-vocab buffer it is REJECTED (latches InvalidArgument, token
+  // ignored) -- interning would grow the owned vocab out of step with the borrowed
+  // one and corrupt the build. It also allocates a std::string per call, so the
+  // hot path is the id overload; prefer that and reserve this for tests / legacy
+  // string-fed callers.
   void add_token(std::string_view term, uint32_t docid, uint32_t pos);
 
   // Number of DISTINCT terms accumulated so far (touched ids still resident).
@@ -175,14 +185,18 @@ class SpimiTermBuffer {
   // Materializes all terms sorted lexicographically; each term's docids are
   // ascending. Convenience wrapper around for_each_term_sorted that keeps the
   // whole result alive at once. Prefer for_each_term_sorted for low peak memory.
-  // May be called once (it drains internal state).
+  // MUST be called at most once: it drains internal state. A SECOND drain (a
+  // repeat call, or a finalize_sorted after a for_each_term_sorted, or vice versa)
+  // returns EMPTY and latches an error into status() rather than re-emitting.
   std::vector<TermPostings> finalize_sorted();
 
   // Streams terms to `fn` in lexicographic order, building ONE transient
   // TermPostings at a time and freeing that term's accumulated arrays before
   // moving to the next. This keeps at most a single term's postings duplicated,
-  // avoiding the input+output coexistence peak. May be called once (it drains
-  // internal state).
+  // avoiding the input+output coexistence peak. MUST be called at most once: it
+  // drains internal state. A SECOND drain invokes `fn` zero times and latches an
+  // error into status() (a re-merge of the still-present run files would otherwise
+  // re-emit every term).
   void for_each_term_sorted(const std::function<void(TermPostings&&)>& fn);
 
  private:
@@ -297,6 +311,10 @@ class SpimiTermBuffer {
 
   std::vector<std::string> run_paths_;  // spilled run temp files (deleted in dtor)
   Status spill_status_;                 // first spill / range error, at finalize
+  bool drained_ = false;  // set once finalize_sorted/for_each_term_sorted has run;
+                          // a second drain would (spilled path) re-merge the run
+                          // files and re-emit every term, or (in-memory path) emit
+                          // nothing -- both wrong. Guard against the double-drain.
 
   // Lazily-built vocab-sized map: term-id -> its lexicographic rank among all
   // vocab strings. Computed once (one full std::string sort of the vocabulary)

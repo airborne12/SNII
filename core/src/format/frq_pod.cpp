@@ -158,6 +158,9 @@ Status decode_dd_region(Slice dd_disk, const FrqRegionMeta& meta, uint64_t win_b
   if (n > kMaxWindowDocs) return Status::Corruption("frq: doc count exceeds sane cap");
   std::vector<uint32_t> dd;
   SNII_RETURN_IF_ERROR(decode_pfor_runs(&src, n, &dd));
+  if (!src.eof()) {
+    return Status::Corruption("frq: trailing bytes after dd region payload");
+  }
   docids->assign(n, 0);
   uint64_t cur = win_base;
   for (uint32_t i = 0; i < n; ++i) {
@@ -181,7 +184,11 @@ Status decode_freq_region(Slice freq_disk, const FrqRegionMeta& meta, size_t doc
     return Status::OK();
   }
   ByteSource src(plain);
-  return decode_pfor_runs(&src, doc_count, freqs);
+  SNII_RETURN_IF_ERROR(decode_pfor_runs(&src, doc_count, freqs));
+  if (!src.eof()) {
+    return Status::Corruption("frq: trailing bytes after freq region payload");
+  }
+  return Status::OK();
 }
 
 }  // namespace snii::format

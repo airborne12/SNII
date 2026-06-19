@@ -202,3 +202,69 @@ TEST(DictBlockDirectory, TrailingBytesRejected) {
   EXPECT_EQ(DictBlockDirectoryReader::open(Slice(sink.buffer()), &reader).code(),
             StatusCode::kCorruption);
 }
+
+// An attacker-inflated n_blocks count must hit the reserve-bomb guard in
+// decode_payload BEFORE the vector reserve, returning Corruption rather than
+// attempting a multi-gigabyte allocation. The payload is framed through
+// SectionFramer::write so the section crc is VALID over the crafted bytes:
+// this proves the inner n_blocks-vs-capacity check fires, not an outer crc flip.
+TEST(DictBlockDirectory, InflatedNBlocksHitsReserveGuard) {
+  ByteSink payload;
+  payload.put_varint32(0xFFFFFFFFu);  // n_blocks = ~4.29 billion (impossible)
+  // Only a few real bytes follow; capacity is nowhere near 4.29B refs.
+  payload.put_u8(0x00);
+  payload.put_u8(0x00);
+  payload.put_u8(0x00);
+  payload.put_u8(0x00);
+  ByteSink sink;
+  SectionFramer::write(sink,
+                       static_cast<uint8_t>(SectionType::kDictBlockDirectory),
+                       payload.view());
+  DictBlockDirectoryReader reader;
+  // remaining()/kMinRefBytes == 4/8 == 0, so n_blocks > 0 trips the guard.
+  EXPECT_EQ(DictBlockDirectoryReader::open(Slice(sink.buffer()), &reader).code(),
+            StatusCode::kCorruption);
+}
+
+// A kZstd ref whose trailing uncomp_len varint is missing (truncated) must be
+// rejected as Corruption: decode_ref reads offset/length/n_entries/flags/checksum
+// fine, sees the kZstd flag, then overruns when it tries to read uncomp_len.
+// n_blocks == 1 with an ~8-byte ref body passes the reserve guard (1 > 8/8 is
+// false), so the corruption surfaces from the inner uncomp_len read -- not the
+// capacity cap and not the section crc (the frame is crc-valid by construction).
+TEST(DictBlockDirectory, ZstdRefTruncatedUncompLenRejected) {
+  ByteSink payload;
+  payload.put_varint32(1);                       // n_blocks = 1
+  payload.put_varint64(0);                        // offset (1 byte)
+  payload.put_varint64(10);                       // length (1 byte)
+  payload.put_varint32(1);                        // n_entries (1 byte)
+  payload.put_u8(block_ref_flags::kZstd);         // flags: kZstd set
+  payload.put_fixed32(0xDEADBEEFu);               // checksum (4 bytes)
+  // INTENTIONALLY OMIT the trailing varint64 uncomp_len -> decode_ref overruns.
+  ByteSink sink;
+  SectionFramer::write(sink,
+                       static_cast<uint8_t>(SectionType::kDictBlockDirectory),
+                       payload.view());
+  DictBlockDirectoryReader reader;
+  EXPECT_EQ(DictBlockDirectoryReader::open(Slice(sink.buffer()), &reader).code(),
+            StatusCode::kCorruption);
+}
+
+// A kZstd ref round-trips through the builder/reader preserving uncomp_len
+// exactly, including a large 64-bit value, proving the trailing varint is both
+// written and read back on the kZstd path.
+TEST(DictBlockDirectory, ZstdRefRoundTripPreservesUncompLen) {
+  const uint64_t kUncomp = (1ull << 40) + 1234567u;  // large, multi-byte varint
+  std::vector<BlockRef> refs = {
+      {1024, 999, 7, block_ref_flags::kZstd, 0x0BADF00Du, kUncomp},
+  };
+  auto bytes = Build(refs);
+  DictBlockDirectoryReader reader;
+  ASSERT_TRUE(DictBlockDirectoryReader::open(Slice(bytes), &reader).ok());
+  ASSERT_EQ(reader.n_blocks(), 1u);
+  BlockRef out{};
+  ASSERT_TRUE(reader.get(0, &out).ok());
+  ExpectRefEq(out, refs[0]);
+  EXPECT_EQ(out.uncomp_len, kUncomp);
+  EXPECT_TRUE((out.flags & block_ref_flags::kZstd) != 0);
+}

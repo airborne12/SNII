@@ -27,6 +27,23 @@ inline constexpr uint32_t kMaxWindowPositions = 1u << 26;  // 64M positions/wind
 // corrupt doc_count is otherwise fed straight to assign()/reserve() -> bad_alloc.
 inline constexpr uint32_t kMaxWindowDocs = 1u << 24;  // 16M docs/window
 
+// Writer-side precondition for the FLAT builders: the per-doc partition `freqs`
+// must address exactly the positions present in `flat`. If sum(freqs) overruns
+// flat.size() a (positions_flat, freqs) mismatch would index flat[off+i] past the
+// span end -- an out-of-bounds read on caller-supplied data. Reject it as
+// InvalidArgument BEFORE any indexing so the bug surfaces as a clean Status, never
+// UB. (sum < size leaves trailing positions unused, which is also a writer bug, so
+// we require exact equality.) Uint64 accumulation cannot overflow for uint32 freqs.
+Status check_flat_partition(std::span<const uint32_t> flat,
+                            std::span<const uint32_t> freqs) {
+  uint64_t sum = 0;
+  for (uint32_t fc : freqs) sum += fc;
+  if (sum != flat.size()) {
+    return Status::InvalidArgument("prx: sum(freqs) does not match positions_flat size");
+  }
+  return Status::OK();
+}
+
 // Encode per-doc position lists into a self-describing plain payload (doc_count + per-doc delta stream).
 Status encode_payload(std::span<const std::vector<uint32_t>> per_doc, ByteSink* out) {
   out->put_varint32(static_cast<uint32_t>(per_doc.size()));
@@ -51,6 +68,7 @@ Status encode_payload(std::span<const std::vector<uint32_t>> per_doc, ByteSink* 
 // for the window; freqs.size() is the doc count and sum(freqs) == flat.size().
 Status encode_payload_flat(std::span<const uint32_t> flat,
                            std::span<const uint32_t> freqs, ByteSink* out) {
+  SNII_RETURN_IF_ERROR(check_flat_partition(flat, freqs));
   out->put_varint32(static_cast<uint32_t>(freqs.size()));
   size_t off = 0;
   for (uint32_t fc : freqs) {
@@ -100,6 +118,7 @@ Status decode_pfor_runs(ByteSource* src, size_t n, std::vector<uint32_t>* out) {
 // Builds the payload from a flat positions span partitioned per-doc by `freqs`.
 Status encode_pfor_payload_flat(std::span<const uint32_t> flat,
                                 std::span<const uint32_t> freqs, ByteSink* out) {
+  SNII_RETURN_IF_ERROR(check_flat_partition(flat, freqs));
   out->put_varint32(static_cast<uint32_t>(freqs.size()));
   out->put_varint32(static_cast<uint32_t>(flat.size()));
   encode_pfor_runs(freqs, out);

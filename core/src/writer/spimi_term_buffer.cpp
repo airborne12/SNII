@@ -176,7 +176,19 @@ void SpimiTermBuffer::add_token(uint32_t term_id, uint32_t docid, uint32_t pos) 
 
 void SpimiTermBuffer::add_token(std::string_view term, uint32_t docid, uint32_t pos) {
   // Compatibility path: intern the term into the owned vocabulary on first
-  // occurrence, then accumulate by its id. Only valid in owned-vocab mode.
+  // occurrence, then accumulate by its id. ONLY valid in OWNED-vocab mode. In
+  // BORROWED-vocab mode vocab_ points at the caller's vector, NOT &owned_vocab_:
+  // interning here would grow owned_vocab_ / intern_ / slot_of_ out of step with
+  // the active (borrowed) vocab, so the new id indexes the WRONG string and writes
+  // a slot_of_ entry the borrowed-vocab build never reconciles -- silent
+  // corruption. Reject (and latch) instead of forwarding by a bogus id.
+  if (vocab_ != &owned_vocab_) {
+    if (spill_status_.ok()) {
+      spill_status_ = Status::InvalidArgument(
+          "spimi: add_token(string_view) requires owned-vocab mode");
+    }
+    return;
+  }
   auto it = intern_.find(std::string(term));
   uint32_t term_id;
   if (it == intern_.end()) {
@@ -192,15 +204,26 @@ void SpimiTermBuffer::add_token(std::string_view term, uint32_t docid, uint32_t 
 
 namespace {
 
-// Reorders a term's flat arrays into ascending-docid order. Only invoked for the
-// rare term that received out-of-order docids; the common path stays untouched.
+// Reorders a term's flat arrays into ascending-docid order, COALESCING any
+// same-docid groups so the result has exactly one entry per docid -- matching the
+// k-way-merge path's boundary-doc coalescing and the writer's strictly-ascending
+// precondition. Only invoked for the rare term that received out-of-order docids
+// (the common ascending path leaves t.sorted true and skips it).
+//
+// A docid may REVISIT (e.g. feed 5,1,5): the chain holds two separate doc-groups
+// for doc 5. A STABLE sort keeps equal-docid groups in arrival order, then the
+// coalesce pass sums their freqs and concatenates their positions in that same
+// (document/arrival) order -- so the merged positions stay consistent with the
+// merged freqs, exactly as the run-order merge would have produced.
 void SortByDocid(std::vector<uint32_t>* docids, std::vector<uint32_t>* freqs,
                  std::vector<uint32_t>* positions_flat, bool has_positions) {
   const size_t n = docids->size();
   std::vector<size_t> order(n);
   std::iota(order.begin(), order.end(), 0);
-  std::sort(order.begin(), order.end(),
-            [&](size_t a, size_t b) { return (*docids)[a] < (*docids)[b]; });
+  // STABLE so equal docids keep arrival order: their positions then concatenate in
+  // document order, the same order the merge path's run concatenation yields.
+  std::stable_sort(order.begin(), order.end(),
+                   [&](size_t a, size_t b) { return (*docids)[a] < (*docids)[b]; });
 
   std::vector<uint32_t> pos_off;
   if (has_positions) {
@@ -216,8 +239,15 @@ void SortByDocid(std::vector<uint32_t>* docids, std::vector<uint32_t>* freqs,
   nf.reserve(n);
   if (has_positions) np.reserve(positions_flat->size());
   for (size_t k : order) {
-    nd.push_back((*docids)[k]);
-    nf.push_back((*freqs)[k]);
+    // Coalesce a revisited docid into the previous entry (it sorts adjacent now):
+    // sum freqs and append this group's positions right after the prior group's,
+    // so flat doc order stays partitioned by the merged freqs.
+    if (!nd.empty() && nd.back() == (*docids)[k]) {
+      nf.back() += (*freqs)[k];
+    } else {
+      nd.push_back((*docids)[k]);
+      nf.push_back((*freqs)[k]);
+    }
     if (has_positions) {
       np.insert(np.end(), positions_flat->begin() + pos_off[k],
                 positions_flat->begin() + pos_off[k] + (*freqs)[k]);
@@ -458,6 +488,16 @@ void SpimiTermBuffer::merge_runs(const std::function<void(TermPostings&&)>& fn,
 }
 
 void SpimiTermBuffer::for_each_term_sorted(const std::function<void(TermPostings&&)>& fn) {
+  // Single-drain contract: a second call would re-merge the (still-present) run
+  // files and re-emit every term, or emit nothing in the in-memory path. Latch an
+  // error and emit NOTHING rather than produce a wrong second stream.
+  if (drained_) {
+    if (spill_status_.ok()) {
+      spill_status_ = Status::Internal("spimi: already drained (single-drain contract)");
+    }
+    return;
+  }
+  drained_ = true;
   // The callback is invoked synchronously while the arena is resident, so large
   // sorted terms may stream positions via pos_pump (peak-RSS win for the writer).
   if (run_paths_.empty() && spill_status_.ok()) {
@@ -471,6 +511,16 @@ void SpimiTermBuffer::for_each_term_sorted(const std::function<void(TermPostings
 
 std::vector<TermPostings> SpimiTermBuffer::finalize_sorted() {
   std::vector<TermPostings> out;
+  // Single-drain contract (mirrors for_each_term_sorted): a second drain (including
+  // a finalize_sorted after a for_each_term_sorted, or vice versa) would re-emit or
+  // emit nothing. Latch an error and return EMPTY rather than a wrong result.
+  if (drained_) {
+    if (spill_status_.ok()) {
+      spill_status_ = Status::Internal("spimi: already drained (single-drain contract)");
+    }
+    return out;
+  }
+  drained_ = true;
   out.reserve(touched_ids_.size());
   // RETAINS each TermPostings past the drain, so positions must be MATERIALIZED
   // (a streamed pos_pump would reference the arena, freed when the drain ends).

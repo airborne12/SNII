@@ -2,14 +2,18 @@
 
 #include <gtest/gtest.h>
 
+#include <sys/stat.h>
+#include <unistd.h>
+
 #include <algorithm>
 #include <cstdint>
 #include <cstdio>
+#include <cstring>
 #include <string>
-#include <unistd.h>
 #include <vector>
 
 #include "snii/encoding/varint.h"
+#include "snii/format/format_constants.h"
 #include "snii/writer/spimi_term_buffer.h"
 
 using snii::Status;
@@ -430,6 +434,149 @@ TEST(SpillRunCodec, MergeWideTermStreamsIdenticalToMaterialized) {
   ASSERT_NE(it, materialized.docids.end());
   const size_t bi = static_cast<size_t>(it - materialized.docids.begin());
   EXPECT_EQ(materialized.freqs[bi], 3u);
+}
+
+// A run record whose term-id is >= vocab.size() must make MergeRuns return
+// Corruption (NOT index a vocab[id] out of bounds, which is UB / a crash). The
+// id is decoded as a perfectly valid varint, so it is the in-merge vocab-range
+// check -- not varint decode -- that must fire. This guards both the heap-seed
+// range check and the post-advance one by placing the bad id as the SECOND term
+// (the first term seeds the heap fine; the bad id is reached after advance()).
+TEST(SpillRunCodec, MergeTermIdOutOfVocabIsCorruption) {
+  const std::vector<std::string> vocab = {"only"};  // valid ids: {0}
+  TempRun run;
+  {
+    RunWriter w;
+    ASSERT_TRUE(w.open(run.path).ok());
+    ASSERT_TRUE(w.write_term(0, MakeTerm({0}, {1}, {{0}})).ok());  // id 0: OK
+    ASSERT_TRUE(w.write_term(5, MakeTerm({9}, {1}, {{0}})).ok());  // id 5: out of range
+    ASSERT_TRUE(w.close().ok());
+  }
+  std::vector<TermPostings> merged;
+  const Status s =
+      MergeRuns({run.path}, vocab, /*has_positions=*/true,
+                [&](TermPostings&& tp) { merged.push_back(std::move(tp)); });
+  EXPECT_EQ(s.code(), StatusCode::kCorruption) << s.message();
+}
+
+// And when the BAD id is the FIRST record of a run, the heap-seed range check (in
+// MergeRuns, before any term is emitted) must fire -- still Corruption, no UB.
+TEST(SpillRunCodec, MergeFirstTermIdOutOfVocabIsCorruption) {
+  const std::vector<std::string> vocab = {"a", "b"};  // valid ids: {0,1}
+  TempRun run;
+  {
+    RunWriter w;
+    ASSERT_TRUE(w.open(run.path).ok());
+    ASSERT_TRUE(w.write_term(9, MakeTerm({0}, {1}, {{0}})).ok());  // id 9: out of range
+    ASSERT_TRUE(w.close().ok());
+  }
+  std::vector<TermPostings> merged;
+  const Status s =
+      MergeRuns({run.path}, vocab, /*has_positions=*/true,
+                [&](TermPostings&& tp) { merged.push_back(std::move(tp)); });
+  EXPECT_EQ(s.code(), StatusCode::kCorruption) << s.message();
+}
+
+// DoS prevention on the POSITIONS length: a record whose declared n_pos varint
+// exceeds what the file can hold must yield Status::Corruption from the resize
+// bound in read_raw_u32 (count > file_size_/4), NOT an uncaught std::bad_alloc.
+// The n_pos varint decodes cleanly; it is the file-size bound -- not varint
+// decode -- that must fire. We hand-craft a CRC-free run (the run codec has no
+// CRC) with a valid term_id/n_docs/docids/freqs header, then an absurd n_pos and
+// NO position data, so materialize_positions() hits the bound on resize().
+TEST(SpillRunCodec, NPosExceedsFileIsCorruption) {
+  TempRun run;
+  {
+    std::FILE* f = std::fopen(run.path.c_str(), "wb");
+    ASSERT_NE(f, nullptr);
+    uint8_t buf[40];
+    size_t n = 0;
+    n += snii::encode_varint64(0, buf + n);  // term_id = 0
+    n += snii::encode_varint64(1, buf + n);  // n_docs = 1
+    // docid[0] = 0 and freq[0] = 1 as RAW LE u32 blocks (matching the writer).
+    const uint32_t one_docid = 0, one_freq = 1;
+    std::memcpy(buf + n, &one_docid, sizeof(uint32_t));
+    n += sizeof(uint32_t);
+    std::memcpy(buf + n, &one_freq, sizeof(uint32_t));
+    n += sizeof(uint32_t);
+    n += snii::encode_varint64(0xFFFFFFFFull, buf + n);  // n_pos ~= 4e9, no data follows
+    ASSERT_EQ(std::fwrite(buf, 1, n, f), n);
+    std::fclose(f);
+  }
+  RunReader r;
+  // open() -> advance() decodes header + parks the (bogus) n_pos count, but does
+  // NOT read positions; materialize_positions() is where the resize bound fires.
+  ASSERT_TRUE(r.open(run.path, /*has_positions=*/true).ok());
+  ASSERT_FALSE(r.exhausted());
+  const Status s = r.materialize_positions();
+  EXPECT_EQ(s.code(), StatusCode::kCorruption) << s.message();
+}
+
+// DETERMINISTIC: the wide-term pos_pump must NEVER hand the writer uninitialized
+// bytes when the positions block is TRUNCATED mid-stream. We build a wide term
+// (df >= kSlimDfThreshold so the merge takes the STREAMED pump path), chop the
+// run so the position block ends early, then drive the pump exactly as the
+// windowed writer does -- pre-poisoning the destination with a sentinel and
+// asserting every unfilled tail slot is ZERO (the fix's memset), never the
+// sentinel. The merge must still surface the latched Corruption afterward.
+TEST(SpillRunCodec, WideTermPumpZeroFillsTruncatedPositions) {
+  const std::vector<std::string> vocab = {"wide"};
+  const uint32_t kDocs = 600;  // > kSlimDfThreshold (512) -> streamed path
+  static_assert(600u > snii::format::kSlimDfThreshold, "must exceed slim df");
+  TempRun run;
+  {
+    TermPostings tp;
+    for (uint32_t d = 0; d < kDocs; ++d) {
+      tp.docids.push_back(d);
+      tp.freqs.push_back(1);
+      tp.positions_flat.push_back(d * 3 + 1);  // distinct non-zero positions
+    }
+    RunWriter w;
+    ASSERT_TRUE(w.open(run.path).ok());
+    ASSERT_TRUE(w.write_term(0, tp).ok());
+    ASSERT_TRUE(w.close().ok());
+  }
+  // Determine the real on-disk size, then chop the tail of the POSITIONS block:
+  // drop the last 100 u32 positions so the pump runs out mid-stream. docids/freqs/
+  // n_pos header are untouched (they precede the positions block), so the merge
+  // reaches the streamed pump and only stream_positions() hits the truncation.
+  struct stat st {};
+  ASSERT_EQ(::stat(run.path.c_str(), &st), 0);
+  const off_t chopped = st.st_size - static_cast<off_t>(100 * sizeof(uint32_t));
+  ASSERT_GT(chopped, 0);
+  ASSERT_EQ(::truncate(run.path.c_str(), chopped), 0);
+
+  // Drive the merge: capture the pump, then drain it into a sentinel-poisoned
+  // buffer (mirrors the windowed writer's synchronous consumption). The pump
+  // must zero-fill the unreachable tail rather than leave the sentinel in place.
+  constexpr uint32_t kSentinel = 0xDEADBEEFu;
+  bool saw_pump = false;
+  std::vector<uint32_t> drained;
+  const Status s = MergeRuns(
+      {run.path}, vocab, /*has_positions=*/true,
+      [&](TermPostings&& tp) {
+        ASSERT_TRUE(static_cast<bool>(tp.pos_pump));  // wide term -> streamed pump
+        saw_pump = true;
+        drained.assign(static_cast<size_t>(tp.pos_total), kSentinel);
+        if (tp.pos_total != 0) {
+          tp.pos_pump(drained.data(), static_cast<size_t>(tp.pos_total));
+        }
+      },
+      /*allow_stream_positions=*/true);
+
+  // The merge must surface the truncation as Corruption (latched after fn()).
+  EXPECT_EQ(s.code(), StatusCode::kCorruption) << s.message();
+  ASSERT_TRUE(saw_pump);
+  // The crux: NOT ONE slot may still hold the sentinel. Whatever the pump could
+  // not fill (the chopped tail) must be deterministic zero -- never uninitialized
+  // / never the poison value. (The leading slots it did fill are the real data.)
+  for (uint32_t v : drained) {
+    ASSERT_NE(v, kSentinel) << "pump left an unfilled slot uninitialized";
+  }
+  // Stronger: the truncated tail (last 100 positions) must be exactly zero.
+  size_t zeros = 0;
+  for (size_t i = drained.size(); i-- > 0 && drained[i] == 0u;) ++zeros;
+  EXPECT_GE(zeros, 100u) << "chopped tail was not zero-filled";
 }
 
 // A truncated run file is rejected by decode (anti-corruption on bytes we read).

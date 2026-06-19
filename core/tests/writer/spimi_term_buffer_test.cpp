@@ -1,5 +1,9 @@
 #include <gtest/gtest.h>
 
+#include <fcntl.h>
+#include <sys/resource.h>
+#include <unistd.h>
+
 #include <cstdint>
 #include <string>
 #include <vector>
@@ -240,4 +244,199 @@ TEST(SpimiTermBuffer, StreamingDrainsAndShrinks) {
   // After consuming each of the 3 terms, the live count drops 2,1,0.
   EXPECT_EQ(remaining_after_each, (std::vector<size_t>{2u, 1u, 0u}));
   EXPECT_EQ(buf.unique_terms(), 0u);
+}
+
+// A REVISITED docid (the out-of-order defensive path actually re-touches a doc:
+// feed 5,1,5) MUST coalesce into ONE entry per docid -- summed freq, positions
+// concatenated in document order -- matching the k-way merge path and the writer's
+// strictly-ascending precondition. Without coalescing this yielded docids
+// {1,5,5} (duplicate, unsorted) that the writer later rejects.
+TEST(SpimiTermBuffer, RevisitedDocidCoalescesWithPositions) {
+  SpimiTermBuffer buf(/*has_positions=*/true);
+  buf.add_token("t", 5, 50);  // doc 5, first visit
+  buf.add_token("t", 5, 51);
+  buf.add_token("t", 1, 10);  // doc 1
+  buf.add_token("t", 5, 52);  // doc 5 REVISITED (a fresh doc-group, same docid)
+
+  std::vector<TermPostings> terms = buf.finalize_sorted();
+  ASSERT_EQ(terms.size(), 1u);
+  const TermPostings& t = terms[0];
+  // Exactly one entry per docid, strictly ascending.
+  EXPECT_EQ(t.docids, (std::vector<uint32_t>{1u, 5u}));
+  // doc 5 freq = 2 (first visit) + 1 (revisit) = 3; doc 1 freq = 1.
+  EXPECT_EQ(t.freqs, (std::vector<uint32_t>{1u, 3u}));
+  // Positions in document order: doc 1 {10}, then doc 5's two visits in arrival
+  // order {50,51} then {52}.
+  EXPECT_EQ(t.positions_flat, (std::vector<uint32_t>{10u, 50u, 51u, 52u}));
+  // doc_positions slices stay consistent with the merged freqs.
+  EXPECT_EQ(std::vector<uint32_t>(t.doc_positions(1).begin(), t.doc_positions(1).end()),
+            (std::vector<uint32_t>{50u, 51u, 52u}));
+  EXPECT_TRUE(buf.status().ok());
+}
+
+// Same revisit, positions disabled: freqs still sum and docids stay unique.
+TEST(SpimiTermBuffer, RevisitedDocidCoalescesNoPositions) {
+  SpimiTermBuffer buf(/*has_positions=*/false);
+  buf.add_token("t", 5, 0);
+  buf.add_token("t", 1, 0);
+  buf.add_token("t", 5, 0);  // revisit doc 5
+
+  std::vector<TermPostings> terms = buf.finalize_sorted();
+  ASSERT_EQ(terms.size(), 1u);
+  EXPECT_EQ(terms[0].docids, (std::vector<uint32_t>{1u, 5u}));
+  EXPECT_EQ(terms[0].freqs, (std::vector<uint32_t>{1u, 2u}));
+  EXPECT_TRUE(terms[0].positions_flat.empty());
+}
+
+// The coalesced out-of-order output satisfies the writer's strictly-ascending
+// docid precondition: docids are unique AND strictly increasing (the exact check
+// LogicalIndexWriter::validate_term enforces). This is the contract the fix
+// restores -- previously a revisited docid produced a non-ascending list.
+TEST(SpimiTermBuffer, RevisitedDocidProducesStrictlyAscending) {
+  SpimiTermBuffer buf(/*has_positions=*/true);
+  // A messy revisit pattern: 9,3,9,3,1.
+  buf.add_token("w", 9, 0);
+  buf.add_token("w", 3, 0);
+  buf.add_token("w", 9, 1);
+  buf.add_token("w", 3, 1);
+  buf.add_token("w", 1, 0);
+
+  std::vector<TermPostings> terms = buf.finalize_sorted();
+  ASSERT_EQ(terms.size(), 1u);
+  const TermPostings& t = terms[0];
+  ASSERT_FALSE(t.docids.empty());
+  for (size_t i = 1; i < t.docids.size(); ++i) {
+    EXPECT_LT(t.docids[i - 1], t.docids[i]) << "docids must be strictly ascending";
+  }
+  EXPECT_EQ(t.docids, (std::vector<uint32_t>{1u, 3u, 9u}));
+  EXPECT_EQ(t.freqs, (std::vector<uint32_t>{1u, 2u, 2u}));
+  // Total positions equals total tokens (sum of freqs) -- nothing dropped.
+  uint64_t total_freq = 0;
+  for (uint32_t f : t.freqs) total_freq += f;
+  EXPECT_EQ(t.positions_flat.size(), total_freq);
+}
+
+// Hardening: add_token(string_view) on a BORROWED-vocab buffer is rejected (it
+// would otherwise grow the owned vocab out of step with the borrowed one and
+// corrupt the build). The token is ignored and an error is latched.
+TEST(SpimiTermBuffer, AddTokenStringViewRejectedInBorrowedMode) {
+  const std::vector<std::string> vocab = {"a", "b"};
+  SpimiTermBuffer buf(&vocab, /*has_positions=*/false);
+  buf.add_token(0, 0, 0);                 // valid id-path token
+  buf.add_token(std::string_view("a"), 1, 0);  // illegal on a borrowed-vocab buffer
+  EXPECT_FALSE(buf.status().ok());
+  // The string-view token was ignored: only the one id-path token counts.
+  EXPECT_EQ(buf.total_tokens(), 1u);
+  EXPECT_EQ(buf.unique_terms(), 1u);
+}
+
+// A spill's open() I/O failure surfaces as a LATCHED error in status() (the
+// streaming for_each_term_sorted swallows the failure, so callers must check
+// status()). We force open() to fail deterministically by EXHAUSTING every free
+// file descriptor below the soft limit, so the spill's ::open returns EMFILE.
+TEST(SpimiTermBuffer, SpillOpenIoFailureLatched) {
+  // Tiny threshold so the very first token triggers a spill_to_run().
+  SpimiTermBuffer buf(/*has_positions=*/false, /*spill_threshold_bytes=*/1);
+
+  // Cap the soft limit low so we can exhaust the fd table cheaply, then hold it.
+  struct rlimit saved {};
+  ASSERT_EQ(getrlimit(RLIMIT_NOFILE, &saved), 0);
+  struct rlimit tight = saved;
+  tight.rlim_cur = 64;  // small, but >= the few gtest/std fds already open
+  if (tight.rlim_cur > saved.rlim_max) tight.rlim_cur = saved.rlim_max;
+  ASSERT_EQ(setrlimit(RLIMIT_NOFILE, &tight), 0);
+
+  // Open /dev/null until the table is full: every free fd below the limit is now
+  // taken, so the next ::open (the spill's) cannot get one -> EMFILE.
+  std::vector<int> hogs;
+  for (;;) {
+    int fd = ::open("/dev/null", O_RDONLY);
+    if (fd < 0) break;  // table exhausted
+    hogs.push_back(fd);
+  }
+  ASSERT_FALSE(hogs.empty());
+
+  buf.add_token("z", 0, 0);  // triggers a spill whose RunWriter::open must fail
+
+  // Release the hog fds and restore the limit before asserting (so gtest I/O works).
+  for (int fd : hogs) ::close(fd);
+  ASSERT_EQ(setrlimit(RLIMIT_NOFILE, &saved), 0);
+
+  EXPECT_FALSE(buf.status().ok()) << "spill open() failure must latch an error";
+}
+
+// Double-drain safety: a SECOND drain (finalize_sorted after for_each_term_sorted,
+// or a second finalize_sorted) must NOT silently re-emit or emit a wrong stream;
+// it returns empty / no callbacks AND latches an error.
+TEST(SpimiTermBuffer, DoubleDrainIsRejected) {
+  SpimiTermBuffer buf(/*has_positions=*/true);
+  buf.add_token("a", 0, 0);
+  buf.add_token("b", 0, 0);
+
+  std::vector<TermPostings> first = buf.finalize_sorted();
+  ASSERT_EQ(first.size(), 2u);
+  EXPECT_TRUE(buf.status().ok());
+
+  // Second finalize_sorted: empty result + latched error.
+  std::vector<TermPostings> second = buf.finalize_sorted();
+  EXPECT_TRUE(second.empty());
+  EXPECT_FALSE(buf.status().ok());
+
+  // for_each_term_sorted after a drain also emits nothing.
+  size_t seen = 0;
+  buf.for_each_term_sorted([&](TermPostings&&) { ++seen; });
+  EXPECT_EQ(seen, 0u);
+}
+
+// Double-drain via for_each_term_sorted first, then finalize_sorted: same guard.
+TEST(SpimiTermBuffer, DoubleDrainStreamingThenMaterialized) {
+  SpimiTermBuffer buf(/*has_positions=*/false);
+  buf.add_token("a", 0, 0);
+
+  size_t seen = 0;
+  buf.for_each_term_sorted([&](TermPostings&&) { ++seen; });
+  EXPECT_EQ(seen, 1u);
+  EXPECT_TRUE(buf.status().ok());
+
+  std::vector<TermPostings> again = buf.finalize_sorted();
+  EXPECT_TRUE(again.empty());
+  EXPECT_FALSE(buf.status().ok());
+}
+
+// BYTE-IDENTICAL guard for normal ascending input: the streaming and materialized
+// drains over an ASCENDING feed (the common, valid path -- NOT the out-of-order
+// path the coalescing fix touches) must produce identical docids/freqs/positions.
+// This asserts the fix did not perturb the normal path's produced postings.
+TEST(SpimiTermBuffer, AscendingInputByteIdenticalAcrossDrains) {
+  auto feed = [](SpimiTermBuffer& b) {
+    for (uint32_t d = 0; d < 50; ++d) {
+      b.add_token("apple", d, d * 2);
+      b.add_token("apple", d, d * 2 + 1);  // freq 2 per doc
+      if (d % 2 == 0) b.add_token("banana", d, d);
+      if (d % 3 == 0) b.add_token("cherry", d, d + 100);
+    }
+  };
+  SpimiTermBuffer mat(/*has_positions=*/true);
+  SpimiTermBuffer strm(/*has_positions=*/true);
+  feed(mat);
+  feed(strm);
+
+  std::vector<TermPostings> material = mat.finalize_sorted();
+  std::vector<TermPostings> streamed;
+  strm.for_each_term_sorted([&](TermPostings&& tp) { streamed.push_back(std::move(tp)); });
+
+  ASSERT_EQ(material.size(), streamed.size());
+  for (size_t i = 0; i < material.size(); ++i) {
+    EXPECT_EQ(material[i].term, streamed[i].term);
+    EXPECT_EQ(material[i].docids, streamed[i].docids);
+    EXPECT_EQ(material[i].freqs, streamed[i].freqs);
+    EXPECT_EQ(material[i].positions_flat, streamed[i].positions_flat);
+  }
+  // Spot-check apple stayed exactly one entry per ascending docid (no coalescing
+  // path was taken for this valid feed).
+  ASSERT_EQ(material[0].term, "apple");
+  EXPECT_EQ(material[0].docids.size(), 50u);
+  for (uint32_t f : material[0].freqs) EXPECT_EQ(f, 2u);
+  EXPECT_TRUE(mat.status().ok());
+  EXPECT_TRUE(strm.status().ok());
 }

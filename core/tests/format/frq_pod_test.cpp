@@ -8,8 +8,10 @@
 #include "snii/common/slice.h"
 #include "snii/common/status.h"
 #include "snii/encoding/byte_sink.h"
+#include "snii/encoding/crc32c.h"
 
 using snii::ByteSink;
+using snii::crc32c;
 using snii::Slice;
 using snii::Status;
 using snii::StatusCode;
@@ -257,4 +259,98 @@ TEST(FrqPod, NullArgsRejected) {
   FrqRegionMeta meta;
   EXPECT_EQ(build_dd_region(docs, 0, -1, nullptr, &meta).code(),
             StatusCode::kInvalidArgument);
+}
+
+// N=0 empty-term prelude round-trips: the dd region encodes VInt n=0 (no PFOR
+// runs) and the freq region is zero-length; both decode back to empty vectors.
+TEST(FrqPod, EmptyTermZeroDocsRoundTrip) {
+  U32Vec docs;   // N = 0 (empty term)
+  U32Vec freqs;  // no freqs
+  ByteSink dd_sink, freq_sink;
+  FrqRegionMeta dd_meta, freq_meta;
+  ASSERT_TRUE(build_dd_region(docs, /*win_base=*/0, /*level=*/0, &dd_sink, &dd_meta).ok());
+  ASSERT_TRUE(build_freq_region(freqs, /*level=*/0, &freq_sink, &freq_meta).ok());
+  EXPECT_EQ(freq_meta.uncomp_len, 0u);  // empty freq region carries no bytes
+
+  U32Vec out_docs, out_freqs;
+  ASSERT_TRUE(decode_dd_region(Slice(dd_sink.buffer()), dd_meta, 0, &out_docs).ok());
+  EXPECT_TRUE(out_docs.empty());
+  ASSERT_TRUE(decode_freq_region(Slice(freq_sink.buffer()), freq_meta,
+                                 out_docs.size(), &out_freqs)
+                  .ok());
+  EXPECT_TRUE(out_freqs.empty());
+}
+
+// A truncated freq region (slice shorter than meta.disk_len) is rejected: the
+// length-mismatch guard in open_region fires before any payload decode.
+TEST(FrqPod, TruncatedFreqRegionRejected) {
+  U32Vec freqs = {1, 2, 3, 4, 5, 6, 7, 8};
+  ByteSink sink;
+  FrqRegionMeta meta;
+  ASSERT_TRUE(build_freq_region(freqs, /*level=*/0, &sink, &meta).ok());
+  std::vector<uint8_t> bytes = sink.buffer();
+  ASSERT_GT(bytes.size(), 1u);
+  bytes.pop_back();  // slice now shorter than meta.disk_len
+  U32Vec out_freqs;
+  Status s = decode_freq_region(Slice(bytes), meta, freqs.size(), &out_freqs);
+  EXPECT_EQ(s.code(), StatusCode::kCorruption);
+}
+
+// A dd region with extra trailing bytes (crc + length kept VALID for the longer
+// slice) must be rejected by the post-decode eof() check, not the crc/length
+// guards. We craft a raw region, append a garbage byte, then fix disk_len,
+// uncomp_len, and crc so every earlier guard passes and only the inner
+// "trailing bytes" assertion can fire.
+TEST(FrqPod, DdRegionTrailingBytesRejected) {
+  U32Vec docs = {0, 1, 2, 3, 4, 5};
+  ByteSink sink;
+  FrqRegionMeta meta;
+  ASSERT_TRUE(build_dd_region(docs, 0, /*level=*/0, &sink, &meta).ok());  // raw
+  ASSERT_FALSE(meta.zstd);
+  std::vector<uint8_t> bytes = sink.buffer();
+  bytes.push_back(0x00);  // garbage trailing byte appended to the plaintext
+  // Keep raw invariant uncomp_len == disk_len and a matching crc so open_region
+  // accepts the slice; only the payload-level eof() check can reject it.
+  meta.disk_len = bytes.size();
+  meta.uncomp_len = bytes.size();
+  meta.crc = crc32c(Slice(bytes));
+  U32Vec out_docs;
+  Status s = decode_dd_region(Slice(bytes), meta, 0, &out_docs);
+  EXPECT_EQ(s.code(), StatusCode::kCorruption);
+}
+
+// A freq region with extra trailing bytes (crc + length kept VALID) must be
+// rejected by the post-decode eof() check. Same crafting strategy as above.
+TEST(FrqPod, FreqRegionTrailingBytesRejected) {
+  U32Vec freqs = {3, 1, 4, 1, 5, 9};
+  ByteSink sink;
+  FrqRegionMeta meta;
+  ASSERT_TRUE(build_freq_region(freqs, /*level=*/0, &sink, &meta).ok());  // raw
+  ASSERT_FALSE(meta.zstd);
+  std::vector<uint8_t> bytes = sink.buffer();
+  bytes.push_back(0x00);  // garbage trailing byte appended to the plaintext
+  meta.disk_len = bytes.size();
+  meta.uncomp_len = bytes.size();
+  meta.crc = crc32c(Slice(bytes));
+  U32Vec out_freqs;
+  Status s = decode_freq_region(Slice(bytes), meta, freqs.size(), &out_freqs);
+  EXPECT_EQ(s.code(), StatusCode::kCorruption);
+}
+
+// The uncomp_len sanity cap (kMaxRegionUncompBytes = 256 MiB) guards against a
+// corrupted length that would inflate to a giant allocation. We keep the on-disk
+// slice + crc valid (so the length/crc guards pass) and only override uncomp_len
+// to an absurd value, proving the cap branch is what rejects it.
+TEST(FrqPod, UncompLenCapRejected) {
+  U32Vec docs = {0, 1, 2, 3, 4, 5};
+  ByteSink sink;
+  FrqRegionMeta meta;
+  ASSERT_TRUE(build_dd_region(docs, 0, /*level=*/0, &sink, &meta).ok());
+  std::vector<uint8_t> bytes = sink.buffer();
+  // kMaxRegionUncompBytes is an internal (anonymous-namespace) constant; use its
+  // literal value (256 MiB) + 1 to step just past the cap.
+  meta.uncomp_len = static_cast<uint64_t>(256u * 1024 * 1024) + 1;
+  U32Vec out_docs;
+  Status s = decode_dd_region(Slice(bytes), meta, 0, &out_docs);
+  EXPECT_EQ(s.code(), StatusCode::kCorruption);
 }

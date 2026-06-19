@@ -64,6 +64,13 @@ class CompactPostingPool {
   // to fill exactly one slice without hardcoding the schedule.
   static uint32_t kSliceSizes_level0();
 
+  // Payload capacity of the slice at `level`, and the level a chain advances to when
+  // that slice overflows. Exposed (like kSliceSizes_level0) so tests can simulate the
+  // arena's bump allocator exactly -- e.g. to construct an EXACT block-boundary fill --
+  // without hardcoding the private schedule. `level` must be in [0, kLevelCount).
+  static uint32_t kSliceSize_at(int level);
+  static uint8_t kNextLevel_at(int level);
+
   // Live append handle for one term's chain. POD, 8 bytes: the absolute write
   // cursor and the absolute end of the current slice's payload region. The chain's
   // current slice LEVEL is kept by the caller (a uint8, packed alongside its other
@@ -103,23 +110,48 @@ class CompactPostingPool {
 
   // ---- Reader ----------------------------------------------------------------
   // Forward cursor over one term's chain, yielding its payload bytes in write
-  // order. Built from the chain head and the exact payload length the term wrote.
+  // order by walking the slice forward pointers.
+  //
+  // CONTRACT of the `budget` ctor argument (single, unambiguous meaning):
+  //   `budget` is an UPPER BOUND on the number of bytes this cursor may yield. It
+  //   is NOT required to equal the exact payload length: passing the exact length
+  //   is fine, and so is passing any value >= it (the production caller passes the
+  //   chain's write-head offset, which always bounds the payload from above). The
+  //   cursor is SELF-TERMINATING: once it walks off the last written byte it sees
+  //   the tail slice's zero forward pointer and stops, regardless of how much
+  //   budget remains. So an over-large budget can never make next() read past the
+  //   chain (no aliasing of block 0, no off-chain access) -- the budget is purely a
+  //   secondary cap. has_next() is therefore a reliable "more bytes remain"
+  //   predicate for ANY budget >= the true length: it becomes false at the smaller
+  //   of (budget exhausted, chain tail reached).
   class Cursor {
    public:
-    Cursor(const CompactPostingPool* pool, uint32_t head, uint32_t remaining);
+    Cursor(const CompactPostingPool* pool, uint32_t head, uint32_t budget);
 
-    bool has_next() const { return remaining_ > 0; }
-    uint8_t next();  // UB if !has_next()
+    // True while the cursor can still yield a REAL payload byte: the budget is not
+    // spent AND the cursor has not reached the chain tail. It peeks the tail forward
+    // pointer at a slice boundary so it never reports a phantom trailing byte, making
+    // has_next()/next() a safe loop for any budget >= the true payload length.
+    bool has_next() const;
+    // Yields the next payload byte. Returns 0 (and yields no more) once the chain
+    // tail is reached or the budget is spent -- never reads past the chain.
+    uint8_t next();
 
    private:
     const CompactPostingPool* pool_;
     uint32_t cur_;        // absolute read cursor
     uint32_t slice_end_;  // one-past-last payload byte of the current slice
     uint32_t level_;      // current slice level
-    uint32_t remaining_;  // payload bytes still to yield
+    uint32_t budget_;     // remaining byte budget (upper bound on bytes to yield)
   };
 
-  Cursor cursor(uint32_t head, uint32_t len) const { return Cursor(this, head, len); }
+  // Builds a cursor over the chain at `head`. `budget` is an UPPER BOUND on bytes to
+  // read (see Cursor's contract): the exact payload length or anything larger. The
+  // production caller passes the write-head offset, which always bounds the payload
+  // from above; the cursor self-terminates at the chain tail regardless.
+  Cursor cursor(uint32_t head, uint32_t budget) const {
+    return Cursor(this, head, budget);
+  }
 
  private:
   static const uint32_t kSliceSizes[kLevelCount];

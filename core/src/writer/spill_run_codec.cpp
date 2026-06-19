@@ -534,11 +534,24 @@ Status MergeRuns(const std::vector<std::string>& run_paths,
           const size_t take = std::min(n - off, static_cast<size_t>(r->positions_remaining()));
           Status s = r->stream_positions(dst + off, take);
           if (!s.ok()) {
+            // Mid-stream I/O / corruption: zero-fill the UNFILLED tail before
+            // returning. fn() has the pump and will consume dst BEFORE pump_status
+            // is surfaced after fn(); never hand it uninitialized bytes (the
+            // failed stream_positions wrote nothing into dst[off..]). The error is
+            // still latched and surfaced after fn(), so the build aborts -- the
+            // zero fill only guarantees deterministic, defined bytes meanwhile.
+            std::memset(dst + off, 0, (n - off) * sizeof(uint32_t));
             if (pump_status.ok()) pump_status = std::move(s);
-            return;  // leave dst tail unfilled; surfaced after fn()
+            return;
           }
           off += take;
         }
+        // Short-fill on over-pull (cursor ran past the matching runs without an
+        // error status): the readers held fewer positions than n. Zero-fill the
+        // unfilled tail so the writer never reads uninitialized storage. With
+        // valid runs n == pos_total == sum(positions_remaining), so off == n and
+        // this memset spans zero bytes -- the produced .idx is unchanged.
+        if (off < n) std::memset(dst + off, 0, (n - off) * sizeof(uint32_t));
       };
       fn(std::move(merged));
       SNII_RETURN_IF_ERROR(pump_status);  // surface a streamed-read I/O error
