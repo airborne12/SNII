@@ -6,10 +6,13 @@
 #include <atomic>
 #include <cstdio>
 #include <cstdlib>
+#include <memory>
 #include <numeric>
 #include <string>
 #include <utility>
 
+#include "snii/encoding/varint.h"
+#include "snii/format/format_constants.h"
 #include "snii/writer/spill_run_codec.h"
 
 #if defined(__GLIBC__)
@@ -101,6 +104,18 @@ SpimiTermBuffer::Term& SpimiTermBuffer::term_slot(uint32_t term_id, bool* new_te
   return slots_[slot];
 }
 
+// Appends one byte to a term's chain, starting the chain lazily on first use.
+void SpimiTermBuffer::put_byte(Term* t, uint8_t b) {
+  if (t->head == kNoChain) t->head = pool_.start_chain(&t->w, &t->level);
+  pool_.append_byte(&t->w, &t->level, b);
+}
+
+void SpimiTermBuffer::put_varint(Term* t, uint64_t v) {
+  uint8_t tmp[10];
+  const size_t n = encode_varint64(v, tmp);
+  for (size_t i = 0; i < n; ++i) put_byte(t, tmp[i]);
+}
+
 void SpimiTermBuffer::accumulate(uint32_t term_id, uint32_t docid, uint32_t pos) {
   bool new_term = false;
   Term& t = term_slot(term_id, &new_term);
@@ -108,14 +123,27 @@ void SpimiTermBuffer::accumulate(uint32_t term_id, uint32_t docid, uint32_t pos)
     touched_ids_.push_back(term_id);
     ++live_term_count_;
   }
-  const bool new_doc = t.docids.empty() || t.docids.back() != docid;
+  // A token starts a new doc unless it continues the most-recent doc for this term.
+  const bool new_doc = !t.started || t.cur_docid != docid;
+  // Tagged entry: varint((pos << 1) | new_doc). Positions are tagged 0 when
+  // disabled. The new_doc bit lets the decoder recover per-doc freqs by counting.
+  // Widen to 64-bit so a full 32-bit position survives the << 1 without truncation.
+  const uint64_t tagged =
+      has_positions_ ? ((static_cast<uint64_t>(pos) << 1) | (new_doc ? 1u : 0u))
+                     : (new_doc ? 1u : 0u);
+  put_varint(&t, tagged);
   if (new_doc) {
-    if (!t.docids.empty() && docid < t.docids.back()) t.sorted = false;
-    t.docids.push_back(docid);
-    t.freqs.push_back(0);
+    // Out-of-order docids are tolerated (zigzag delta is signed) and reordered at
+    // finalize; flag them so to_postings sorts. The delta base is the previous
+    // distinct doc (cur_docid), which is 0 for the very first doc (started==false).
+    const int64_t base = t.started ? static_cast<int64_t>(t.cur_docid) : 0;
+    if (t.started && docid < t.cur_docid) t.sorted = false;
+    const int64_t delta = static_cast<int64_t>(docid) - base;
+    put_varint(&t, zigzag_encode(delta));
+    t.cur_docid = docid;
+    t.started = true;
   }
-  ++t.freqs.back();
-  if (has_positions_) t.positions_flat.push_back(pos);
+  ++t.ntok;
   ++total_tokens_;
 
   if (spill_threshold_bytes_ != 0) {
@@ -194,17 +222,111 @@ void SortByDocid(std::vector<uint32_t>* docids, std::vector<uint32_t>* freqs,
 
 }  // namespace
 
-TermPostings SpimiTermBuffer::to_postings(std::string term, Term&& t) const {
-  if (!t.sorted) {
-    SortByDocid(&t.docids, &t.freqs, &t.positions_flat, has_positions_);
+namespace {
+
+// Decodes one varint from a pool chain cursor. The chain was written by
+// encode_varint*, so the same LEB128 continuation-bit loop reconstructs it.
+uint64_t DecodeChainVarint(CompactPostingPool::Cursor* c) {
+  uint64_t result = 0;
+  int shift = 0;
+  for (;;) {
+    const uint8_t b = c->next();
+    result |= static_cast<uint64_t>(b & 0x7F) << shift;
+    if ((b & 0x80) == 0) break;
+    shift += 7;
   }
+  return result;
+}
+
+}  // namespace
+
+// Decodes a term's compact tagged chain back into a flat TermPostings (the exact
+// docids/freqs/positions_flat the writer consumes), so the produced index is
+// byte-identical to the legacy raw-uint32 accumulator. The chain holds one entry
+// per token: varint((pos << 1) | new_doc); each new_doc entry is followed by a
+// zigzag(docid-delta). A doc's freq is the run length of consecutive same-doc
+// tokens; positions stream out in document order (empty when positions disabled).
+// Stream positions for a sorted term whose token count exceeds this: such a term's
+// flat positions buffer (uint32 per token) would be the peak-RSS transient (tens of
+// MiB for the widest term). Below it, the flat buffer is cheap and simpler.
+static constexpr uint32_t kStreamPositionsTokenThreshold = 1u << 16;  // 65536
+
+TermPostings SpimiTermBuffer::to_postings(std::string term, Term&& t,
+                                          bool allow_stream_positions) const {
   TermPostings tp;
   tp.term = std::move(term);
-  tp.docids = std::move(t.docids);
-  tp.freqs = std::move(t.freqs);
-  if (has_positions_) {
-    // Flat positions move straight through -- no per-doc vector-of-vectors built.
-    tp.positions_flat = std::move(t.positions_flat);
+  if (t.ntok == 0 || t.head == kNoChain) return tp;
+
+  // Reserve docids/freqs by ntok (an upper bound on the doc count: ntok >= ndocs).
+  // The doc count is not stored separately to keep Term compact; since the corpus
+  // is freq~1 per (term, doc), ntok ~= ndocs so the over-reserve is negligible.
+  tp.docids.reserve(t.ntok);
+  tp.freqs.reserve(t.ntok);
+
+  // For a large SORTED term, stream positions on demand instead of materializing a
+  // multi-MiB flat buffer: the writer (prx builder) pulls them window by window via
+  // pos_pump, decoding straight from the still-resident arena chain. Out-of-order
+  // terms (rare, defensive) need a full sort, so they always use the flat path.
+  const bool stream_pos = allow_stream_positions && has_positions_ && t.sorted &&
+                          t.ntok >= kStreamPositionsTokenThreshold;
+  if (has_positions_ && !stream_pos) tp.positions_flat.reserve(t.ntok);
+
+  CompactPostingPool::Cursor c = pool_.cursor(t.head, t.w.cur);
+  int64_t prev = 0;
+  for (uint32_t i = 0; i < t.ntok; ++i) {
+    const uint64_t tagged = DecodeChainVarint(&c);
+    const bool new_doc = (tagged & 1u) != 0;
+    if (new_doc) {
+      prev += zigzag_decode(DecodeChainVarint(&c));
+      tp.docids.push_back(static_cast<uint32_t>(prev));
+      tp.freqs.push_back(0);
+    }
+    ++tp.freqs.back();  // count this token toward the current doc's freq
+    if (has_positions_ && !stream_pos) {
+      tp.positions_flat.push_back(static_cast<uint32_t>(tagged >> 1));
+    }
+  }
+
+  // Decide the FINAL position handling now that df (= docids.size()) is known.
+  // pos_pump is honored ONLY by the windowed writer path (build_windowed_entry),
+  // taken when df >= kSlimDfThreshold. A SLIM term (df below it) goes through
+  // build_slim_entry, which reads positions_flat directly -- so streaming would
+  // leave it empty and crash. A high-ntok but low-df term (many repeats in few
+  // docs) therefore falls back to materializing its df-bounded positions here.
+  const bool windowed_path =
+      tp.docids.size() >= snii::format::kSlimDfThreshold;
+  if (stream_pos && windowed_path) {
+    // Hand the writer a sequential position source backed by a SECOND pass over the
+    // same chain (the chain stays resident in pool_ for the whole drain). The pump
+    // yields positions in document order -- identical to positions_flat -- so the
+    // produced .prx is byte-for-byte the same. The cursor is shared/advanced across
+    // calls (the writer pulls in order, exactly pos_total positions total).
+    tp.pos_total = t.ntok;
+    auto cur = std::make_shared<CompactPostingPool::Cursor>(pool_.cursor(t.head, t.w.cur));
+    tp.pos_pump = [cur](uint32_t* dst, size_t count) {
+      // Re-walk the tagged token stream, yielding one position per token. A new-doc
+      // token is followed by a zigzag docid-delta varint that must be consumed and
+      // discarded so the cursor stays aligned with the encoding.
+      for (size_t k = 0; k < count; ++k) {
+        const uint64_t tagged = DecodeChainVarint(cur.get());
+        if ((tagged & 1u) != 0) (void)DecodeChainVarint(cur.get());  // skip docid delta
+        dst[k] = static_cast<uint32_t>(tagged >> 1);
+      }
+    };
+  } else if (stream_pos && has_positions_) {
+    // Slim fallback: the decode loop skipped positions (stream candidate) but the
+    // term is slim, so materialize positions_flat in a second pass for build_slim.
+    tp.positions_flat.reserve(t.ntok);
+    CompactPostingPool::Cursor pc = pool_.cursor(t.head, t.w.cur);
+    for (uint32_t i = 0; i < t.ntok; ++i) {
+      const uint64_t tagged = DecodeChainVarint(&pc);
+      if ((tagged & 1u) != 0) (void)DecodeChainVarint(&pc);  // skip docid delta
+      tp.positions_flat.push_back(static_cast<uint32_t>(tagged >> 1));
+    }
+  } else if (!t.sorted) {
+    // Defensive reorder for the rare out-of-order-docid feed (merge of pre-sorted
+    // runs). The common ascending path leaves t.sorted true and skips it.
+    SortByDocid(&tp.docids, &tp.freqs, &tp.positions_flat, has_positions_);
   }
   return tp;
 }
@@ -245,16 +367,27 @@ void SpimiTermBuffer::release_term(uint32_t term_id) {
   --live_term_count_;
 }
 
-void SpimiTermBuffer::drain_sorted(const std::function<void(TermPostings&&)>& fn) {
+void SpimiTermBuffer::drain_sorted(const std::function<void(TermPostings&&)>& fn,
+                                   bool allow_stream_positions) {
   const std::vector<std::string>& v = vocab();
   for (uint32_t id : sorted_ids()) {
     Term term = std::move(slots_[slot_of_[id] - 1]);
     release_term(id);  // release this term's slot before building the next
-    TermPostings tp = to_postings(v[id], std::move(term));
+    // Allow streaming positions only when the caller consumes synchronously (the
+    // arena chain stays resident for the whole drain, so the pump can read from it).
+    TermPostings tp = to_postings(v[id], std::move(term), allow_stream_positions);
     fn(std::move(tp));
   }
   touched_ids_.clear();
   live_bytes_ = 0;
+  // Drop the arena + the slot pool (their bytes are fully decoded) and return the
+  // freed chunks to the OS so the process peak reflects only what survives the
+  // drain, not retained input-phase arena memory.
+  pool_.reset();
+  std::vector<Term>().swap(slots_);
+  std::vector<uint32_t>().swap(free_slots_);
+  std::vector<uint32_t>().swap(slot_of_);
+  TrimMalloc();
 }
 
 Status SpimiTermBuffer::drain_to_writer(RunWriter* w) {
@@ -265,11 +398,14 @@ Status SpimiTermBuffer::drain_to_writer(RunWriter* w) {
   for (uint32_t id : sorted_ids()) {
     Term term = std::move(slots_[slot_of_[id] - 1]);
     release_term(id);
-    TermPostings tp = to_postings(v[id], std::move(term));
+    // Spill path: the run codec serializes positions_flat directly, so positions
+    // must be materialized (no streaming pump).
+    TermPostings tp = to_postings(v[id], std::move(term), /*allow_stream=*/false);
     if (st.ok()) st = w->write_term(id, tp);
   }
   touched_ids_.clear();
   live_bytes_ = 0;
+  pool_.reset();  // all chains decoded into the run; free the arena for the refill
   return st;
 }
 
@@ -313,17 +449,26 @@ void SpimiTermBuffer::merge_runs(const std::function<void(TermPostings&&)>& fn) 
 }
 
 void SpimiTermBuffer::for_each_term_sorted(const std::function<void(TermPostings&&)>& fn) {
+  // The callback is invoked synchronously while the arena is resident, so large
+  // sorted terms may stream positions via pos_pump (peak-RSS win for the writer).
   if (run_paths_.empty() && spill_status_.ok()) {
-    drain_sorted(fn);  // pure in-memory path: byte-for-byte the legacy behavior
+    drain_sorted(fn, /*allow_stream_positions=*/true);  // pure in-memory path
     return;
   }
-  merge_runs(fn);
+  merge_runs(fn);  // spilled path: MergeRuns yields fully-materialized positions
 }
 
 std::vector<TermPostings> SpimiTermBuffer::finalize_sorted() {
   std::vector<TermPostings> out;
   out.reserve(touched_ids_.size());
-  for_each_term_sorted([&out](TermPostings&& tp) { out.push_back(std::move(tp)); });
+  // RETAINS each TermPostings past the drain, so positions must be MATERIALIZED
+  // (a streamed pos_pump would reference the arena, freed when the drain ends).
+  if (run_paths_.empty() && spill_status_.ok()) {
+    drain_sorted([&out](TermPostings&& tp) { out.push_back(std::move(tp)); },
+                 /*allow_stream_positions=*/false);
+  } else {
+    merge_runs([&out](TermPostings&& tp) { out.push_back(std::move(tp)); });
+  }
   return out;
 }
 

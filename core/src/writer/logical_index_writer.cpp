@@ -239,7 +239,12 @@ Status BuildWindowedPosting(TermPostings& tp, bool has_freq, bool has_prx,
   // grows. m.prx_off is the byte offset WITHIN this entry's prx span (running
   // prx_total_len), matching the reader's prx_off_delta + meta.prx_off contract.
   {
+    // Positions come either from the flat buffer or, for very-high-df terms, from a
+    // sequential pump (so the term's full positions are never materialized). Both
+    // yield the SAME positions in the SAME order, so the prx bytes are identical.
+    const bool streamed = static_cast<bool>(tp.pos_pump);
     const std::span<const uint32_t> all_pos(tp.positions_flat);
+    std::vector<uint32_t> win_pos_buf;  // reused per window when streaming
     uint64_t win_base = 0;
     size_t pos_off = 0;
     for (size_t start = 0; start < n; start += unit) {
@@ -255,9 +260,17 @@ Status BuildWindowedPosting(TermPostings& tp, bool has_freq, bool has_prx,
       size_t win_pos = 0;
       for (uint32_t f : freqs) win_pos += f;
       if (has_prx) {
+        std::span<const uint32_t> pos_span;
+        if (streamed) {
+          win_pos_buf.resize(win_pos);
+          if (win_pos != 0) tp.pos_pump(win_pos_buf.data(), win_pos);
+          pos_span = std::span<const uint32_t>(win_pos_buf);
+        } else {
+          pos_span = all_pos.subspan(pos_off, win_pos);
+        }
         sc.prx_sink.clear();
-        SNII_RETURN_IF_ERROR(snii::format::build_prx_window_flat(
-            all_pos.subspan(pos_off, win_pos), freqs, kAutoZstd, &sc.prx_sink));
+        SNII_RETURN_IF_ERROR(
+            snii::format::build_prx_window_flat(pos_span, freqs, kAutoZstd, &sc.prx_sink));
         m.prx_off = out->prx_total_len;
         m.prx_len = static_cast<uint64_t>(sc.prx_sink.size());
         SNII_RETURN_IF_ERROR(prx_file->append(sc.prx_sink.buffer()));
@@ -313,9 +326,12 @@ Status LogicalIndexWriter::validate_term(const TermPostings& tp) const {
   if (has_prx_) {
     uint64_t total_pos = 0;
     for (uint32_t f : tp.freqs) total_pos += f;
-    if (total_pos != tp.positions_flat.size()) {
+    // Streamed positions (pos_pump set): validate against the declared pos_total
+    // (positions_flat is intentionally empty). Otherwise validate the flat buffer.
+    const uint64_t have = tp.pos_pump ? tp.pos_total : tp.positions_flat.size();
+    if (total_pos != have) {
       return Status::InvalidArgument(
-          "logical_index: flat positions count must equal sum(freqs)");
+          "logical_index: positions count must equal sum(freqs)");
     }
   }
   for (size_t i = 1; i < tp.docids.size(); ++i) {

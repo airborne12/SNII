@@ -96,6 +96,73 @@ TEST(SpimiStreamingWriter, StreamingMatchesMaterializedBytes) {
   EXPECT_EQ(mat_bytes, stream_bytes);
 }
 
+// Position STREAMING (pos_pump) path: a term whose token count exceeds the
+// streaming threshold (65536) has its positions pulled per-window from the arena
+// chain instead of a materialized positions_flat. The streamed (term_source) build
+// must still be BYTE-IDENTICAL to the materialized (finalize_sorted) build -- the
+// pump must yield the exact same positions in the same order, so every .prx byte
+// (and thus the whole container) matches. This is the byte-identity guard for the
+// peak-RSS optimization.
+TEST(SpimiStreamingWriter, StreamedPositionsMatchMaterializedBytesHighDf) {
+  // ~80k docs of a single high-df term gives that term > 65536 tokens, crossing the
+  // streaming threshold. A few extra terms exercise the slim (non-streamed) path
+  // alongside it so both encodings appear in one container.
+  constexpr uint32_t kDocs = 80000;
+  auto feed = [](SpimiTermBuffer* buf) {
+    for (uint32_t d = 0; d < kDocs; ++d) {
+      buf->add_token("hot", d, 0);                    // every doc: > 65536 tokens
+      if (d % 1000 == 0) buf->add_token("cold", d, 1);  // tiny df (slim path)
+    }
+  };
+
+  SpimiTermBuffer mat_buf(/*has_positions=*/true);
+  feed(&mat_buf);
+  SniiIndexInput mat_in = BaseInput(kDocs);
+  mat_in.terms = mat_buf.finalize_sorted();  // materialized: positions_flat
+  const std::vector<uint8_t> mat_bytes = WriteContainer(mat_in);
+
+  SpimiTermBuffer stream_buf(/*has_positions=*/true);
+  feed(&stream_buf);
+  SniiIndexInput stream_in = BaseInput(kDocs);
+  stream_in.term_source = &stream_buf;  // streamed: pos_pump for "hot"
+  const std::vector<uint8_t> stream_bytes = WriteContainer(stream_in);
+
+  ASSERT_EQ(mat_bytes.size(), stream_bytes.size());
+  EXPECT_EQ(mat_bytes, stream_bytes);
+}
+
+// A term repeated MANY times within FEW docs crosses the streaming token threshold
+// (ntok >= 65536) yet has a LOW df (< kSlimDfThreshold == 512), so it takes the SLIM
+// writer path -- which reads positions_flat directly and does NOT honor pos_pump.
+// The stream candidate must therefore fall back to materializing positions for this
+// term; otherwise build_slim_entry sees an empty positions_flat and reads out of
+// bounds (deterministic segfault). Byte-identity vs the materialized build proves
+// both that it does not crash and that the fallback produces the exact same bytes.
+TEST(SpimiStreamingWriter, StreamedLowDfHighNtokMatchesMaterialized) {
+  constexpr uint32_t kDocs = 200;     // df = 200 (< 512 -> slim path)
+  constexpr uint32_t kReps = 400;     // 200 * 400 = 80000 tokens (> 65536 -> stream)
+  auto feed = [](SpimiTermBuffer* buf) {
+    for (uint32_t d = 0; d < kDocs; ++d) {
+      for (uint32_t p = 0; p < kReps; ++p) buf->add_token("rep", d, p);
+    }
+  };
+
+  SpimiTermBuffer mat_buf(/*has_positions=*/true);
+  feed(&mat_buf);
+  SniiIndexInput mat_in = BaseInput(kDocs);
+  mat_in.terms = mat_buf.finalize_sorted();
+  const std::vector<uint8_t> mat_bytes = WriteContainer(mat_in);
+
+  SpimiTermBuffer stream_buf(/*has_positions=*/true);
+  feed(&stream_buf);
+  SniiIndexInput stream_in = BaseInput(kDocs);
+  stream_in.term_source = &stream_buf;
+  const std::vector<uint8_t> stream_bytes = WriteContainer(stream_in);
+
+  ASSERT_EQ(mat_bytes.size(), stream_bytes.size());
+  EXPECT_EQ(mat_bytes, stream_bytes);
+}
+
 // The streaming path drains its source: after build the buffer is empty.
 TEST(SpimiStreamingWriter, StreamingConsumesSource) {
   SpimiTermBuffer buf(/*has_positions=*/true);

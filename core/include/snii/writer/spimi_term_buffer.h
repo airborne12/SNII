@@ -9,6 +9,7 @@
 #include <vector>
 
 #include "snii/common/status.h"
+#include "snii/writer/compact_posting_pool.h"
 
 namespace snii::writer {
 
@@ -27,6 +28,19 @@ struct TermPostings {
   std::vector<uint32_t> docids;
   std::vector<uint32_t> freqs;
   std::vector<uint32_t> positions_flat;  // empty when positions disabled
+
+  // OPTIONAL streamed-positions source (peak-RSS optimization for very-high-df
+  // terms). When set, positions_flat is left EMPTY and the writer pulls positions
+  // SEQUENTIALLY in document order via pos_pump(dst, n) -- filling `dst[0..n)` with
+  // the next n positions -- one window at a time, so the term's full flat positions
+  // buffer (tens of MiB for the widest term) is never materialized. The yielded
+  // bytes are byte-identical to building from positions_flat (same values, same
+  // order). pos_total is the total number of positions the pump will yield (==
+  // sum(freqs)); it lets the writer validate without a flat buffer. When pos_pump
+  // is null, positions come from positions_flat as before. Only the writer's prx
+  // builders consume this; all other consumers use positions_flat.
+  std::function<void(uint32_t*, size_t)> pos_pump;
+  uint64_t pos_total = 0;
 
   // Byte offset of doc i's first position within positions_flat (prefix sum of
   // freqs). O(i) -- callers iterating all docs should track a running offset.
@@ -97,11 +111,21 @@ struct TermPostings {
 // the threshold (plus the widest single term), NOT by total postings. With the
 // default threshold 0 (unlimited) the path is exactly the in-memory behavior.
 //
-// Internal representation is FLAT per-term parallel arrays (docids/freqs and a
-// single positions_flat vector), NOT a per-doc node-graph: this avoids the
-// red-black-tree node overhead and the millions of tiny per-posting position
-// vectors that dominated peak memory. Per-doc position counts are recoverable
-// from freqs (positions are stored in document order).
+// Internal representation is a COMPACT TAGGED VARINT byte stream per term, held in
+// a shared SEGMENTED ARENA (CompactPostingPool), NOT per-term uint32 vectors. Each
+// term owns ONE arena chain holding a stream of per-TOKEN entries in arrival
+// order: every token contributes varint((pos << 1) | new_doc_bit); when new_doc_bit
+// is set, the token's doc differs from the previous one, so a zigzag-varint(docid -
+// prev_docid) immediately follows. Frequencies are NOT stored -- a doc's freq is
+// the count of consecutive same-doc tokens, recovered while decoding. This drops
+// the entire freq stream and the second (positions) chain versus a freq/prox split,
+// so the payload is ~3.4x smaller than raw uint32 docids/freqs/positions, and the
+// shared arena removes per-vector doubling slack and per-term vector headers. Each
+// append writes straight into the chain (no deferred per-doc flush): the only live
+// per-term state is the current doc id (to detect a doc change) and the delta base.
+// to_postings() decodes a term's chain back to the SAME flat TermPostings the
+// writer consumes, so the produced .idx is BYTE-IDENTICAL. positions_flat stays
+// empty (and pos is tagged as 0) when positions are disabled; freq still counts.
 //
 // Duplicate vocab strings: the vocab is assumed to map each id to a DISTINCT
 // string (a dense vocabulary). If two ids share a string they sort adjacently
@@ -162,16 +186,25 @@ class SpimiTermBuffer {
   void for_each_term_sorted(const std::function<void(TermPostings&&)>& fn);
 
  private:
-  // Flat per-term accumulator. docids[i]/freqs[i] are parallel; positions_flat
-  // holds all positions for this term in document order, partitioned by the
-  // per-doc freqs (doc i owns the next freqs[i] entries). No per-posting heap
-  // vectors, no ordering tree.
+  // Compact per-term accumulator: ONE tagged-varint arena chain plus a few cursors.
+  // Every token is appended immediately (no deferred flush), so the only running
+  // state is the current doc id and the delta base. A sentinel chain head of
+  // kNoChain marks a term that has not started its chain yet (so an all-empty term
+  // costs no arena bytes). ntok / ndocs bound the decode loop and size reserves.
+  // Total ~36 B per live term.
+  static constexpr uint32_t kNoChain = 0xFFFFFFFFu;
   struct Term {
-    std::vector<uint32_t> docids;
-    std::vector<uint32_t> freqs;
-    std::vector<uint32_t> positions_flat;  // empty when positions disabled
-    bool sorted = true;  // false if a docid ever arrived out of ascending order
+    uint32_t head = kNoChain;        // chain read entry point
+    CompactPostingPool::SliceWriter w;  // append cursor for the chain (8 B)
+    uint32_t ntok = 0;               // total tokens (entries) in the chain
+    uint32_t cur_docid = 0;          // most-recent doc id: detects doc change AND
+                                     // is the zigzag delta base for the next doc
+    uint8_t level = 0;               // current slice level of w (packed here, not in w)
+    bool started = false;            // false until the first token is appended
+    bool sorted = true;              // false if a docid arrived out of ascending order
   };
+  static_assert(sizeof(CompactPostingPool::SliceWriter) == 8,
+                "SliceWriter must stay 8 bytes to keep Term compact");
 
   // The active vocabulary (term-id -> string): either the borrowed pointer or,
   // in owned mode, &owned_vocab_. Always non-null after construction.
@@ -180,9 +213,14 @@ class SpimiTermBuffer {
   // Accumulates one already-validated token into the per-id Term.
   void accumulate(uint32_t term_id, uint32_t docid, uint32_t pos);
 
-  // Moves `t`'s flat arrays into a TermPostings (re-slicing positions_flat into
-  // per-doc lists), sorting by docid first if `t.sorted` is false.
-  TermPostings to_postings(std::string term, Term&& t) const;
+  // Decodes `t`'s compact chain into a TermPostings (the exact docids/freqs/
+  // positions the writer consumes), sorting by docid first if `t.sorted` is false.
+  // When `allow_stream_positions` is true (the in-memory drain path), a large
+  // sorted term's positions are provided via TermPostings::pos_pump instead of a
+  // materialized positions_flat (peak-RSS win). The spill path passes false so the
+  // run codec always sees a fully-materialized positions_flat.
+  TermPostings to_postings(std::string term, Term&& t,
+                           bool allow_stream_positions) const;
 
   // Returns the touched term-ids sorted by their vocab string (lexicographic).
   // Sorts by a PRECOMPUTED integer string-rank (term-id -> lexicographic rank),
@@ -192,9 +230,13 @@ class SpimiTermBuffer {
   std::vector<uint32_t> sorted_ids() const;
   // Builds string_rank_ (term-id -> lexicographic rank) once, lazily. Idempotent.
   void ensure_string_rank() const;
-  // Streams the in-memory terms in sorted order, draining terms_ (the in-memory
-  // single-pass path; used both by the no-spill case and to emit the final run).
-  void drain_sorted(const std::function<void(TermPostings&&)>& fn);
+  // Streams the in-memory terms in sorted order, draining the slot pool (the
+  // in-memory single-pass path). When `allow_stream_positions` is true, large
+  // sorted terms stream positions via pos_pump (valid only because the callback
+  // consumes each term synchronously while the arena is still resident); callers
+  // that RETAIN the TermPostings past the drain (finalize_sorted) must pass false.
+  void drain_sorted(const std::function<void(TermPostings&&)>& fn,
+                    bool allow_stream_positions);
   // Spills the current buffer to a fresh sorted run file and clears memory.
   Status spill_to_run();
   // Writes all current terms (sorted) to an already-open RunWriter, draining.
@@ -235,8 +277,18 @@ class SpimiTermBuffer {
   std::vector<uint32_t> touched_ids_;
   size_t live_term_count_ = 0;  // present (non-drained) terms; == unique_terms()
 
+  // Shared arena backing every live term's DOC and POS varint byte chains. Holds
+  // the bulk of the accumulator's memory in a few large blocks (no per-term vector
+  // headers, no per-vector doubling slack) -- the compact-RSS win.
+  CompactPostingPool pool_;
+
   // Returns the live Term for `term_id`, claiming a pool slot on first touch.
   Term& term_slot(uint32_t term_id, bool* new_term);
+
+  // Appends one byte / one varint to a term's tagged chain, lazily starting the
+  // chain on first use (so an untouched term costs no arena bytes).
+  void put_byte(Term* t, uint8_t b);
+  void put_varint(Term* t, uint64_t v);
 
   std::vector<std::string> run_paths_;  // spilled run temp files (deleted in dtor)
   Status spill_status_;                 // first spill / range error, at finalize
