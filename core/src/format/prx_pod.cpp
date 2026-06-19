@@ -23,6 +23,9 @@ inline constexpr int kDefaultZstdLevel = 3;
 inline constexpr uint32_t kMaxWindowUncompBytes = 256u * 1024 * 1024;
 // Anti-DoS cap on position count decoded from a single window before allocation.
 inline constexpr uint32_t kMaxWindowPositions = 1u << 26;  // 64M positions/window
+// Anti-DoS cap on doc count decoded from a single window before allocation. A
+// corrupt doc_count is otherwise fed straight to assign()/reserve() -> bad_alloc.
+inline constexpr uint32_t kMaxWindowDocs = 1u << 24;  // 16M docs/window
 
 // Encode per-doc position lists into a self-describing plain payload (doc_count + per-doc delta stream).
 Status encode_payload(std::span<const std::vector<uint32_t>> per_doc, ByteSink* out) {
@@ -139,6 +142,9 @@ Status decode_pfor_payload(Slice plain, std::vector<std::vector<uint32_t>>* out)
   if (total_pos > kMaxWindowPositions) {
     return Status::Corruption("prx: position count exceeds sane cap");
   }
+  if (doc_count > kMaxWindowDocs) {
+    return Status::Corruption("prx: doc count exceeds sane cap");
+  }
   std::vector<uint32_t> pos_counts;
   SNII_RETURN_IF_ERROR(decode_pfor_runs(&src, doc_count, &pos_counts));
   uint64_t sum = 0;
@@ -181,6 +187,9 @@ Status decode_payload(Slice plain, std::vector<std::vector<uint32_t>>* out) {
   ByteSource src(plain);
   uint32_t doc_count = 0;
   SNII_RETURN_IF_ERROR(src.get_varint32(&doc_count));
+  if (doc_count > kMaxWindowDocs) {
+    return Status::Corruption("prx: doc count exceeds sane cap");
+  }
   out->clear();
   out->reserve(doc_count);
   for (uint32_t d = 0; d < doc_count; ++d) {

@@ -9,9 +9,11 @@
 #include <unistd.h>
 #include <vector>
 
+#include "snii/encoding/varint.h"
 #include "snii/writer/spimi_term_buffer.h"
 
 using snii::Status;
+using snii::StatusCode;
 using snii::writer::MergeRuns;
 using snii::writer::RunReader;
 using snii::writer::RunWriter;
@@ -79,6 +81,27 @@ void RoundTrip(const std::vector<IdTerm>& terms, bool has_positions) {
 }
 
 }  // namespace
+
+// DoS prevention: a corrupt/truncated run whose n_docs length varint decodes to an
+// absurd value must yield Status::Corruption (bounded by the run's file size), NOT an
+// uncaught std::bad_alloc from read_raw_u32's resize(). No docid data follows the
+// huge count, so without the file-size bound this would resize() to ~4e9 u32s.
+TEST(SpillRunCodec, CorruptDocCountIsCorruptionNotBadAlloc) {
+  TempRun run;
+  {
+    std::FILE* f = std::fopen(run.path.c_str(), "wb");
+    ASSERT_NE(f, nullptr);
+    uint8_t buf[16];
+    size_t n = 0;
+    n += snii::encode_varint64(0, buf + n);              // term_id = 0
+    n += snii::encode_varint64(0xFFFFFFFFull, buf + n);  // n_docs ~= 4e9, no data follows
+    ASSERT_EQ(std::fwrite(buf, 1, n, f), n);
+    std::fclose(f);
+  }
+  RunReader r;
+  const Status s = r.open(run.path, /*has_positions=*/false);  // open() -> advance()
+  EXPECT_EQ(s.code(), StatusCode::kCorruption) << s.message();
+}
 
 // Empty run: open succeeds, immediately exhausted, merge yields nothing.
 TEST(SpillRunCodec, EmptyRun) {

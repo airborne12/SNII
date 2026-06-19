@@ -70,6 +70,15 @@ Status LogicalIndexReader::lookup(std::string_view term, bool* found,
   std::vector<uint8_t> inflated;
   Slice block_slice(block_bytes);
   if (ref.flags & snii::format::block_ref_flags::kZstd) {
+    // Anti-DoS: uncomp_len comes from on-disk directory bytes and is passed to
+    // zstd_decompress, which resizes the output to it BEFORE the block crc can
+    // validate the inflated bytes. A crafted ref (uncomp_len = 1<<48) would force
+    // a multi-TB allocation. Reject an absurd or zero size up front, mirroring the
+    // uncomp_len caps already enforced on the .frq / .prx compressed regions.
+    constexpr uint64_t kMaxDictBlockUncompBytes = 256ull * 1024 * 1024;
+    if (ref.uncomp_len == 0 || ref.uncomp_len > kMaxDictBlockUncompBytes) {
+      return Status::Corruption("dict block: zstd uncomp_len out of range");
+    }
     SNII_RETURN_IF_ERROR(snii::zstd_decompress(
         Slice(block_bytes), static_cast<size_t>(ref.uncomp_len), &inflated));
     block_slice = Slice(inflated);

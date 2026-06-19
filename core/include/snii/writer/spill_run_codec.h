@@ -147,6 +147,7 @@ class RunReader {
   int fd_ = -1;
   bool has_positions_ = false;
   bool exhausted_ = false;
+  uint64_t file_size_ = 0;       // total run byte size (fstat at open); bounds lengths
   std::vector<uint8_t> window_;  // sliding decode window
   size_t pos_ = 0;               // consumed offset within window_
   bool eof_ = false;             // no more bytes on disk

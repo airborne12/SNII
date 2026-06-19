@@ -148,9 +148,17 @@ void SpimiTermBuffer::accumulate(uint32_t term_id, uint32_t docid, uint32_t pos)
 
   if (spill_threshold_bytes_ != 0) {
     account_token(term_id, new_term, new_doc);
-    if (live_bytes_ >= spill_threshold_bytes_ && spill_status_.ok()) {
-      spill_status_ = spill_to_run();
-    }
+  }
+  // Spill when the live size crosses the configured threshold, OR (hard safety,
+  // active even in unlimited mode) when the arena nears the 4 GiB uint32-offset
+  // limit -- without this, a single >4 GiB in-memory segment wraps alloc_run and
+  // silently corrupts data. A forced spill + final k-way merge stays byte-identical.
+  constexpr uint64_t kArenaSpillCap = 0xE0000000ull;  // 3.5 GiB, < UINT32_MAX margin
+  const bool threshold_hit =
+      spill_threshold_bytes_ != 0 && live_bytes_ >= spill_threshold_bytes_;
+  const bool arena_near_limit = pool_.arena_bytes() >= kArenaSpillCap;
+  if ((threshold_hit || arena_near_limit) && spill_status_.ok()) {
+    spill_status_ = spill_to_run();
   }
 }
 

@@ -1,6 +1,7 @@
 #include "snii/writer/spill_run_codec.h"
 
 #include <fcntl.h>
+#include <sys/stat.h>
 #include <unistd.h>
 
 #include <algorithm>
@@ -131,6 +132,16 @@ Status RunReader::open(const std::string& path, bool has_positions) {
   if (fd_ < 0) {
     return Status::IoError("run reopen(" + path + "): " + std::strerror(errno));
   }
+  // Record the run's byte size so every length decoded from the stream can be
+  // bounded against it before allocating (no record holds more u32s than the whole
+  // file). Honors the header's "lengths validated against the file size" contract,
+  // turning a corrupt/truncated length into Status::Corruption rather than an
+  // uncaught std::bad_alloc from a giant resize().
+  struct stat st {};
+  if (::fstat(fd_, &st) != 0) {
+    return Status::IoError(std::string("run fstat: ") + std::strerror(errno));
+  }
+  file_size_ = static_cast<uint64_t>(st.st_size);
   has_positions_ = has_positions;
   exhausted_ = false;
   eof_ = false;
@@ -227,6 +238,12 @@ Status RunReader::pull_raw_u32(uint8_t* dst, size_t count) {
 
 // Bulk-decodes `count` raw u32s into `out` (resized to count).
 Status RunReader::read_raw_u32(size_t count, std::vector<uint32_t>* out) {
+  // Bound `count` against the run's byte size BEFORE resize(): a record can never
+  // hold more u32s than the whole file. Rejects a corrupt/truncated length varint
+  // (which is otherwise an unbounded resize -> uncaught std::bad_alloc).
+  if (count > file_size_ / sizeof(uint32_t)) {
+    return Status::Corruption("run: raw u32 count exceeds file size");
+  }
   out->resize(count);
   if (count == 0) return Status::OK();
   return pull_raw_u32(reinterpret_cast<uint8_t*>(out->data()), count);

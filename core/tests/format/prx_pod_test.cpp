@@ -10,6 +10,7 @@
 #include "snii/common/status.h"
 #include "snii/encoding/byte_sink.h"
 #include "snii/encoding/byte_source.h"
+#include "snii/encoding/crc32c.h"
 #include "snii/format/format_constants.h"
 
 using snii::ByteSink;
@@ -278,4 +279,23 @@ TEST(PrxPod, OversizedUncompLenRejected) {
   PerDoc out;
   Status s = read_prx_window(&src, &out);
   EXPECT_EQ(s.code(), StatusCode::kCorruption);
+}
+
+// DoS prevention: a CRC-VALID raw frame whose decoded doc_count is absurd must return
+// Corruption, not a giant reserve()/assign() -> std::bad_alloc. Distinct from the CRC
+// and uncomp_len tests above, which are caught BEFORE the inner doc_count is read.
+TEST(PrxPod, OversizedDocCountRejected) {
+  ByteSink payload;
+  payload.put_varint32(0x02000000u);  // doc_count = 33M, > kMaxWindowDocs (1<<24)
+  ByteSink framed;
+  framed.put_u8(static_cast<uint8_t>(snii::format::PrxCodec::kRaw));
+  framed.put_varint32(static_cast<uint32_t>(payload.view().size()));  // uncomp_len
+  framed.put_bytes(payload.view());
+  ByteSink full;
+  full.put_bytes(framed.view());
+  full.put_fixed32(snii::crc32c(framed.view()));  // valid crc over codec+uncomp_len+payload
+  ByteSource src(full.view());
+  PerDoc out;
+  Status s = read_prx_window(&src, &out);
+  EXPECT_EQ(s.code(), StatusCode::kCorruption) << s.message();
 }

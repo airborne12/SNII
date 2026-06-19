@@ -88,6 +88,15 @@ class CompactPostingPool {
   // forward-pointer overhead). Drives the spill-threshold estimate only.
   uint64_t payload_bytes() const { return payload_bytes_; }
 
+  // Bytes the arena currently occupies (block_count * kBlockSize). The pool
+  // addresses bytes with a uint32 offset (next_offset_), so the arena MUST stay
+  // below 4 GiB or alloc_run wraps and silently aliases block 0. The accumulator
+  // watches this to force a safety spill before the wrap. Hard invariant: a single
+  // CompactPostingPool never exceeds UINT32_MAX bytes.
+  uint64_t arena_bytes() const {
+    return static_cast<uint64_t>(blocks_.size()) << kBlockShift;
+  }
+
   // Releases ALL blocks back to the OS. Called after the accumulator is fully
   // drained (or before a spill's next fill) so no input-side bytes stay resident.
   void reset();
