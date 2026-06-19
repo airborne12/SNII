@@ -157,8 +157,14 @@ SNII container: one Doris segment ({rowset_id}_{seg_id}.idx)
    输入 = analyzer token stream / null bitmap / doc length。
 
 4. 每个 logical index writer 执行 SPIMI
-   复用当前 SpimiIndexWriter 的 buffer、spill、k-way merge 思路。
-   spill 段与最终段使用同一 native 格式。
+   累积：整数 term-id 键入 CompactPostingPool（共享 bump-arena 的 tagged-varint 流，
+     每 token = tag 位 + 位置 delta，每新 doc = zigzag docid delta，比 raw uint32 小 ~3.4×）。
+   超 spill 阈值则落一个 raw-u32 磁盘 run（docids/freqs/positions，4MiB 写缓冲），
+     reset arena 归还 OS + malloc_trim 后继续累积下一批。
+   final k-way merge：按 vocab 串有序合并各 run + 末批内存项，逐 term 跨 run coalesce；
+     宽 term 的 positions 经 pos_pump 跨 run 游标流式喂给 writer，避免数十 MB 物化瞬态。
+   spill run 是私有临时格式（非 native，仅供回读合并）；只有最终 section 是 native。
+   输出 byte-identical 于 spill 阈值（含无 spill 全内存路径）—— spill 只 bound 内存、不改产物。
 
 5. final k-way merge 后顺序写 data sections
    写 DICT blocks。
@@ -328,6 +334,7 @@ block_bytes =
 - term 文本使用 UTF-8 字节级前缀压缩。
 - block 内周期性写入完整词项作为“词项锚点”，并维护锚点偏移表。reader 先在锚点上定位，再在局部 entry 范围内扫描，从而支持 exact term 查找、range 查询和 prefix 枚举。
 - block 尾部写 crc32c，checksum 覆盖 header、entries 和锚点偏移表。reader 只有在按需读取该 block 时才校验它。
+- **DICT block 默认 zstd 压缩**：dict region（term keys + DictEntry 元信息 + 97% 低频 term 的 inline 倒排）是索引最大 section，整块 zstd 同时**降索引体积**与**每次 term lookup 的 S3 读字节**（命中 term 只需取更小的压缩块）。`dict_block_directory` 每条记录一个 zstd 位 + `uncomp_len`；reader 取压缩块 → RAM 内解压 → 校验 crc → 锚点定位+局部扫描。压缩对 reader 透明，不改 DictEntry 语义。
 DICT block 格式：
 ```cpp
 DICT BLOCK
@@ -475,8 +482,16 @@ norms POD:
 
 doc/freq 与 positions 分离存储。bitmap 查询只需要 doc；scoring 查询同时消费 doc 与 freq，因此 doc 和 freq 保持同流同窗。positions 只在 phrase / proximity 查询中读取，不与 doc/freq 交错。
 ### `frq` 设计
-SNII 继承当前 V4 的自适应窗口方向：以 256-doc 为基准unit，组合成 256 / 512 / 1024 / 2048 doc 的窗口。窗口内采用列式布局，先写全部 doc-delta PFOR run，再写全部 freq PFOR run，避免 unit 级 [dd][fq][dd][fq] 交错导致 decoder 状态复杂。
-SNII 调整窗口基准，使 merge stitch 的 byte-copy 通道可行：
+SNII 继承自适应窗口方向：以 256-doc 为基准 unit，组合成 256 / 512 / 1024 / 2048 doc 的窗口。**dd 与 freq 分离到 posting 级**（而非窗口内 `[dd][fq]` 交错）——windowed posting 的 `.frq` payload 布局为：
+```plaintext
+[prelude][dd-block][freq-block]
+  dd-block   = 各窗口 dd_region 依次拼接（doc-delta，PFOR 位打包）
+  freq-block = 各窗口 freq_region 依次拼接（freq，PFOR 位打包）
+```
+
+这样 **docid-only term 与所有短语只读连续的 dd-block、整段跳过 freq-block** —— 三指标同时降（read_at 不碎片化、range_gets 降、字节降），1MB FileCache 块对齐与直连 S3 下都省（若 dd/freq 共块，块对齐后跳 freq 等于没跳，故必须分离到 posting 级）。dd/freq 已 PFOR 位打包、熵接近下限，**默认 raw 存储**（zstd 仅在极少数可压窗口由 win_mode 位启用）。
+
+窗口基准对齐使 merge stitch 的 byte-copy 通道可行：
 ```plaintext
 win_base(0) = 0
 win_base(w) = win_last(w - 1), w > 0
@@ -486,19 +501,9 @@ window payload:
   dd[i] = docid[i] - docid[i - 1], i > 0
 ```
 
-非首窗 payload 不保存绝对 docid。segment merge 时，如果窗口内部 docid 相对关系不变，除首窗或跨 run 边界窗口外，其余窗口可以 byte-copy。绝对 docid 锚点、窗口长度和 checksum 修正由 prelude 的列式目录提供。
-```plaintext
-.frq window header:
+非首窗 payload 不保存绝对 docid。segment merge 时，窗口内部 docid 相对关系不变者（除首窗或跨 run 边界窗口外）可以 byte-copy；绝对 docid 锚点、窗口长度和 checksum 修正由 prelude 的列式目录提供。
 
-u8   win_mode       # 0 raw / 1 zstd
-VInt uncomp_len     # raw 也必须写
-VInt comp_len       # zstd 时存在
-VInt dd_part_len    # bitmap 路跳过 freq part
-u32  crc32c
-bytes payload = PFOR_runs(dd) ++ PFOR_runs(freq)
-```
-
-`dd_part_len` 是 bitmap 路径的关键字段。bitmap-only 查询只需要 doc-delta ；scoring 查询再消费 freq 。对于 raw window，reader 可以直接跳过 freq part；对于压缩 window，`dd_part_len` 仍用于解压后分割 doc/freq 两段。
+每窗的 region 元信息**不再放在 per-window header，而是上提到 prelude 列**（见下「窗口元信息 prelude」），每行含 `win_mode`（dd_zstd / freq_zstd 位）、`dd_off` / `dd_disk_len` / `crc_dd`、`freq_off` / `freq_disk_len` / `crc_freq`。reader 据此把命中窗口的 dd（scoring 时再加 freq）子段从 dd-block / freq-block 切出并 coalesce 成可并发 range。**inline DictEntry** 落在 dict block 内、已被 block 级 crc 覆盖，故**省去自身的 dd/freq region crc**（`pod_ref` 项保留——其字节在独立 `.frq` POD、不被 block crc 覆盖）。
 ### 窗口元信息prelude
 当 `DictEntry.flags.enc = windowed `时，`.frq` payload 使用：
 ```plaintext
@@ -524,9 +529,9 @@ prelude:
   B  column: max_freq[N]
   B2 column: max_norm[N]
   C  column: last_docid_delta[N]
-  D  column: frq_window_len[N]
+  D  column: win_mode[N] / dd_off[N] / dd_disk_len[N] / crc_dd[N]   # dd-block region 定位+校验
+  D2 column: freq_off[N] / freq_disk_len[N] / crc_freq[N]           # freq-block region（has_freq 时）
   E  column: prx_cum_off[M]
-  H  column: win_crc32c[N]
   SB column: optional super-block directory
 ```
 
@@ -554,14 +559,14 @@ SNII prelude:
 `.prx` 独立分窗，并与 `.frq` 在 256-doc unit 边界上保持可对齐。具备 windowed positions 和 lazy `.prx` reader 的方向，同时包含自描述 header 与 checksum。
 ```plaintext
 .prx window:
-  u8   codec        # bit0-5: raw / zstd / lz4-reserved; bit7 cont-reserved
+  u8   codec        # bit0-5: raw=0 / zstd=1 / pfor=2; bit7 cont-reserved
   VInt uncomp_len
-  VInt comp_len     # codec != raw
+  VInt comp_len     # codec == zstd
   u32  crc32c
-  bytes payload     # doc 内 position delta VInt 流
+  bytes payload     # codec 决定布局（见下）
 ```
 
-`.prx` 默认对足够大的窗口使用 ZSTD。遇到超大单 doc positions 时，先退化为单个大窗口读取。
+`.prx` 默认编码为 **PFOR**（`codec=2`）：payload = `doc_count` ++ 每-doc `pos_count` 列 PFOR 位打包 ++ doc 内 position-delta 流 PFOR 位打包。位打包 `pos_count` 列（绝大多数为 1，约 1 bit/doc）是 PFOR 总体积反超 zstd 的关键——若 `pos_count` 用朴素 VInt，PFOR 体积反而比 zstd 大。相比 zstd，PFOR 无熵编码、构建 CPU 大幅更低，而位置 delta 单调升序使其体积持平甚至更优。`zstd`/`raw` 仍保留（强制路径与回放）。遇到超大单 doc positions 时，先退化为单个大窗口读取。
 ###  slim / inline 形态
 `slim` 是 **小倒排表的紧凑编码形态**，面向低 df term。
 小 postings 不进入 windowed 路径：

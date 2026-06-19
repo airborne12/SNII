@@ -151,15 +151,23 @@ class FileWriter {            // append-only，禁止 seek 回写
 SegmentWriter → SniiCompoundIndexWriter
   写 bootstrap header（仅容器级固定字段）
   每列索引/子列 → LogicalIndexWriter(key=(index_id,index_suffix), 输入=token stream/null bitmap/doc length)
-    SPIMI：buffer → spill（同 native 格式）→ final k-way merge（term 有序、语义一致、窗口 byte-copy stitch）
-    顺序写 DICT blocks → .frq POD → .prx POD，内存 manifest 记 refs/codec/checksum/stats
+    SPIMI 累积：整数 term-id 键入 CompactPostingPool —— 共享 bump-arena，每 posting 编码为
+      tagged-varint 流（每 token = tag 位 + 位置 delta；每新 doc = zigzag docid delta），
+      比 raw uint32 向量小 ~3.4×，无 per-token 字符串哈希
+    内存超 spill 阈值 → 落一个磁盘 run（raw u32 docids/freqs/positions，4MiB 写缓冲）；
+      reset arena 归还 OS + malloc_trim → 继续累积下一批
+    final k-way merge：按 vocab 串有序合并各 run + 末批内存项；逐 term 跨 run coalesce docid/freq；
+      宽 term 的 positions 经 pos_pump 跨 run 游标流式喂给 writer，不物化数十 MB 级位置瞬态
+    流式输出：DICT blocks / .frq POD / .prx POD 各写独立临时段，finish 时拼接，内存 manifest 记 refs/codec/checksum/stats
   写 side PODs：encoded_norm POD（per field）、null bitmap POD（per logical index）
   构建并写 per-index meta blocks（StatsBlock/term locator/HighDfDirectory/XF/section refs/feature bits/checksums）
   写 logical index directory（(index_id,index_suffix)→per-index meta ref）
   写 meta_region_checksum → 追加 fixed tail pointer → close
 ```
 
-不走 V2 两阶段打包：单遍流式写入，close 前只追加 meta 与 tail pointer。
+不走 V2 两阶段打包：单遍流式写入，close 前只追加 meta 与 tail pointer。索引输出 **byte-identical** 于 spill 阈值（含无 spill 全内存路径）—— spill 只 bound 内存、不改产物，由专门测试跨 {无 spill / spill+宽词常驻 / 跨缝边界 doc} 断言。
+
+**构建资源模型**（S3-native 设计的写端约束，与读端三指标并列）：内存峰值可调（spill 阈值），两段都被压低 ——① 累积期由 CompactPostingPool 紧凑表示压低，② merge 期由宽 term 位置流式消除单个高频 term 的数十 MB 物化瞬态（否则该瞬态与 spill 阈值无关地占据 merge 峰值）。因此 bounded build 的引擎内存随规模次线性增长：真实日志 50M 实测引擎内存约为 CLucene 的 1/7（详见 `benchmark-results.md`）。磁盘体积比 CLucene 小 ~13%（`.prx` PFOR + DICT 块 zstd），构建 CPU 在 ≥20M 规模反超 CLucene。这与「牺牲索引大小换冷查」的早期假设相比已无需牺牲——SNII 在体积、内存、CPU 三项均不弱于 CLucene，同时保留读端的批量 range 优势。
 
 ## 7. 读取与查询设计
 
