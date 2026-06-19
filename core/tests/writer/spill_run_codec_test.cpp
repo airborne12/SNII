@@ -2,6 +2,7 @@
 
 #include <gtest/gtest.h>
 
+#include <algorithm>
 #include <cstdint>
 #include <cstdio>
 #include <string>
@@ -62,6 +63,10 @@ void RoundTrip(const std::vector<IdTerm>& terms, bool has_positions) {
   for (const auto& expect : terms) {
     ASSERT_FALSE(r.exhausted());
     EXPECT_EQ(r.current_id(), expect.id);
+    // Positions are LAZY: the count is known after advance(), the bytes only after
+    // materialize_positions().
+    EXPECT_EQ(r.current_pos_count(), expect.tp.positions_flat.size());
+    ASSERT_TRUE(r.materialize_positions().ok());
     const TermPostings& got = r.current();
     EXPECT_EQ(got.docids, expect.tp.docids);
     EXPECT_EQ(got.freqs, expect.tp.freqs);
@@ -215,6 +220,193 @@ TEST(SpillRunCodec, MergeOrdersByVocabStringNotId) {
                         [&](TermPostings&& tp) { order.push_back(tp.term); })
                   .ok());
   EXPECT_EQ(order, (std::vector<std::string>{"apple", "zebra"}));
+}
+
+// Lazy positions: stream_positions yields the SAME bytes as the materialized
+// block, even when pulled in awkward (non-block-aligned) chunk sizes that straddle
+// the reader's internal 64 KiB window boundaries.
+TEST(SpillRunCodec, StreamPositionsMatchesMaterialized) {
+  TempRun run;
+  // One wide term: 5000 docs, freq 3 each -> 15000 flat positions spanning several
+  // internal read windows.
+  std::vector<uint32_t> docids, freqs, flat;
+  for (uint32_t d = 0; d < 5000; ++d) {
+    docids.push_back(d);
+    freqs.push_back(3);
+    flat.push_back(d * 7 + 0);
+    flat.push_back(d * 7 + 1);
+    flat.push_back(d * 7 + 2);
+  }
+  TermPostings tp;
+  tp.docids = docids;
+  tp.freqs = freqs;
+  tp.positions_flat = flat;
+  {
+    RunWriter w;
+    ASSERT_TRUE(w.open(run.path).ok());
+    ASSERT_TRUE(w.write_term(0, tp).ok());
+    ASSERT_TRUE(w.close().ok());
+  }
+  RunReader r;
+  ASSERT_TRUE(r.open(run.path, /*has_positions=*/true).ok());
+  ASSERT_EQ(r.current_pos_count(), flat.size());
+  ASSERT_EQ(r.positions_remaining(), flat.size());
+  // Pull in odd chunks (7, 1000, 7, 1000, ...) until drained.
+  std::vector<uint32_t> got;
+  std::vector<size_t> chunks = {7, 1000, 7, 1000};
+  size_t ci = 0;
+  while (r.positions_remaining() > 0) {
+    size_t want = std::min<size_t>(chunks[ci % chunks.size()],
+                                   static_cast<size_t>(r.positions_remaining()));
+    ++ci;
+    std::vector<uint32_t> buf(want);
+    ASSERT_TRUE(r.stream_positions(buf.data(), want).ok());
+    got.insert(got.end(), buf.begin(), buf.end());
+  }
+  EXPECT_EQ(got, flat);
+  EXPECT_TRUE(r.positions_drained());
+  ASSERT_TRUE(r.advance().ok());
+  EXPECT_TRUE(r.exhausted());
+}
+
+// advance() after a PARTIALLY-streamed term skips the unread positions and lands
+// on the next record correctly.
+TEST(SpillRunCodec, PartialStreamThenAdvanceSkipsRemainder) {
+  TempRun run;
+  {
+    RunWriter w;
+    ASSERT_TRUE(w.open(run.path).ok());
+    ASSERT_TRUE(w.write_term(0, MakeTerm({0, 1, 2}, {2, 2, 2},
+                                         {{10, 11}, {20, 21}, {30, 31}}))
+                    .ok());
+    ASSERT_TRUE(w.write_term(1, MakeTerm({9}, {1}, {{99}})).ok());
+    ASSERT_TRUE(w.close().ok());
+  }
+  RunReader r;
+  ASSERT_TRUE(r.open(run.path, /*has_positions=*/true).ok());
+  ASSERT_EQ(r.current_id(), 0u);
+  // Pull only the first two positions, then advance -- the remaining 4 are skipped.
+  std::vector<uint32_t> buf(2);
+  ASSERT_TRUE(r.stream_positions(buf.data(), 2).ok());
+  EXPECT_EQ(buf, (std::vector<uint32_t>{10, 11}));
+  ASSERT_TRUE(r.advance().ok());
+  ASSERT_FALSE(r.exhausted());
+  EXPECT_EQ(r.current_id(), 1u);
+  ASSERT_TRUE(r.materialize_positions().ok());
+  EXPECT_EQ(r.current().positions_flat, (std::vector<uint32_t>{99}));
+}
+
+// Drains a streamed merge term's pos_pump into a flat buffer (mirrors the windowed
+// writer's synchronous consumption). Returns the merged term with positions
+// realized so tests can compare against the materialized path.
+TermPostings DrainStreamed(TermPostings&& tp) {
+  if (tp.pos_pump) {
+    tp.positions_flat.resize(static_cast<size_t>(tp.pos_total));
+    if (tp.pos_total != 0) tp.pos_pump(tp.positions_flat.data(),
+                                       static_cast<size_t>(tp.pos_total));
+    tp.pos_pump = nullptr;
+  }
+  return std::move(tp);
+}
+
+// WIDE-TERM STREAMING == MATERIALIZED (byte-identity proof at the postings level):
+// a term with df >= kSlimDfThreshold split across several runs (with a boundary doc
+// straddling a spill) must yield IDENTICAL docids/freqs/positions whether the merge
+// streams positions via pos_pump (allow_stream=true) or materializes them
+// (allow_stream=false). Pulling the pump in document order reproduces the exact
+// coalesced positions_flat.
+TEST(SpillRunCodec, MergeWideTermStreamsIdenticalToMaterialized) {
+  const std::vector<std::string> vocab = {"wide"};
+  // Build a wide term (df ~ 2000) sharded across 3 runs, with the LAST doc of each
+  // run continuing as the FIRST doc of the next (boundary-doc coalesce).
+  TempRun r0, r1, r2;
+  auto shard = [&](TempRun& run, uint32_t lo, uint32_t hi, uint32_t carry_first) {
+    TermPostings tp;
+    for (uint32_t d = lo; d < hi; ++d) {
+      tp.docids.push_back(d);
+      // Boundary docs (lo when it's a carry) get freq 1 here; otherwise freq 2.
+      const uint32_t fc = 2;
+      tp.freqs.push_back(fc);
+      for (uint32_t k = 0; k < fc; ++k) tp.positions_flat.push_back(d * 13 + k);
+    }
+    (void)carry_first;
+    RunWriter w;
+    ASSERT_TRUE(w.open(run.path).ok());
+    ASSERT_TRUE(w.write_term(0, tp).ok());
+    ASSERT_TRUE(w.close().ok());
+  };
+  // Ranges chosen so doc 700 ends r0 AND begins r1 (boundary), doc 1400 likewise.
+  // Encode the boundary by repeating that docid at the seam with extra positions.
+  {
+    TermPostings a;
+    for (uint32_t d = 0; d <= 700; ++d) {
+      a.docids.push_back(d);
+      a.freqs.push_back(2);
+      a.positions_flat.push_back(d * 13);
+      a.positions_flat.push_back(d * 13 + 1);
+    }
+    RunWriter w;
+    ASSERT_TRUE(w.open(r0.path).ok());
+    ASSERT_TRUE(w.write_term(0, a).ok());
+    ASSERT_TRUE(w.close().ok());
+  }
+  {
+    TermPostings b;
+    // doc 700 continues here (boundary): extra positions for it, then 701..1400.
+    b.docids.push_back(700);
+    b.freqs.push_back(1);
+    b.positions_flat.push_back(700 * 13 + 2);
+    for (uint32_t d = 701; d <= 1400; ++d) {
+      b.docids.push_back(d);
+      b.freqs.push_back(2);
+      b.positions_flat.push_back(d * 13);
+      b.positions_flat.push_back(d * 13 + 1);
+    }
+    RunWriter w;
+    ASSERT_TRUE(w.open(r1.path).ok());
+    ASSERT_TRUE(w.write_term(0, b).ok());
+    ASSERT_TRUE(w.close().ok());
+  }
+  {
+    TermPostings c;
+    c.docids.push_back(1400);
+    c.freqs.push_back(1);
+    c.positions_flat.push_back(1400 * 13 + 2);
+    for (uint32_t d = 1401; d <= 2100; ++d) {
+      c.docids.push_back(d);
+      c.freqs.push_back(2);
+      c.positions_flat.push_back(d * 13);
+      c.positions_flat.push_back(d * 13 + 1);
+    }
+    RunWriter w;
+    ASSERT_TRUE(w.open(r2.path).ok());
+    ASSERT_TRUE(w.write_term(0, c).ok());
+    ASSERT_TRUE(w.close().ok());
+  }
+  (void)shard;
+
+  const std::vector<std::string> paths = {r0.path, r1.path, r2.path};
+  TermPostings materialized, streamed;
+  ASSERT_TRUE(MergeRuns(paths, vocab, /*has_positions=*/true,
+                        [&](TermPostings&& tp) { materialized = std::move(tp); },
+                        /*allow_stream_positions=*/false)
+                  .ok());
+  ASSERT_TRUE(MergeRuns(paths, vocab, /*has_positions=*/true,
+                        [&](TermPostings&& tp) { streamed = DrainStreamed(std::move(tp)); },
+                        /*allow_stream_positions=*/true)
+                  .ok());
+
+  // The materialized path filled positions_flat; the streamed path must too (after
+  // draining the pump) -- identical docids, freqs, and positions.
+  EXPECT_GE(materialized.docids.size(), 512u);  // wide enough to take the stream path
+  EXPECT_EQ(materialized.docids, streamed.docids);
+  EXPECT_EQ(materialized.freqs, streamed.freqs);
+  EXPECT_EQ(materialized.positions_flat, streamed.positions_flat);
+  // Boundary doc 700 coalesced: freq 2 (r0) + 1 (r1) = 3, positions in run order.
+  const auto it = std::find(materialized.docids.begin(), materialized.docids.end(), 700u);
+  ASSERT_NE(it, materialized.docids.end());
+  const size_t bi = static_cast<size_t>(it - materialized.docids.begin());
+  EXPECT_EQ(materialized.freqs[bi], 3u);
 }
 
 // A truncated run file is rejected by decode (anti-corruption on bytes we read).

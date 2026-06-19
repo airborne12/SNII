@@ -80,6 +80,20 @@ class RunWriter {
 // exhausted). Only the current term's postings live in memory at a time. The
 // current record's `term` string is left EMPTY -- runs store only the id; the
 // owner resolves the string via the shared vocabulary.
+//
+// LAZY POSITIONS (peak-RSS optimization for the widest merged term): advance()
+// loads term_id / docids / freqs and the position-block COUNT, but does NOT read
+// the position bytes -- it leaves the decode window cursor parked at the start of
+// the position block. The owner then chooses, per term:
+//   * materialize_positions(): bulk-reads the block into current().positions_flat
+//     (the default; behaves exactly as the old eager reader).
+//   * stream_positions(dst, n): pulls the next n positions straight from the
+//     window in 64 KiB chunks, never materializing the whole block -- used by the
+//     k-way merge's wide-term position pump so the widest term's tens-of-MiB
+//     positions buffer is never resident.
+// advance() drains any positions left unread from the previous term before the
+// next record, so a partly-streamed (or skipped) term still lands at the right
+// record boundary. The yielded byte sequence is identical either way.
 class RunReader {
  public:
   RunReader() = default;
@@ -96,7 +110,23 @@ class RunReader {
   const TermPostings& current() const { return current_; }
   uint32_t current_id() const { return current_id_; }
 
-  // Loads the next record into current(); sets exhausted() at end of file.
+  // Number of positions in the current term's (lazily-loaded) position block.
+  uint64_t current_pos_count() const { return pos_count_; }
+  // True once the current term's positions have been materialized OR fully
+  // streamed (i.e. nothing remains to read before advance()).
+  bool positions_drained() const { return pos_remaining_ == 0; }
+
+  // Materializes the current term's position block into current().positions_flat
+  // (bulk read). Idempotent within a term: a no-op once positions are drained.
+  Status materialize_positions();
+  // Streams the next `n` positions of the current term into dst[0..n) directly
+  // from the decode window (64 KiB chunks topped up on demand). Caller must not
+  // request more than positions_remaining(); each call advances the cursor.
+  Status stream_positions(uint32_t* dst, size_t n);
+  uint64_t positions_remaining() const { return pos_remaining_; }
+
+  // Loads the next record into current(); sets exhausted() at end of file. Any
+  // positions of the current term left unread are skipped first.
   Status advance();
 
  private:
@@ -107,6 +137,12 @@ class RunReader {
   // Bulk-reads `count` RAW little-endian u32s from the window into `out` (resized
   // to count). Bounds-checked against the run's true length (Corruption on EOF).
   Status read_raw_u32(size_t count, std::vector<uint32_t>* out);
+  // Streams `count` raw u32s from the window into dst (caller-owned, sized by the
+  // caller); shared by read_raw_u32 (into a vector) and stream_positions.
+  Status pull_raw_u32(uint8_t* dst, size_t count);
+  // Drains (and discards) any remaining positions of the current term so the
+  // window cursor lands at the next record boundary.
+  Status skip_remaining_positions();
 
   int fd_ = -1;
   bool has_positions_ = false;
@@ -115,6 +151,8 @@ class RunReader {
   size_t pos_ = 0;               // consumed offset within window_
   bool eof_ = false;             // no more bytes on disk
   uint32_t current_id_ = 0;      // current record's term-id
+  uint64_t pos_count_ = 0;       // current term's total position count (from n_pos)
+  uint64_t pos_remaining_ = 0;   // positions still unread in the current block
   TermPostings current_;
 };
 
@@ -125,8 +163,19 @@ class RunReader {
 // Only one merged term is materialized at a time. Returns IoError/Corruption on
 // bad run data. has_positions must match how the runs were written. `vocab`
 // maps term-id -> string and is borrowed.
+//
+// allow_stream_positions (peak-RSS optimization): when true (the streaming-writer
+// path), a WIDE merged term's positions are NOT materialized into positions_flat;
+// instead the TermPostings carries a pos_pump that streams positions in document
+// order straight from the run readers (which stay parked at this term's blocks
+// for the duration of the fn() call). `fn` MUST therefore consume each term
+// SYNCHRONOUSLY and must NOT retain the TermPostings past the call (the pump
+// references live readers freed when the merge advances). Callers that retain the
+// term (e.g. finalize_sorted) MUST pass false, so positions are always fully
+// materialized. The produced bytes are identical either way.
 Status MergeRuns(const std::vector<std::string>& run_paths,
                  const std::vector<std::string>& vocab, bool has_positions,
-                 const std::function<void(TermPostings&&)>& fn);
+                 const std::function<void(TermPostings&&)>& fn,
+                 bool allow_stream_positions = true);
 
 }  // namespace snii::writer

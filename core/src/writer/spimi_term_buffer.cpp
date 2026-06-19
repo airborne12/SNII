@@ -421,7 +421,8 @@ Status SpimiTermBuffer::spill_to_run() {
   return w.close();
 }
 
-void SpimiTermBuffer::merge_runs(const std::function<void(TermPostings&&)>& fn) {
+void SpimiTermBuffer::merge_runs(const std::function<void(TermPostings&&)>& fn,
+                                 bool allow_stream_positions) {
   // Flush whatever is still resident as one final sorted run so the k-way merge
   // sees a uniform set of run files (and never holds two term sources at once).
   if (!touched_ids_.empty()) {
@@ -438,7 +439,7 @@ void SpimiTermBuffer::merge_runs(const std::function<void(TermPostings&&)>& fn) 
   std::vector<uint32_t>().swap(free_slots_);
   std::vector<uint32_t>().swap(slot_of_);
   TrimMalloc();
-  Status s = MergeRuns(run_paths_, vocab(), has_positions_, fn);
+  Status s = MergeRuns(run_paths_, vocab(), has_positions_, fn, allow_stream_positions);
   if (!s.ok() && spill_status_.ok()) spill_status_ = s;
   // The merge churns one large coalesced TermPostings per term (the widest term's
   // arrays are tens of MiB) plus per-run reader windows; on completion glibc
@@ -455,7 +456,9 @@ void SpimiTermBuffer::for_each_term_sorted(const std::function<void(TermPostings
     drain_sorted(fn, /*allow_stream_positions=*/true);  // pure in-memory path
     return;
   }
-  merge_runs(fn);  // spilled path: MergeRuns yields fully-materialized positions
+  // Spilled path: the merge may STREAM a wide term's positions via pos_pump (fn
+  // consumes each term synchronously while the run readers stay parked).
+  merge_runs(fn, /*allow_stream_positions=*/true);
 }
 
 std::vector<TermPostings> SpimiTermBuffer::finalize_sorted() {
@@ -467,7 +470,10 @@ std::vector<TermPostings> SpimiTermBuffer::finalize_sorted() {
     drain_sorted([&out](TermPostings&& tp) { out.push_back(std::move(tp)); },
                  /*allow_stream_positions=*/false);
   } else {
-    merge_runs([&out](TermPostings&& tp) { out.push_back(std::move(tp)); });
+    // RETAINS each TermPostings past the merge, so positions MUST be materialized
+    // (a streamed pos_pump would reference run readers freed when the merge ends).
+    merge_runs([&out](TermPostings&& tp) { out.push_back(std::move(tp)); },
+               /*allow_stream_positions=*/false);
   }
   return out;
 }

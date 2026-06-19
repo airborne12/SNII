@@ -136,6 +136,25 @@ TEST(SpimiSpillWriter, SpilledMatchesUnlimitedBytes) {
   EXPECT_EQ(unlimited, spilled);
 }
 
+// Regression: the wide term "alpha" (every doc, freq 2) can have a doc split across
+// a spill seam, so its PRE-coalesce total_docs reaches >= kSlimDfThreshold (512)
+// while its POST-coalesce df stays below it. The merge gate keyed on total_docs
+// would then STREAM positions (leaving positions_flat empty) into the slim writer
+// path, which reads positions_flat directly -> segfault. Sweeping docs around the
+// 512 boundary x several spill thresholds exercises the band; byte-identity vs the
+// unlimited build proves both no-crash and identical output.
+TEST(SpimiSpillWriter, WideTermDfNearThresholdAcrossSeamMatchesUnlimited) {
+  for (uint32_t docs = 505; docs <= 515; ++docs) {
+    const std::vector<uint8_t> unlimited = BuildStreamed(docs, /*spill=*/0);
+    for (size_t spill : {size_t{1024}, size_t{2048}, size_t{4096}}) {
+      const std::vector<uint8_t> spilled = BuildStreamed(docs, spill);
+      ASSERT_EQ(unlimited.size(), spilled.size())
+          << "docs=" << docs << " spill=" << spill;
+      EXPECT_EQ(unlimited, spilled) << "docs=" << docs << " spill=" << spill;
+    }
+  }
+}
+
 // Identical bytes regardless of threshold size: a mid threshold (one or two
 // spills) must also match the unlimited build exactly.
 TEST(SpimiSpillWriter, MidThresholdAlsoIdentical) {
@@ -188,6 +207,24 @@ TEST(SpimiSpillWriter, QueriesMatchAcrossSpill) {
   ASSERT_TRUE(query::phrase_query(un.index, {"alpha", "alpha"}, &un_phrase).ok());
   ASSERT_TRUE(query::phrase_query(sp.index, {"alpha", "alpha"}, &sp_phrase).ok());
   EXPECT_EQ(un_phrase, sp_phrase);
+}
+
+// WIDE-TERM STREAMED MERGE byte-identity: with enough docs that the high-df term
+// "alpha" exceeds kSlimDfThreshold, the spilled k-way merge takes the WIDE-term
+// position-STREAMING path (pos_pump pulled across runs) instead of materializing
+// the term's full positions_flat. The produced container MUST stay byte-for-byte
+// identical to the unlimited in-memory build (which materializes positions). This
+// is the direct regression guard for the merge-phase peak-RSS streaming change.
+TEST(SpimiSpillWriter, WideTermStreamedMergeMatchesUnlimitedBytes) {
+  // 1200 docs -> alpha df=1200 (>= kSlimDfThreshold 512) -> windowed + streamed.
+  constexpr uint32_t kDocs = 1200;
+  static_assert(kDocs >= snii::format::kSlimDfThreshold, "alpha must be a wide term");
+  const std::vector<uint8_t> unlimited = BuildStreamed(kDocs, /*spill=*/0);
+  // Small threshold forces many spills, so alpha lands in EVERY run and the merge
+  // coalesces it across runs via the streamed pump.
+  const std::vector<uint8_t> spilled = BuildStreamed(kDocs, /*spill=*/8192);
+  ASSERT_EQ(unlimited.size(), spilled.size());
+  EXPECT_EQ(unlimited, spilled);
 }
 
 // Single-doc corpus with spilling: an edge corpus must not crash or diverge.

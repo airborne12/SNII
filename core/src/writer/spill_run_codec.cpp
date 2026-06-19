@@ -10,6 +10,7 @@
 #include <utility>
 
 #include "snii/encoding/varint.h"
+#include "snii/format/format_constants.h"
 
 namespace snii::writer {
 
@@ -134,6 +135,8 @@ Status RunReader::open(const std::string& path, bool has_positions) {
   exhausted_ = false;
   eof_ = false;
   pos_ = 0;
+  pos_count_ = 0;
+  pos_remaining_ = 0;
   window_.clear();
   return advance();
 }
@@ -196,14 +199,13 @@ Status RunReader::read_varint(uint64_t* v) {
   }
 }
 
-// Bulk-decodes `count` raw little-endian u32s into `out`, topping up the window
-// from disk as needed. Copies whatever is buffered each pass (the window may hold
-// only part of a large block), so a high-df term's freqs/positions stream through
-// in 64 KiB chunks without ever needing the whole block resident at once.
-Status RunReader::read_raw_u32(size_t count, std::vector<uint32_t>* out) {
-  out->resize(count);
+// Streams `count` raw little-endian u32s from the window into `dst` (caller-owned
+// storage of at least count*4 bytes), topping up the window from disk as needed.
+// Copies whatever is buffered each pass (the window may hold only part of a large
+// block), so a high-df term's freqs/positions stream through in 64 KiB chunks
+// without ever needing the whole block resident at once.
+Status RunReader::pull_raw_u32(uint8_t* dst, size_t count) {
   if (count == 0) return Status::OK();
-  auto* dst = reinterpret_cast<uint8_t*>(out->data());
   size_t need = count * sizeof(uint32_t);
   size_t written = 0;
   while (need > 0) {
@@ -223,7 +225,59 @@ Status RunReader::read_raw_u32(size_t count, std::vector<uint32_t>* out) {
   return Status::OK();
 }
 
+// Bulk-decodes `count` raw u32s into `out` (resized to count).
+Status RunReader::read_raw_u32(size_t count, std::vector<uint32_t>* out) {
+  out->resize(count);
+  if (count == 0) return Status::OK();
+  return pull_raw_u32(reinterpret_cast<uint8_t*>(out->data()), count);
+}
+
+// Materializes the current term's deferred position block into positions_flat.
+// A no-op once the positions are already drained (idempotent within a term).
+Status RunReader::materialize_positions() {
+  if (pos_remaining_ == 0) {
+    current_.positions_flat.clear();
+    return Status::OK();
+  }
+  const size_t n = static_cast<size_t>(pos_remaining_);
+  if (has_positions_) {
+    SNII_RETURN_IF_ERROR(read_raw_u32(n, &current_.positions_flat));
+  } else {
+    // No-positions runs should carry n_pos == 0; tolerate (skip) a stray block.
+    std::vector<uint32_t> skip;
+    SNII_RETURN_IF_ERROR(read_raw_u32(n, &skip));
+    current_.positions_flat.clear();
+  }
+  pos_remaining_ = 0;
+  return Status::OK();
+}
+
+// Streams the next `n` positions of the current term straight from the window.
+Status RunReader::stream_positions(uint32_t* dst, size_t n) {
+  if (n == 0) return Status::OK();
+  if (n > pos_remaining_) {
+    return Status::Corruption("run: stream_positions past block end");
+  }
+  SNII_RETURN_IF_ERROR(pull_raw_u32(reinterpret_cast<uint8_t*>(dst), n));
+  pos_remaining_ -= n;
+  return Status::OK();
+}
+
+// Discards any positions of the current term left unread, so the window cursor
+// lands at the next record boundary before advance() reads the next term.
+Status RunReader::skip_remaining_positions() {
+  if (pos_remaining_ == 0) return Status::OK();
+  const size_t n = static_cast<size_t>(pos_remaining_);
+  std::vector<uint32_t> skip;
+  SNII_RETURN_IF_ERROR(read_raw_u32(n, &skip));
+  pos_remaining_ = 0;
+  return Status::OK();
+}
+
 Status RunReader::advance() {
+  // Drain any positions the owner left unread for the previous term so the window
+  // cursor lands at the next record boundary.
+  SNII_RETURN_IF_ERROR(skip_remaining_positions());
   // End-of-run detection: at a record boundary, if no bytes remain we are done.
   if (available() == 0) {
     SNII_RETURN_IF_ERROR(fill());
@@ -246,17 +300,13 @@ Status RunReader::advance() {
   SNII_RETURN_IF_ERROR(read_raw_u32(static_cast<size_t>(n_docs), &current_.freqs));
   uint64_t n_pos = 0;
   SNII_RETURN_IF_ERROR(read_varint(&n_pos));
+  // Positions are LAZY: record the block count and leave the window cursor parked
+  // at the block start. The owner picks materialize_positions() (default) or
+  // stream_positions() (wide-term merge pump). The widest term's tens-of-MiB
+  // position block is thus never resident unless the owner asks for it whole.
   current_.positions_flat.clear();
-  if (has_positions_) {
-    // Positions: RAW u32 block, flat document-order (partitioned by freqs). No
-    // per-doc vector-of-vectors is built -- the widest term's positions land in a
-    // single contiguous buffer.
-    SNII_RETURN_IF_ERROR(read_raw_u32(static_cast<size_t>(n_pos), &current_.positions_flat));
-  } else if (n_pos != 0) {
-    // No-positions runs should carry n_pos == 0; tolerate (skip) a stray block.
-    std::vector<uint32_t> skip;
-    SNII_RETURN_IF_ERROR(read_raw_u32(static_cast<size_t>(n_pos), &skip));
-  }
+  pos_count_ = n_pos;
+  pos_remaining_ = n_pos;
   return Status::OK();
 }
 
@@ -322,11 +372,43 @@ void Concat(TermPostings* dst, const TermPostings& src, bool has_positions) {
   }
 }
 
+// Coalesces ONLY docids/freqs (no positions). Used by the WIDE-term path, whose
+// positions are streamed via a pos_pump instead of materialized. The boundary-doc
+// freq merge (dst->freqs.back() += head_fc) is identical to Concat's, so the
+// merged df / freqs / ttf are bit-for-bit the same; positions are emitted in pure
+// run-order concatenation by the pump (the same byte stream Concat would build).
+void ConcatDocsFreqs(TermPostings* dst, const TermPostings& src) {
+  if (src.docids.empty()) return;
+  size_t start = 0;
+  if (!dst->docids.empty() && dst->docids.back() == src.docids.front()) {
+    dst->freqs.back() += src.freqs.front();
+    start = 1;  // boundary doc folded in; append the rest
+  }
+  dst->docids.insert(dst->docids.end(), src.docids.begin() + start, src.docids.end());
+  dst->freqs.insert(dst->freqs.end(), src.freqs.begin() + start, src.freqs.end());
+}
+
+// A merged term is emitted with a STREAMED position pump (instead of a
+// materialized positions_flat) when it is wide enough that its full flat
+// positions would dominate the merge-phase peak RSS. The writer routes any term
+// with df >= kSlimDfThreshold through the windowed path (build_windowed_entry),
+// which is the only path that consumes pos_pump; a slim term reads positions_flat
+// directly, so it must always be materialized. Gating on the same df threshold
+// the writer uses keeps the two in lockstep and is conservative: only the few
+// genuinely-wide terms (led by the single widest, the merge-phase peak driver)
+// take the streamed path. total_pos is also required so a degenerate wide term
+// with no positions still has something to stream.
+bool ShouldStreamPositions(uint64_t total_docs, uint64_t total_pos, bool has_positions) {
+  return has_positions && total_pos != 0 &&
+         total_docs >= snii::format::kSlimDfThreshold;
+}
+
 }  // namespace
 
 Status MergeRuns(const std::vector<std::string>& run_paths,
                  const std::vector<std::string>& vocab, bool has_positions,
-                 const std::function<void(TermPostings&&)>& fn) {
+                 const std::function<void(TermPostings&&)>& fn,
+                 bool allow_stream_positions) {
   std::vector<std::unique_ptr<RunReader>> readers;
   readers.reserve(run_paths.size());
   std::priority_queue<HeapItem, std::vector<HeapItem>, HeapGreater> heap(
@@ -359,9 +441,9 @@ Status MergeRuns(const std::vector<std::string>& run_paths,
     while (!heap.empty() && vocab[heap.top().term_id] == merged.term) {
       const size_t ri = heap.top().run;
       heap.pop();
-      const TermPostings& cur = readers[ri]->current();
-      total_docs += cur.docids.size();
-      total_pos += cur.positions_flat.size();
+      const RunReader* r = readers[ri].get();
+      total_docs += r->current().docids.size();
+      total_pos += r->current_pos_count();  // positions are LAZY: use the count
       matching.push_back(ri);
     }
     // Reserve EXACTLY the summed sizes (an upper bound -- boundary-doc coalescing
@@ -372,10 +454,87 @@ Status MergeRuns(const std::vector<std::string>& run_paths,
     // empty reservation itself does not raise RSS; only the actual data does.
     merged.docids.reserve(static_cast<size_t>(total_docs));
     merged.freqs.reserve(static_cast<size_t>(total_docs));
-    if (has_positions) merged.positions_flat.reserve(static_cast<size_t>(total_pos));
+
+    bool stream = allow_stream_positions &&
+                  ShouldStreamPositions(total_docs, total_pos, has_positions);
+    if (!stream && has_positions) {
+      merged.positions_flat.reserve(static_cast<size_t>(total_pos));
+    }
+    // Coalesce docids/freqs from every matching run (always materialized -- a few
+    // u32 vectors). For the non-wide case, also coalesce positions here. For the
+    // wide case, leave positions for the streamed pump and keep the readers PARKED
+    // at their position blocks until fn() drains the pump.
     for (size_t ri : matching) {
       RunReader* r = readers[ri].get();
-      Concat(&merged, r->current(), has_positions);
+      if (stream) {
+        ConcatDocsFreqs(&merged, r->current());
+      } else {
+        if (has_positions) SNII_RETURN_IF_ERROR(r->materialize_positions());
+        Concat(&merged, r->current(), has_positions);
+      }
+    }
+
+    // The stream gate keyed on PRE-coalesce total_docs, but the writer's slim vs
+    // windowed dispatch keys on the POST-coalesce df (merged.docids.size()).
+    // Boundary-doc coalescing across spill seams can drop df below kSlimDfThreshold
+    // while total_docs stayed above it; that term routes to build_slim_entry, which
+    // reads positions_flat directly and ignores pos_pump. Materialize positions now
+    // from the still-parked readers (mirrors drain_sorted()'s slim fallback).
+    if (stream && merged.docids.size() < snii::format::kSlimDfThreshold) {
+      merged.positions_flat.reserve(static_cast<size_t>(total_pos));
+      for (size_t ri : matching) {
+        RunReader* r = readers[ri].get();
+        SNII_RETURN_IF_ERROR(r->materialize_positions());
+        const std::vector<uint32_t>& pf = r->current().positions_flat;
+        merged.positions_flat.insert(merged.positions_flat.end(), pf.begin(), pf.end());
+      }
+      stream = false;
+    }
+
+    if (stream) {
+      // WIDE term: STREAM positions via a pump that walks the matching readers in
+      // run order (pure flat concatenation == the coalesced positions_flat,
+      // byte-for-byte). positions_flat stays empty -- the widest term's tens-of-MiB
+      // position buffer is never resident; only one ~64 KiB window per pull is. The
+      // readers are still parked at this term's blocks, so the pump pulls from them
+      // synchronously while fn() runs (fn consumes synchronously -- the windowed
+      // writer does). After fn(), advance the readers past the (now-drained) blocks.
+      merged.pos_total = total_pos;
+      size_t cursor = 0;  // index into `matching` for the run currently being drained
+      Status pump_status = Status::OK();
+      std::vector<std::unique_ptr<RunReader>>* rd = &readers;
+      const std::vector<size_t>* match = &matching;
+      merged.pos_pump = [rd, match, &cursor, &pump_status](uint32_t* dst, size_t n) {
+        size_t off = 0;
+        while (off < n) {
+          // Advance to the next run that still has positions to yield.
+          while (cursor < match->size() &&
+                 (*rd)[(*match)[cursor]]->positions_remaining() == 0) {
+            ++cursor;
+          }
+          if (cursor >= match->size()) break;  // defensive: pump over-pulled
+          RunReader* r = (*rd)[(*match)[cursor]].get();
+          const size_t take = std::min(n - off, static_cast<size_t>(r->positions_remaining()));
+          Status s = r->stream_positions(dst + off, take);
+          if (!s.ok()) {
+            if (pump_status.ok()) pump_status = std::move(s);
+            return;  // leave dst tail unfilled; surfaced after fn()
+          }
+          off += take;
+        }
+      };
+      fn(std::move(merged));
+      SNII_RETURN_IF_ERROR(pump_status);  // surface a streamed-read I/O error
+    } else {
+      fn(std::move(merged));
+    }
+
+    // Advance every matching reader to its next term and re-seed the heap. For the
+    // wide path this also skips any positions the pump did not pull (none, when fn
+    // drained the whole stream); for the non-wide path positions were already
+    // materialized so nothing remains.
+    for (size_t ri : matching) {
+      RunReader* r = readers[ri].get();
       SNII_RETURN_IF_ERROR(r->advance());  // frees this run's slice, loads next term
       if (!r->exhausted()) {
         if (r->current_id() >= vocab.size()) {
@@ -384,7 +543,6 @@ Status MergeRuns(const std::vector<std::string>& run_paths,
         heap.push({r->current_id(), ri});
       }
     }
-    fn(std::move(merged));
   }
   return Status::OK();
 }

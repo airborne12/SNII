@@ -244,7 +244,12 @@ class SpimiTermBuffer {
   // Approximate live byte cost a token adds (per the threshold model).
   void account_token(uint32_t term_id, bool new_term, bool new_doc);
   // Final k-way merge over the spilled runs (+ the residual flushed as a run).
-  void merge_runs(const std::function<void(TermPostings&&)>& fn);
+  // When `allow_stream_positions` is true (the streaming for_each path), a wide
+  // merged term streams positions via pos_pump (valid only because fn consumes
+  // synchronously while the run readers stay parked); callers that RETAIN the
+  // TermPostings past the merge (finalize_sorted) MUST pass false.
+  void merge_runs(const std::function<void(TermPostings&&)>& fn,
+                  bool allow_stream_positions);
   // Deletes every temp run file; called from the destructor (RAII cleanup).
   void cleanup_runs();
   // Frees a drained term's accumulator (id leaves the touched set).
