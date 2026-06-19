@@ -29,6 +29,7 @@
 
 #include "clucene_adapter.h"
 #include "corpus_gen.h"
+#include "corpus_loader.h"
 #include "snii/io/metered_file_reader.h"
 #include "snii_adapter.h"
 
@@ -52,6 +53,7 @@ struct Args {
   bool resources = false;     // measure index size / build CPU / peak RSS
   std::string engine = "both";  // --resources scope: snii | clucene | none | both
   uint32_t spill_mib = 0;     // SNII SPIMI spill threshold in MiB (0 = unlimited)
+  std::string corpus_file;    // load a REAL corpus (one doc/line) instead of generate
 };
 
 Args parse_args(int argc, char** argv) {
@@ -88,6 +90,8 @@ Args parse_args(int argc, char** argv) {
     } else if (flag == "--spill-mib") {
       a.spill_mib =
           static_cast<uint32_t>(std::strtoul(next("--spill-mib"), nullptr, 10));
+    } else if (flag == "--corpus-file") {
+      a.corpus_file = next("--corpus-file");
     } else {
       std::fprintf(stderr, "unknown argument: %s\n", flag.c_str());
       std::exit(2);
@@ -551,9 +555,16 @@ int main(int argc, char** argv) {
               args.docs, args.vocab, args.zipf, args.doclen,
               static_cast<unsigned long long>(args.seed));
 
-  // 1. Generate the deterministic corpus.
+  // 1. Build the corpus: load a REAL one (one doc/line) if --corpus-file is set,
+  // else generate the deterministic synthetic corpus.
   const bench::Corpus corpus =
-      bench::generate(args.docs, args.vocab, args.zipf, args.doclen, args.seed);
+      args.corpus_file.empty()
+          ? bench::generate(args.docs, args.vocab, args.zipf, args.doclen, args.seed)
+          : bench::load_from_file(args.corpus_file, args.docs);
+  if (!args.corpus_file.empty()) {
+    std::printf("loaded real corpus: %s docs=%u vocab=%zu\n",
+                args.corpus_file.c_str(), corpus.doc_count, corpus.vocab.size());
+  }
 
   // 1a. Resource mode: index size / build CPU / peak RSS (no oracle needed).
   if (args.resources) {
