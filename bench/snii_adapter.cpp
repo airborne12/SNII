@@ -68,7 +68,8 @@ void SniiAdapter::build_range(const std::string& path, const Corpus& c,
   // space is 0..seg_docs-1; the caller maps back to the global docid by adding
   // doc_lo. The corpus tokens are ALREADY dense ids into c.vocab (shared across
   // segments, no copy). A non-zero spill threshold bounds input RAM.
-  SpimiTermBuffer buf(&c.vocab, /*has_positions=*/true, spill_threshold_bytes_);
+  // Keyword (docs-only) build stores no positions; tokenized stores positions.
+  SpimiTermBuffer buf(&c.vocab, /*has_positions=*/!docs_only_, spill_threshold_bytes_);
   for (uint32_t d = doc_lo; d < doc_hi; ++d) {
     const auto& toks = c.docs[d];
     for (uint32_t pos = 0; pos < toks.size(); ++pos) {
@@ -82,7 +83,7 @@ void SniiAdapter::build_range(const std::string& path, const Corpus& c,
   SniiIndexInput in;
   in.index_id = 1;
   in.index_suffix = "body";
-  in.config = IndexConfig::kDocsPositions;
+  in.config = docs_only_ ? IndexConfig::kDocsOnly : IndexConfig::kDocsPositions;
   in.doc_count = seg_docs;
   in.term_source = &buf;
   // A larger DICT block target (64 KiB) yields far fewer blocks: it shrinks the

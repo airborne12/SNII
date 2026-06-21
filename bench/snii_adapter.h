@@ -29,6 +29,11 @@ class SniiAdapter {
   // and k-way-merging them, so peak RSS stops scaling with total postings.
   void set_spill_threshold_bytes(size_t bytes) { spill_threshold_bytes_ = bytes; }
 
+  // Build a NON-TOKENIZED (keyword) index: docs-only (IndexConfig::kDocsOnly, no
+  // positions/freqs) for exact-match/range on whole-value terms. Default false
+  // (tokenized docs+positions). Set before build_at/build_range.
+  void set_docs_only(bool v) { docs_only_ = v; }
+
   // Builds the index at a temporary path and opens it for reading. Throws
   // std::runtime_error on any failure (writer, reader, or open_index).
   void build_and_open(const Corpus& c);
@@ -85,6 +90,7 @@ class SniiAdapter {
   std::string path_;
   bool keep_path_ = false;  // when true, the destructor leaves path_ on disk
   size_t spill_threshold_bytes_ = 0;  // 0 = unlimited (in-memory build)
+  bool docs_only_ = false;            // true = keyword (docs-only, no positions)
   std::unique_ptr<snii::io::LocalFileReader> local_;
   std::unique_ptr<snii::io::MeteredFileReader> metered_;
   std::unique_ptr<snii::reader::SniiSegmentReader> segment_;

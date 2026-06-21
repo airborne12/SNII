@@ -19,6 +19,7 @@
 #include <algorithm>
 #include <chrono>
 #include <cstdint>
+#include <cctype>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -73,6 +74,7 @@ struct Args {
   bool no_merge = false;      // CLucene: flush segments but skip optimize() (no merge)
   uint32_t shard_docs = 0;    // SNII: docs per segment (0 = single segment)
   bool scenarios = false;     // run the enriched scenario catalog (build + compare)
+  bool keyword = false;       // run the non-tokenized (keyword) docs-only comparison
 };
 
 Args parse_args(int argc, char** argv) {
@@ -140,6 +142,8 @@ Args parse_args(int argc, char** argv) {
           static_cast<uint32_t>(std::strtoul(next("--shard-docs"), nullptr, 10));
     } else if (flag == "--scenarios") {
       a.scenarios = true;
+    } else if (flag == "--keyword") {
+      a.keyword = true;
     } else {
       std::fprintf(stderr, "unknown argument: %s\n", flag.c_str());
       std::exit(2);
@@ -1391,6 +1395,99 @@ void report_scenario(const Scenario& s, const EngineQueryResult& sn,
   std::printf("  latency ratio(CL/SNII): median=%.2f\n", sl > 0 ? clm / sl : 0.0);
 }
 
+// Non-tokenized (keyword) index comparison: each document's WHOLE field value is
+// one term. Both engines build a DOCS-ONLY index (SNII kDocsOnly; CLucene
+// omitTermFreqAndPositions) and answer exact-value lookups. Values are lowercased
+// single tokens (e.g. OTel ServiceName / SeverityText / TraceId) so the whole value
+// survives CLucene's SimpleAnalyzer as one term -- a faithful docs-only PERFORMANCE
+// comparison. (Case-sensitive multi-word keyword would need CLucene untokenized
+// fields, a separate build path; out of scope here.)
+int run_keyword_mode(const Args& args) {
+  std::vector<std::string> values;
+  if (!args.parquet_file.empty()) {
+    try {
+      values = bench::read_text_column(args.parquet_file, args.text_col, args.docs);
+    } catch (const std::exception& e) {
+      std::fprintf(stderr, "FATAL: parquet read failed: %s\n", e.what());
+      return 1;
+    }
+  } else {
+    static const char* kServices[] = {
+        "frontend", "cartservice", "checkoutservice", "paymentservice",
+        "shippingservice", "emailservice", "currencyservice",
+        "recommendationservice", "adservice", "productcatalogservice"};
+    const uint32_t n = args.docs ? args.docs : 100000;
+    values.reserve(n);
+    for (uint32_t i = 0; i < n; ++i) values.push_back(kServices[i % 10]);
+    for (uint32_t i = 0; i < n / 1000; ++i) values[i] = "trace" + std::to_string(i);
+  }
+  if (values.empty()) {
+    std::fprintf(stderr, "FATAL: keyword column yielded 0 rows\n");
+    return 1;
+  }
+  // Lowercase whole values to match CLucene's SimpleAnalyzer (single-token keyword).
+  for (std::string& v : values)
+    for (char& ch : v)
+      ch = static_cast<char>(std::tolower(static_cast<unsigned char>(ch)));
+
+  bench::Corpus corpus = bench::keyword_corpus(values);
+  std::printf("keyword corpus: docs=%u distinct=%zu (col=%s)\n", corpus.doc_count,
+              corpus.vocab.size(), args.text_col.c_str());
+
+  bench::SniiAdapter snii_idx;
+  bench::CluceneAdapter cl_idx;
+  snii_idx.set_docs_only(true);
+  cl_idx.set_docs_only(true);
+  apply_spill(snii_idx, args.spill_mib);
+  apply_spill(cl_idx, args.spill_mib);
+  const std::string out =
+      args.out_dir.empty() ? std::string("/mnt/disk15/jiangkai/e2e_data/keyword")
+                           : args.out_dir;
+  try {
+    snii_idx.build_at(out + "/snii/index.idx", corpus, args.keep_index);
+    cl_idx.build_at(out + "/clucene", corpus, args.keep_index);
+  } catch (const std::exception& e) {
+    std::fprintf(stderr, "FATAL: keyword build failed: %s\n", e.what());
+    return 1;
+  }
+  std::printf("keyword index bytes (docs-only): SNII=%llu CLucene=%llu (CL/SNII=%.2f)\n",
+              static_cast<unsigned long long>(snii_idx.index_bytes()),
+              static_cast<unsigned long long>(cl_idx.index_bytes()),
+              ratio(cl_idx.index_bytes(), snii_idx.index_bytes()));
+
+  std::vector<Scenario> scenarios;
+  auto add = [&](const std::string& id, uint32_t tid) {
+    if (tid < corpus.vocab.size())
+      scenarios.push_back({id, SKind::kTerm, corpus.vocab[tid], {}});
+  };
+  add("KW-very-high", bench::term_in_df_bucket(corpus, 0.5, 1.0));
+  add("KW-high", bench::term_in_df_bucket(corpus, 0.1, 0.5));
+  add("KW-mid", bench::mid_df_term(corpus));
+  add("KW-df1", bench::df1_term(corpus));
+  scenarios.push_back({"KW-absent", SKind::kTerm, bench::absent_token(corpus), {}});
+
+  const uint32_t R = std::max(args.runs, 5u);
+  std::printf("=== keyword (non-tokenized, docs-only) exact-query suite (%zu, runs=%u) ===\n",
+              scenarios.size(), R);
+  bool all_identical = true;
+  for (const Scenario& s : scenarios) {
+    EngineQueryResult sn, cl;
+    try {
+      sn = run_scenario_on(snii_idx, s, R);
+      cl = run_scenario_on(cl_idx, s, R);
+    } catch (const std::exception& e) {
+      std::fprintf(stderr, "FATAL: keyword scenario %s: %s\n", s.id.c_str(), e.what());
+      return 1;
+    }
+    report_scenario(s, sn, cl, &all_identical);
+  }
+  std::printf("\nresult: %s (keyword, %zu scenarios)\n",
+              all_identical ? "ALL DOCIDS IDENTICAL (SNII == CLucene)"
+                            : "DOCID MISMATCH",
+              scenarios.size());
+  return all_identical ? 0 : 1;
+}
+
 // Enriched scenario suite (local): build both engines from the corpus, resolve the
 // df-calibrated catalog, run every scenario on both, compare docids + the three
 // gold metrics + latency. Corpus from parquet (--parquet-file) or synthetic.
@@ -1461,6 +1558,11 @@ int main(int argc, char** argv) {
   mallopt(M_TRIM_THRESHOLD, 128 * 1024);
 
   const Args args = parse_args(argc, argv);
+
+  // Non-tokenized (keyword) docs-only index comparison.
+  if (args.keyword) {
+    return run_keyword_mode(args);
+  }
 
   // Enriched scenario suite (build both engines + run the df-calibrated catalog).
   if (args.scenarios) {

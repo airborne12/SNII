@@ -332,7 +332,8 @@ void CluceneAdapter::build_range(const std::string& dir, const Corpus& c,
         cl_doc::Field::STORE_NO | cl_doc::Field::INDEX_TOKENIZED;
     auto* doc = _CLNEW cl_doc::Document();
     auto* field = _CLNEW cl_doc::Field(field_name.c_str(), field_config);
-    field->setOmitTermFreqAndPositions(false);  // keep positions for PhraseQuery
+    // Keyword (docs-only) omits freq/positions; tokenized keeps them for phrase.
+    field->setOmitTermFreqAndPositions(docs_only_);
     doc->add(*field);
 
     // Docs in [doc_lo, doc_hi) are added in order, so CLucene assigns this

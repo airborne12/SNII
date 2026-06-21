@@ -43,6 +43,11 @@ class CluceneAdapter {
   // positions exceed ~2^30.
   void set_no_merge(bool v) { no_merge_ = v; }
 
+  // Build a NON-TOKENIZED (keyword) index: docs-only via omitTermFreqAndPositions
+  // (no freq/positions, smaller index, exact-match only). Default false. Pair with
+  // a single-token keyword corpus so each value is one term. Set before build_at.
+  void set_docs_only(bool v) { docs_only_ = v; }
+
   // Builds the compound index in a temp directory and opens a searcher over a
   // metered directory. Throws std::runtime_error on failure.
   void build_and_open(const Corpus& c);
@@ -111,6 +116,7 @@ class CluceneAdapter {
   double ram_buffer_mb_ = 0.0;
   // When true: periodic flush + skip optimize() (multi-segment, no merge).
   bool no_merge_ = false;
+  bool docs_only_ = false;  // true = keyword (docs-only, omit freq/positions)
   // Opaque handles; concrete CLucene types live in the .cpp to keep this header
   // free of CLucene includes.
   struct Impl;
