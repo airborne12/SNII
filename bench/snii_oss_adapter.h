@@ -42,6 +42,14 @@ class SniiOssAdapter {
   // The OSS object key (prefix + "/" + key) that was uploaded, for cleanup.
   const std::string& uploaded_key() const { return uploaded_key_; }
 
+  // The raw OSS object key (no prefix) passed to S3FileReader::open -- pass it to
+  // open_uploaded on a fresh adapter to open the SAME uploaded index per thread.
+  const std::string& object_key() const { return object_key_; }
+
+  // Opens an ALREADY-uploaded index (its own S3FileReader + reader chain) without
+  // rebuilding/re-uploading -- one per worker thread for concurrent S3 querying.
+  void open_uploaded(const std::string& key, const snii::io::S3Config& cfg);
+
   // term_query for `term`: ascending docids + per-query I/O metrics. Throws on error.
   void term_query(const std::string& term, std::vector<uint32_t>* docids,
                   snii::io::IoMetrics* metrics);
@@ -53,6 +61,7 @@ class SniiOssAdapter {
  private:
   std::string local_path_;   // temp local .idx (removed in dtor)
   std::string uploaded_key_;  // full OSS key (prefix + "/" + key)
+  std::string object_key_;    // raw key for S3FileReader::open / open_uploaded
   std::unique_ptr<snii::io::S3FileReader> s3_;
   std::unique_ptr<snii::io::MeteredFileReader> metered_;
   std::unique_ptr<snii::reader::SniiSegmentReader> segment_;

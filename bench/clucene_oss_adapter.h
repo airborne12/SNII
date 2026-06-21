@@ -43,6 +43,15 @@ class CluceneOssAdapter {
   // cleanup by the caller.
   const std::vector<std::string>& uploaded_keys() const;
 
+  // The CLucene segment file names of the uploaded index -- pass them to
+  // open_uploaded on a fresh adapter to open the SAME index per worker thread.
+  const std::vector<std::string>& file_names() const;
+
+  // Opens an ALREADY-uploaded index (its own OSS directory + reader + searcher)
+  // without rebuilding/re-uploading -- one per worker thread for concurrent S3.
+  void open_uploaded(const snii::io::S3Config& cfg,
+                     const std::vector<std::string>& file_names);
+
   // TermQuery on field "body": ascending docids + per-query I/O metrics (the OSS
   // directory's metered readers are reset first). Throws on failure.
   void term_query(const std::string& term, std::vector<uint32_t>* docids,

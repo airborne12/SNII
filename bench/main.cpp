@@ -326,6 +326,12 @@ void print_wall_distribution(const char* engine, std::vector<double> samples) {
 
 // Runs the full real-OSS comparison. Returns the process exit code (0 on success
 // with all docids matching, nonzero otherwise).
+// Concurrent S3 throughput matrix (defined after run_concurrent below). Each worker
+// opens its OWN S3 reader chain over the already-uploaded index via open_uploaded.
+void run_oss_concurrent(const Args& args, const bench::Corpus& corpus,
+                        const snii::io::S3Config& cfg, const std::string& snii_key,
+                        const std::vector<std::string>& clu_names);
+
 int run_oss_mode(const Args& args, const bench::Corpus& corpus,
                  const Oracle& oracle) {
   snii::io::S3Config cfg;
@@ -502,6 +508,17 @@ int run_oss_mode(const Args& args, const bench::Corpus& corpus,
       std::printf("[%s] (hits=%zu)\n", q.label, sdoc.size());
       print_wall_distribution("CLucene", cl_ms);
       print_wall_distribution("SNII", snii_ms);
+    }
+  }
+
+  // Concurrent S3 throughput matrix (single vs N threads), term/phrase scenarios.
+  // The aws_guard above stays live across the worker pool (required for S3 init).
+  if (args.concurrency != 0) {
+    try {
+      run_oss_concurrent(args, corpus, cfg, snii_idx.object_key(),
+                         cl_idx.file_names());
+    } catch (const std::exception& e) {
+      std::fprintf(stderr, "WARN: OSS concurrent pass failed: %s\n", e.what());
     }
   }
 
@@ -1413,11 +1430,13 @@ double pct(const std::vector<double>& sorted, double p) {
 
 // Runs `scenarios` round-robin on `threads` worker threads for `seconds` wall-clock,
 // each thread owning an INDEPENDENT adapter from make_adapter() (no shared mutable
-// state -- verified race-free). The first `warmup` queries per thread are discarded.
-// Returns throughput (QPS) + tail latency. make_adapter() runs inside each worker.
-template <class MakeAdapter>
-ConcResult run_concurrent(MakeAdapter make_adapter, const std::vector<Scenario>& scs,
-                          uint32_t threads, double seconds, uint32_t warmup) {
+// state -- verified race-free). `run_query(adapter, scenario, &docids, &scratch)`
+// dispatches one query (so the local and S3 paths reuse the same driver). The first
+// `warmup` queries per thread are discarded. Returns throughput (QPS) + tail latency.
+template <class MakeAdapter, class RunFn>
+ConcResult run_concurrent(MakeAdapter make_adapter, RunFn run_query,
+                          const std::vector<Scenario>& scs, uint32_t threads,
+                          double seconds, uint32_t warmup) {
   std::atomic<bool> go{false}, stop{false};
   std::vector<std::vector<double>> per_thread(threads);
   std::vector<std::thread> workers;
@@ -1430,15 +1449,13 @@ ConcResult run_concurrent(MakeAdapter make_adapter, const std::vector<Scenario>&
       std::vector<uint32_t> docids;
       snii::io::IoMetrics scratch;
       size_t si = t;  // round-robin offset so threads spread across scenarios
-      uint32_t local = 0;
       while (!go.load(std::memory_order_acquire)) {
       }
       while (!stop.load(std::memory_order_relaxed)) {
         const Scenario& s = scs[si++ % scs.size()];
         const auto t0 = std::chrono::steady_clock::now();
-        run_one(*adapter, s, &docids, &scratch);
-        const double ms = wall_ms_since(t0);
-        if (local++ >= warmup) lat.push_back(ms);
+        run_query(*adapter, s, &docids, &scratch);
+        lat.push_back(wall_ms_since(t0));  // record all; warmup trimmed at aggregation
       }
     });
   }
@@ -1450,8 +1467,14 @@ ConcResult run_concurrent(MakeAdapter make_adapter, const std::vector<Scenario>&
   const double wall = std::chrono::duration<double>(
       std::chrono::steady_clock::now() - wall0).count();
 
+  // Trim the first `warmup` queries per thread (cold start), but never zero out a
+  // thread: a slow engine that ran <= warmup queries keeps its last sample so QPS /
+  // tail latency are still reported instead of collapsing to 0.
   std::vector<double> all;
-  for (auto& v : per_thread) all.insert(all.end(), v.begin(), v.end());
+  for (auto& v : per_thread) {
+    const size_t skip = v.size() > warmup ? warmup : (v.empty() ? 0 : v.size() - 1);
+    for (size_t i = skip; i < v.size(); ++i) all.push_back(v[i]);
+  }
   std::sort(all.begin(), all.end());
   ConcResult r;
   r.threads = threads;
@@ -1473,6 +1496,51 @@ void print_conc_row(const char* engine, const ConcResult& c) {
               engine, c.threads, c.qps,
               static_cast<unsigned long long>(c.queries), c.p50, c.p90, c.p99, c.mean);
 }
+
+#ifdef SNII_WITH_S3
+// Concurrent S3 throughput: build/upload already done; each worker opens its OWN
+// S3 reader chain over the uploaded index (open_uploaded). term/phrase scenarios
+// only (the OSS adapters expose term_query/phrase_query). The wall-clock is real
+// OSS round-trips, where SNII's fewer serial rounds drive the QPS / tail advantage.
+void run_oss_concurrent(const Args& args, const bench::Corpus& corpus,
+                        const snii::io::S3Config& cfg, const std::string& snii_key,
+                        const std::vector<std::string>& clu_names) {
+  std::vector<Scenario> all = resolve_scenarios(corpus);
+  std::vector<Scenario> scs;  // term + phrase only (OSS adapter query surface)
+  for (const Scenario& s : all)
+    if (s.kind == SKind::kTerm || s.kind == SKind::kPhrase) scs.push_back(s);
+  if (scs.empty()) return;
+
+  auto make_snii = [&cfg, snii_key]() {
+    auto a = std::make_unique<bench::SniiOssAdapter>();
+    a->open_uploaded(snii_key, cfg);
+    return a;
+  };
+  auto make_clu = [&cfg, clu_names]() {
+    auto a = std::make_unique<bench::CluceneOssAdapter>();
+    a->open_uploaded(cfg, clu_names);
+    return a;
+  };
+  auto run_tp = [](auto& a, const Scenario& s, std::vector<uint32_t>* d,
+                   snii::io::IoMetrics* m) {
+    if (s.kind == SKind::kPhrase) a.phrase_query(s.words, d, m);
+    else a.term_query(s.term, d, m);
+  };
+
+  const double secs = args.concurrency_seconds;
+  const uint32_t W = args.concurrency;
+  std::printf("\n=== concurrent throughput (REAL OSS, %.0fs/pass, warmup=%u/thread, "
+              "term+phrase) ===\n", secs, args.concurrency_warmup);
+  std::vector<uint32_t> levels = {1u};
+  if (W != 1) levels.push_back(W);
+  for (uint32_t N : levels) {
+    print_conc_row("CLucene", run_concurrent(make_clu, run_tp, scs, N, secs,
+                                             args.concurrency_warmup));
+    print_conc_row("SNII", run_concurrent(make_snii, run_tp, scs, N, secs,
+                                          args.concurrency_warmup));
+  }
+}
+#endif  // SNII_WITH_S3
 
 void report_scenario(const Scenario& s, const EngineQueryResult& sn,
                      const EngineQueryResult& cl, bool* all_identical) {
@@ -1878,6 +1946,8 @@ int run_scenario_mode(const Args& args) {
         run_one(*ca, s, &d, &m);
       }
     }
+    auto run_q = [](auto& a, const Scenario& s, std::vector<uint32_t>* d,
+                    snii::io::IoMetrics* m) { run_one(a, s, d, m); };
     const double secs = args.concurrency_seconds;
     const uint32_t W = args.concurrency;
     std::printf("\n=== concurrent throughput (local, %.0fs/pass, warmup=%u/thread) ===\n",
@@ -1885,10 +1955,10 @@ int run_scenario_mode(const Args& args) {
     std::vector<uint32_t> levels = {1u};
     if (W != 1) levels.push_back(W);
     for (uint32_t N : levels) {
-      print_conc_row("CLucene",
-                     run_concurrent(make_clu, scenarios, N, secs, args.concurrency_warmup));
-      print_conc_row("SNII",
-                     run_concurrent(make_snii, scenarios, N, secs, args.concurrency_warmup));
+      print_conc_row("CLucene", run_concurrent(make_clu, run_q, scenarios, N, secs,
+                                               args.concurrency_warmup));
+      print_conc_row("SNII", run_concurrent(make_snii, run_q, scenarios, N, secs,
+                                            args.concurrency_warmup));
     }
     std::printf("  peak_rss=%.1f MiB (process high-water across all passes)\n",
                 peak_rss_mib());

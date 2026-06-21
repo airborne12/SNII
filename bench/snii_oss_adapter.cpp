@@ -97,9 +97,17 @@ void SniiOssAdapter::build_upload_and_open(const Corpus& c,
     if (Status s = w.append(Slice(idx_bytes)); !s.ok()) fail("S3 append", s);
     if (Status s = w.finalize(); !s.ok()) fail("S3 finalize", s);
   }
+  object_key_ = key;
   uploaded_key_ = cfg.prefix + "/" + key;
 
   // 5. Open over an S3FileReader wrapped in a metered cost model.
+  open_uploaded(key, cfg);
+}
+
+void SniiOssAdapter::open_uploaded(const std::string& key,
+                                   const snii::io::S3Config& cfg) {
+  using namespace snii;
+  object_key_ = key;
   s3_ = std::make_unique<io::S3FileReader>();
   if (Status s = io::S3FileReader::open(cfg, key, s3_.get()); !s.ok()) {
     fail("S3 read open", s);

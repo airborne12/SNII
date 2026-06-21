@@ -102,6 +102,10 @@ const std::vector<std::string>& CluceneOssAdapter::uploaded_keys() const {
   return impl_->uploaded_keys;
 }
 
+const std::vector<std::string>& CluceneOssAdapter::file_names() const {
+  return impl_->file_names;
+}
+
 void CluceneOssAdapter::build_upload_and_open(const Corpus& c,
                                               const snii::io::S3Config& cfg) {
   impl_->dir_path = make_temp_dir();
@@ -184,8 +188,13 @@ void CluceneOssAdapter::build_upload_and_open(const Corpus& c,
   }
 
   // --- Read phase: open through the OSS-backed metered directory. ---
-  impl_->directory =
-      std::make_unique<OssCluceneDirectory>(cfg, impl_->file_names);
+  open_uploaded(cfg, impl_->file_names);
+}
+
+void CluceneOssAdapter::open_uploaded(const snii::io::S3Config& cfg,
+                                      const std::vector<std::string>& file_names) {
+  impl_->file_names = file_names;
+  impl_->directory = std::make_unique<OssCluceneDirectory>(cfg, impl_->file_names);
   impl_->reader = cl_index::IndexReader::open(impl_->directory->directory());
   if (impl_->reader == nullptr) fail("IndexReader::open returned null");
   impl_->searcher = std::make_unique<cl_search::IndexSearcher>(
