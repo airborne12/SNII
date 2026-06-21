@@ -27,6 +27,7 @@
 #include <map>
 #include <set>
 #include <string>
+#include <atomic>
 #include <thread>
 #include <vector>
 
@@ -77,6 +78,9 @@ struct Args {
   bool keyword = false;       // run the non-tokenized (keyword) docs-only comparison
   bool multi_index = false;   // run the SNII multi-logical-index write self-check
   bool scoring = false;       // run the SNII BM25 scoring path-equivalence check
+  uint32_t concurrency = 0;   // >0: also run a concurrent throughput pass (N threads)
+  double concurrency_seconds = 5.0;  // wall-clock duration of each concurrent pass
+  uint32_t concurrency_warmup = 50;  // queries discarded per thread before timing
 };
 
 Args parse_args(int argc, char** argv) {
@@ -150,6 +154,14 @@ Args parse_args(int argc, char** argv) {
       a.multi_index = true;
     } else if (flag == "--scoring") {
       a.scoring = true;
+    } else if (flag == "--concurrency") {
+      a.concurrency =
+          static_cast<uint32_t>(std::strtoul(next("--concurrency"), nullptr, 10));
+    } else if (flag == "--concurrency-seconds") {
+      a.concurrency_seconds = std::strtod(next("--concurrency-seconds"), nullptr);
+    } else if (flag == "--concurrency-warmup") {
+      a.concurrency_warmup = static_cast<uint32_t>(
+          std::strtoul(next("--concurrency-warmup"), nullptr, 10));
     } else {
       std::fprintf(stderr, "unknown argument: %s\n", flag.c_str());
       std::exit(2);
@@ -1358,22 +1370,108 @@ std::vector<Scenario> resolve_scenarios(const bench::Corpus& c) {
   return out;
 }
 
+// One query of a scenario, dispatched on kind (shared by single + concurrent runs).
+template <class Adapter>
+void run_one(Adapter& idx, const Scenario& s, std::vector<uint32_t>* docids,
+             snii::io::IoMetrics* metrics) {
+  switch (s.kind) {
+    case SKind::kTerm: idx.term_query(s.term, docids, metrics); break;
+    case SKind::kPhrase: idx.phrase_query(s.words, docids, metrics); break;
+    case SKind::kAnd: idx.boolean_and(s.words, docids, metrics); break;
+    case SKind::kOr: idx.boolean_or(s.words, docids, metrics); break;
+    case SKind::kMatchAll: idx.match_all(docids, metrics); break;
+  }
+}
+
 // Runs one scenario `runs` times on an adapter, dispatching on its kind.
 template <class Adapter>
 EngineQueryResult run_scenario_on(Adapter& idx, const Scenario& s, uint32_t runs) {
   EngineQueryResult r;
   for (uint32_t i = 0; i < runs; ++i) {
     const auto t0 = std::chrono::steady_clock::now();
-    switch (s.kind) {
-      case SKind::kTerm: idx.term_query(s.term, &r.docids, &r.metrics); break;
-      case SKind::kPhrase: idx.phrase_query(s.words, &r.docids, &r.metrics); break;
-      case SKind::kAnd: idx.boolean_and(s.words, &r.docids, &r.metrics); break;
-      case SKind::kOr: idx.boolean_or(s.words, &r.docids, &r.metrics); break;
-      case SKind::kMatchAll: idx.match_all(&r.docids, &r.metrics); break;
-    }
+    run_one(idx, s, &r.docids, &r.metrics);
     r.latency_ms.push_back(wall_ms_since(t0));
   }
   return r;
+}
+
+// Aggregate result of a concurrent throughput pass.
+struct ConcResult {
+  uint32_t threads = 0;
+  uint64_t queries = 0;   // post-warmup queries counted toward latency/QPS
+  double wall_s = 0.0;
+  double qps = 0.0;
+  double p50 = 0.0, p90 = 0.0, p99 = 0.0, mean = 0.0;
+};
+
+// Nearest-rank percentile (idx = round(p*(n-1))), matching lat_stats' convention.
+double pct(const std::vector<double>& sorted, double p) {
+  if (sorted.empty()) return 0.0;
+  const size_t i = static_cast<size_t>(p * (sorted.size() - 1) + 0.5);
+  return sorted[i];
+}
+
+// Runs `scenarios` round-robin on `threads` worker threads for `seconds` wall-clock,
+// each thread owning an INDEPENDENT adapter from make_adapter() (no shared mutable
+// state -- verified race-free). The first `warmup` queries per thread are discarded.
+// Returns throughput (QPS) + tail latency. make_adapter() runs inside each worker.
+template <class MakeAdapter>
+ConcResult run_concurrent(MakeAdapter make_adapter, const std::vector<Scenario>& scs,
+                          uint32_t threads, double seconds, uint32_t warmup) {
+  std::atomic<bool> go{false}, stop{false};
+  std::vector<std::vector<double>> per_thread(threads);
+  std::vector<std::thread> workers;
+  workers.reserve(threads);
+  for (uint32_t t = 0; t < threads; ++t) {
+    workers.emplace_back([&, t]() {
+      auto adapter = make_adapter();  // own reader chain (per-thread isolation)
+      std::vector<double>& lat = per_thread[t];
+      lat.reserve(16384);
+      std::vector<uint32_t> docids;
+      snii::io::IoMetrics scratch;
+      size_t si = t;  // round-robin offset so threads spread across scenarios
+      uint32_t local = 0;
+      while (!go.load(std::memory_order_acquire)) {
+      }
+      while (!stop.load(std::memory_order_relaxed)) {
+        const Scenario& s = scs[si++ % scs.size()];
+        const auto t0 = std::chrono::steady_clock::now();
+        run_one(*adapter, s, &docids, &scratch);
+        const double ms = wall_ms_since(t0);
+        if (local++ >= warmup) lat.push_back(ms);
+      }
+    });
+  }
+  const auto wall0 = std::chrono::steady_clock::now();
+  go.store(true, std::memory_order_release);
+  std::this_thread::sleep_for(std::chrono::duration<double>(seconds));
+  stop.store(true, std::memory_order_relaxed);
+  for (auto& w : workers) w.join();
+  const double wall = std::chrono::duration<double>(
+      std::chrono::steady_clock::now() - wall0).count();
+
+  std::vector<double> all;
+  for (auto& v : per_thread) all.insert(all.end(), v.begin(), v.end());
+  std::sort(all.begin(), all.end());
+  ConcResult r;
+  r.threads = threads;
+  r.queries = all.size();
+  r.wall_s = wall;
+  r.qps = wall > 0 ? static_cast<double>(all.size()) / wall : 0.0;
+  r.p50 = pct(all, 0.50);
+  r.p90 = pct(all, 0.90);
+  r.p99 = pct(all, 0.99);
+  double sum = 0.0;
+  for (double v : all) sum += v;
+  r.mean = all.empty() ? 0.0 : sum / static_cast<double>(all.size());
+  return r;
+}
+
+void print_conc_row(const char* engine, const ConcResult& c) {
+  std::printf("  %-8s threads=%-3u QPS=%-9.0f queries=%-8llu p50=%.3f p90=%.3f "
+              "p99=%.3f mean=%.3f ms\n",
+              engine, c.threads, c.qps,
+              static_cast<unsigned long long>(c.queries), c.p50, c.p90, c.p99, c.mean);
 }
 
 void report_scenario(const Scenario& s, const EngineQueryResult& sn,
@@ -1750,6 +1848,52 @@ int run_scenario_mode(const Args& args) {
     }
     report_scenario(s, sn, cl, &all_identical);
   }
+
+  // Concurrent throughput matrix: single (N=1) vs concurrent (N threads), per
+  // engine, over the SAME scenario set. Each worker owns an independent adapter
+  // (open_existing over the just-built index) -- verified race-free. The single-
+  // thread docid-identity gate above must have passed first.
+  if (args.concurrency != 0) {
+    const std::string snii_path = out + "/snii/index.idx";
+    const std::string clu_path = out + "/clucene";
+    auto make_snii = [snii_path]() {
+      auto a = std::make_unique<bench::SniiAdapter>();
+      a->open_existing(snii_path);
+      return a;
+    };
+    auto make_clu = [clu_path]() {
+      auto a = std::make_unique<bench::CluceneAdapter>();
+      a->open_existing(clu_path);
+      return a;
+    };
+    // Warm-up single-threaded so process-global lazy inits (CLucene Similarity /
+    // FSDirectory cache / string-intern / ThreadLocal) happen outside the timing.
+    {
+      std::vector<uint32_t> d;
+      snii::io::IoMetrics m;
+      auto sa = make_snii();
+      auto ca = make_clu();
+      for (const Scenario& s : scenarios) {
+        run_one(*sa, s, &d, &m);
+        run_one(*ca, s, &d, &m);
+      }
+    }
+    const double secs = args.concurrency_seconds;
+    const uint32_t W = args.concurrency;
+    std::printf("\n=== concurrent throughput (local, %.0fs/pass, warmup=%u/thread) ===\n",
+                secs, args.concurrency_warmup);
+    std::vector<uint32_t> levels = {1u};
+    if (W != 1) levels.push_back(W);
+    for (uint32_t N : levels) {
+      print_conc_row("CLucene",
+                     run_concurrent(make_clu, scenarios, N, secs, args.concurrency_warmup));
+      print_conc_row("SNII",
+                     run_concurrent(make_snii, scenarios, N, secs, args.concurrency_warmup));
+    }
+    std::printf("  peak_rss=%.1f MiB (process high-water across all passes)\n",
+                peak_rss_mib());
+  }
+
   std::printf("\nresult: %s (%zu scenarios)\n",
               all_identical ? "ALL DOCIDS IDENTICAL (SNII == CLucene)"
                             : "DOCID MISMATCH",
