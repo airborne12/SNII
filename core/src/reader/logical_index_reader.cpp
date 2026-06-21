@@ -97,6 +97,61 @@ Status LogicalIndexReader::lookup(std::string_view term, bool* found,
   return Status::OK();
 }
 
+Status LogicalIndexReader::prefix_terms(std::string_view prefix,
+                                        std::vector<PrefixHit>* out) const {
+  out->clear();
+  if (reader_ == nullptr) return Status::InvalidArgument("logical_index: not opened");
+
+  // Seek the start block: the SampledTermIndex block whose first term <= prefix
+  // (terms with `prefix` are >= prefix, so they begin in that block or later). If
+  // the prefix sorts before every sample (or is empty), start at block 0.
+  uint32_t start = 0;
+  if (!prefix.empty()) {
+    bool maybe = false;
+    uint32_t ordinal = 0;
+    SNII_RETURN_IF_ERROR(sti_.locate(prefix, &maybe, &ordinal));
+    if (maybe) start = ordinal;
+  }
+
+  for (uint32_t ord = start; ord < dbd_.n_blocks(); ++ord) {
+    BlockRef ref{};
+    SNII_RETURN_IF_ERROR(dbd_.get(ord, &ref));
+    std::vector<uint8_t> block_bytes;
+    SNII_RETURN_IF_ERROR(reader_->read_at(ref.offset, ref.length, &block_bytes));
+    std::vector<uint8_t> inflated;
+    Slice block_slice(block_bytes);
+    if (ref.flags & snii::format::block_ref_flags::kZstd) {
+      constexpr uint64_t kMaxDictBlockUncompBytes = 256ull * 1024 * 1024;
+      if (ref.uncomp_len == 0 || ref.uncomp_len > kMaxDictBlockUncompBytes) {
+        return Status::Corruption("dict block: zstd uncomp_len out of range");
+      }
+      SNII_RETURN_IF_ERROR(snii::zstd_decompress(
+          Slice(block_bytes), static_cast<size_t>(ref.uncomp_len), &inflated));
+      block_slice = Slice(inflated);
+    }
+    DictBlockReader br;
+    SNII_RETURN_IF_ERROR(
+        DictBlockReader::open(block_slice, tier_, has_positions_, &br));
+    std::vector<DictEntry> entries;
+    SNII_RETURN_IF_ERROR(br.decode_all(&entries));
+
+    for (DictEntry& e : entries) {
+      const std::string_view t(e.term);
+      if (t < prefix) continue;  // not yet at the prefix range
+      const bool has_prefix =
+          t.size() >= prefix.size() && t.compare(0, prefix.size(), prefix) == 0;
+      if (!has_prefix) return Status::OK();  // past the prefix range; sorted -> done
+      PrefixHit hit;
+      hit.term = e.term;
+      hit.entry = std::move(e);
+      hit.frq_base = br.frq_base();
+      hit.prx_base = br.prx_base();
+      out->push_back(std::move(hit));
+    }
+  }
+  return Status::OK();
+}
+
 namespace {
 
 // Validates a pod_ref window locator against its POD section and returns the
