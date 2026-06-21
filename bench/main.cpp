@@ -22,14 +22,18 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <filesystem>
 #include <map>
 #include <set>
 #include <string>
+#include <thread>
 #include <vector>
 
 #include "clucene_adapter.h"
 #include "corpus_gen.h"
 #include "corpus_loader.h"
+#include "parallel_tokenizer.h"
+#include "parquet_corpus_reader.h"
 #include "snii/io/metered_file_reader.h"
 #include "snii_adapter.h"
 
@@ -54,6 +58,20 @@ struct Args {
   std::string engine = "both";  // --resources scope: snii | clucene | none | both
   uint32_t spill_mib = 0;     // SNII SPIMI spill threshold in MiB (0 = unlimited)
   std::string corpus_file;    // load a REAL corpus (one doc/line) instead of generate
+  // E2E real-dataset import mode (activated when parquet_file is non-empty).
+  std::string parquet_file;   // source parquet (real OTel-log dataset)
+  std::string text_col = "Body";  // string column to index
+  uint32_t threads = 0;       // tokenization worker threads (0 = hardware concurrency)
+  std::string out_dir;        // persistent index output dir (default under e2e_data)
+  bool keep_index = true;     // leave the built index files on disk for inspection
+  uint32_t runs = 1;          // build-measurement repeats; report the median
+  // Query-only mode (activated when query_dir is non-empty): open the persisted
+  // indexes under query_dir and run a query benchmark (no import / build).
+  std::string query_dir;      // dir holding snii/index.idx and clucene/
+  std::string terms;          // comma-separated query terms (empty = OTel defaults)
+  std::string phrase;         // space-separated phrase words (empty = default)
+  bool no_merge = false;      // CLucene: flush segments but skip optimize() (no merge)
+  uint32_t shard_docs = 0;    // SNII: docs per segment (0 = single segment)
 };
 
 Args parse_args(int argc, char** argv) {
@@ -92,6 +110,33 @@ Args parse_args(int argc, char** argv) {
           static_cast<uint32_t>(std::strtoul(next("--spill-mib"), nullptr, 10));
     } else if (flag == "--corpus-file") {
       a.corpus_file = next("--corpus-file");
+    } else if (flag == "--parquet-file") {
+      a.parquet_file = next("--parquet-file");
+    } else if (flag == "--text-col") {
+      a.text_col = next("--text-col");
+    } else if (flag == "--threads") {
+      a.threads =
+          static_cast<uint32_t>(std::strtoul(next("--threads"), nullptr, 10));
+    } else if (flag == "--out-dir") {
+      a.out_dir = next("--out-dir");
+    } else if (flag == "--keep-index") {
+      a.keep_index = true;
+    } else if (flag == "--no-keep-index") {
+      a.keep_index = false;
+    } else if (flag == "--runs") {
+      a.runs = static_cast<uint32_t>(std::strtoul(next("--runs"), nullptr, 10));
+      if (a.runs == 0) a.runs = 1;
+    } else if (flag == "--query-dir") {
+      a.query_dir = next("--query-dir");
+    } else if (flag == "--terms") {
+      a.terms = next("--terms");
+    } else if (flag == "--phrase") {
+      a.phrase = next("--phrase");
+    } else if (flag == "--no-merge") {
+      a.no_merge = true;
+    } else if (flag == "--shard-docs") {
+      a.shard_docs =
+          static_cast<uint32_t>(std::strtoul(next("--shard-docs"), nullptr, 10));
     } else {
       std::fprintf(stderr, "unknown argument: %s\n", flag.c_str());
       std::exit(2);
@@ -490,13 +535,19 @@ void apply_spill(bench::CluceneAdapter& idx, uint32_t spill_mib) {
 template <typename Adapter>
 void apply_spill(Adapter&, uint32_t) {}
 
+// CLucene-only: flush segments without optimize() (no merge). No-op for SNII.
+void apply_no_merge(bench::CluceneAdapter& idx, bool v) { idx.set_no_merge(v); }
+template <typename Adapter>
+void apply_no_merge(Adapter&, bool) {}
+
 // Builds one engine over the corpus, reporting its on-disk index size and the
 // CPU it took. Returns nothing; peak RSS is read at process exit by the caller.
 template <typename Adapter>
 void build_and_report(const char* name, const bench::Corpus& corpus,
-                      uint32_t spill_mib) {
+                      uint32_t spill_mib, bool no_merge) {
   Adapter idx;
   apply_spill(idx, spill_mib);
+  apply_no_merge(idx, no_merge);
   std::printf("  %-8s pre_build_rss=%.1f MiB (corpus floor)\n", name, current_rss_mib());
   const double c0 = cpu_seconds();
   const auto w0 = std::chrono::steady_clock::now();
@@ -525,9 +576,13 @@ int run_resources_mode(const Args& args, const bench::Corpus& corpus) {
   const bool snii = args.engine == "snii" || args.engine == "both";
   const bool clu = args.engine == "clucene" || args.engine == "both";
   try {
-    if (snii) build_and_report<bench::SniiAdapter>("SNII", corpus, args.spill_mib);
+    if (snii)
+      build_and_report<bench::SniiAdapter>("SNII", corpus, args.spill_mib,
+                                           args.no_merge);
     // Same threshold for CLucene: its RAM-buffer flush matches SNII's spill.
-    if (clu) build_and_report<bench::CluceneAdapter>("CLucene", corpus, args.spill_mib);
+    if (clu)
+      build_and_report<bench::CluceneAdapter>("CLucene", corpus, args.spill_mib,
+                                              args.no_merge);
   } catch (const std::exception& e) {
     std::fprintf(stderr, "FATAL: resource build failed: %s\n", e.what());
     return 1;
@@ -535,6 +590,709 @@ int run_resources_mode(const Args& args, const bench::Corpus& corpus) {
   std::printf("  peak_rss=%.1f MiB (process high-water; engine=%s)\n",
               peak_rss_mib(), args.engine.c_str());
   return 0;
+}
+
+// Median of a sample set (sorts a local copy). Empty input returns 0.
+double median(std::vector<double> v) {
+  if (v.empty()) return 0.0;
+  std::sort(v.begin(), v.end());
+  return v[v.size() / 2];
+}
+
+// Lists the on-disk index files with sizes (the "real index files" deliverable).
+void print_index_files(const char* name, const std::vector<std::string>& files) {
+  uint64_t total = 0;
+  std::printf("  %s index files:\n", name);
+  for (const std::string& f : files) {
+    std::error_code ec;
+    const auto sz = std::filesystem::file_size(f, ec);
+    const uint64_t b = ec ? 0 : static_cast<uint64_t>(sz);
+    total += b;
+    std::printf("    %-52s %10llu B (%7.2f MiB)\n", f.c_str(),
+                static_cast<unsigned long long>(b), mib(b));
+  }
+  std::printf("    %-52s %10llu B (%7.2f MiB)\n", "TOTAL",
+              static_cast<unsigned long long>(total), mib(total));
+}
+
+// E2E real-dataset import mode: read a parquet text column, tokenize it with the
+// shared Doris-english analyzer across `threads` workers, build a persistent
+// on-disk index with each engine, verify cross-engine query consistency (and
+// that the persisted SNII container reopens), and report import CPU / peak RSS /
+// index size. Returns the process exit code (0 = success + all docids match).
+int run_e2e_mode(const Args& args) {
+  const bool want_snii = args.engine == "snii" || args.engine == "both";
+  const bool want_clu = args.engine == "clucene" || args.engine == "both";
+  const uint32_t threads =
+      args.threads != 0 ? args.threads
+                        : std::max(1u, std::thread::hardware_concurrency());
+  std::string out_dir = args.out_dir.empty()
+                            ? std::string("/mnt/disk15/jiangkai/e2e_data/run")
+                            : args.out_dir;
+  const std::string snii_path = out_dir + "/snii/index.idx";
+  const std::string clu_dir = out_dir + "/clucene";
+
+  std::printf("\n=== E2E real-dataset import "
+              "(parquet -> Doris-english tokenize -> build -> verify) ===\n");
+  std::printf("parquet=%s column=%s max_docs=%u threads=%u engine=%s\n",
+              args.parquet_file.c_str(), args.text_col.c_str(), args.docs,
+              threads, args.engine.c_str());
+  std::printf("out_dir=%s keep_index=%s runs=%u spill_mib=%u\n", out_dir.c_str(),
+              args.keep_index ? "yes" : "no", args.runs, args.spill_mib);
+
+  // 1. Read the text column from the real parquet dataset.
+  std::vector<std::string> bodies;
+  uint64_t raw_bytes = 0;
+  try {
+    const auto w0 = std::chrono::steady_clock::now();
+    bodies = bench::read_text_column(args.parquet_file, args.text_col, args.docs);
+    const double read_wall =
+        std::chrono::duration<double>(std::chrono::steady_clock::now() - w0).count();
+    for (const std::string& b : bodies) raw_bytes += b.size();
+    std::printf("  read %zu rows (%.1f MiB raw text) in %.2f s\n", bodies.size(),
+                mib(raw_bytes), read_wall);
+  } catch (const std::exception& e) {
+    std::fprintf(stderr, "FATAL: parquet read failed: %s\n", e.what());
+    return 1;
+  }
+  if (bodies.empty()) {
+    std::fprintf(stderr, "FATAL: parquet column yielded 0 rows\n");
+    return 1;
+  }
+
+  // 2. Parallel Doris-english tokenization (the only multi-threaded stage).
+  const double tc0 = cpu_seconds();
+  const auto tw0 = std::chrono::steady_clock::now();
+  bench::Corpus corpus = bench::tokenize_corpus(bodies, threads);
+  const double tok_cpu = cpu_seconds() - tc0;
+  const double tok_wall =
+      std::chrono::duration<double>(std::chrono::steady_clock::now() - tw0).count();
+  uint64_t total_tokens = 0;
+  for (const auto& d : corpus.docs) total_tokens += d.size();
+  const double corpus_floor = current_rss_mib();
+  std::printf("  tokenized: docs=%u vocab=%zu tokens=%llu  "
+              "tok_cpu_s=%.2f tok_wall_s=%.2f\n",
+              corpus.doc_count, corpus.vocab.size(),
+              static_cast<unsigned long long>(total_tokens), tok_cpu, tok_wall);
+  std::printf("  tokenize throughput: %.0f docs/s, %.1f MiB/s (raw) @ %u threads\n",
+              tok_wall > 0 ? bodies.size() / tok_wall : 0.0,
+              tok_wall > 0 ? mib(raw_bytes) / tok_wall : 0.0, threads);
+  std::printf("  corpus floor RSS=%.1f MiB (tokens held in memory)\n", corpus_floor);
+  // Raw bodies are no longer needed (tokens are the source of truth); free them
+  // so the build's peak RSS is not inflated by the raw text.
+  { std::vector<std::string>().swap(bodies); }
+
+  // Real-OSS latency mode: route the real-parquet corpus into the OSS comparison
+  // (build + upload both indexes to OSS, then query over REAL ranged GETs and
+  // measure wall-clock). The oracle is built only at safe scales.
+  if (args.oss) {
+#ifdef SNII_WITH_S3
+    if (corpus.doc_count > 50'000'000) {
+      std::fprintf(stderr, "FATAL: --oss caps at 50M docs (oracle + upload); "
+                           "use a smaller --docs\n");
+      return 2;
+    }
+    const Oracle oracle(corpus);
+    return run_oss_mode(args, corpus, oracle);
+#else
+    std::fprintf(stderr, "FATAL: --oss requires building with -DSNII_WITH_S3=ON\n");
+    return 2;
+#endif
+  }
+
+  // 3. Build the selected engine(s), persisting to out_dir. The final iteration's
+  //    index is the one kept on disk; --runs repeats the build to take a median.
+  bench::SniiAdapter snii_idx;
+  bench::CluceneAdapter cl_idx;
+  apply_spill(snii_idx, args.spill_mib);
+  apply_spill(cl_idx, args.spill_mib);
+  std::vector<double> snii_cpu, snii_wall, clu_cpu, clu_wall;
+  uint64_t snii_bytes = 0, clu_bytes = 0;
+  try {
+    for (uint32_t r = 0; r < args.runs; ++r) {
+      const bool last = (r + 1 == args.runs);
+      const bool keep = last && args.keep_index;
+      if (want_snii) {
+        // A throwaway adapter for the non-final measurement runs; the final build
+        // uses the persistent snii_idx kept alive for the consistency check.
+        const double c0 = cpu_seconds();
+        const auto w0 = std::chrono::steady_clock::now();
+        if (last) {
+          snii_idx.build_at(snii_path, corpus, keep);
+        } else {
+          bench::SniiAdapter tmp;
+          apply_spill(tmp, args.spill_mib);
+          tmp.build_at(snii_path, corpus, /*keep_on_disk=*/false);
+        }
+        snii_cpu.push_back(cpu_seconds() - c0);
+        snii_wall.push_back(
+            std::chrono::duration<double>(std::chrono::steady_clock::now() - w0).count());
+        if (last) snii_bytes = snii_idx.index_bytes();
+      }
+      if (want_clu) {
+        const double c0 = cpu_seconds();
+        const auto w0 = std::chrono::steady_clock::now();
+        if (last) {
+          cl_idx.build_at(clu_dir, corpus, keep);
+        } else {
+          bench::CluceneAdapter tmp;
+          apply_spill(tmp, args.spill_mib);
+          tmp.build_at(clu_dir, corpus, /*keep_on_disk=*/false);
+        }
+        clu_cpu.push_back(cpu_seconds() - c0);
+        clu_wall.push_back(
+            std::chrono::duration<double>(std::chrono::steady_clock::now() - w0).count());
+        if (last) clu_bytes = cl_idx.index_bytes();
+      }
+    }
+  } catch (const std::exception& e) {
+    std::fprintf(stderr, "FATAL: E2E build failed: %s\n", e.what());
+    return 1;
+  }
+
+  // 4. Cross-engine consistency: term (high/mid/low df) + a real phrase. Each is
+  //    asserted equal across SNII, CLucene, and the in-memory oracle.
+  bool all_match = true;
+  if (want_snii && want_clu) {
+    // The in-memory Oracle (map<string,set<docid>>) is a third cross-check, but
+    // it is itself a full inverted index in the most memory-expensive layout, so
+    // at very large doc counts it would dwarf both engines and risk OOM. Above
+    // the threshold we drop it and rely on the direct SNII-vs-CLucene equality
+    // (the primary consistency guarantee); below it we keep all three.
+    constexpr uint32_t kOracleMaxDocs = 50'000'000;
+    const bool use_oracle = corpus.doc_count <= kOracleMaxDocs;
+    std::unique_ptr<Oracle> oracle;
+    if (use_oracle) {
+      oracle = std::make_unique<Oracle>(corpus);
+    } else {
+      std::printf("  (corpus > %u docs: skipping in-memory oracle to bound RAM; "
+                  "verifying SNII == CLucene directly)\n",
+                  kOracleMaxDocs);
+    }
+    const std::string high_term = corpus.vocab[bench::highest_df_term(corpus)];
+    const std::string mid_term = corpus.vocab[bench::mid_df_term(corpus)];
+    const std::string low_term = corpus.vocab[bench::low_df_term(corpus)];
+    const std::vector<std::string> phrase = bench::extract_phrase(corpus, 3);
+    std::printf("query terms: high-df='%s' mid-df='%s' low-df='%s'  phrase='%s'\n",
+                high_term.c_str(), mid_term.c_str(), low_term.c_str(),
+                join_words(phrase).c_str());
+
+    auto check_term = [&](const std::string& term) {
+      std::vector<uint32_t> sdoc, cdoc;
+      snii::io::IoMetrics sm, cm;
+      snii_idx.term_query(term, &sdoc, &sm);
+      cl_idx.term_query(term, &cdoc, &cm);
+      const bool engines_eq = (sdoc == cdoc);
+      const bool oracle_eq = !use_oracle || sdoc == oracle->term(term);
+      if (!(engines_eq && oracle_eq)) {
+        all_match = false;
+        std::fprintf(stderr, "MISMATCH term '%s': snii=%zu clucene=%zu%s\n",
+                     term.c_str(), sdoc.size(), cdoc.size(),
+                     use_oracle ? (" oracle=" + std::to_string(
+                                       oracle->term(term).size())).c_str()
+                                : "");
+      }
+    };
+    check_term(high_term);
+    check_term(mid_term);
+    check_term(low_term);
+    if (!phrase.empty()) {
+      std::vector<uint32_t> sdoc, cdoc;
+      snii::io::IoMetrics sm, cm;
+      snii_idx.phrase_query(phrase, &sdoc, &sm);
+      cl_idx.phrase_query(phrase, &cdoc, &cm);
+      const bool engines_eq = (sdoc == cdoc);
+      const bool oracle_eq = !use_oracle || sdoc == oracle->phrase(phrase);
+      if (!(engines_eq && oracle_eq)) {
+        all_match = false;
+        std::fprintf(stderr, "MISMATCH phrase: snii=%zu clucene=%zu\n",
+                     sdoc.size(), cdoc.size());
+      }
+    }
+
+    // 4b. Reopen the persisted SNII container with a FRESH reader and confirm the
+    //     same docids -- proving the on-disk file is a real, reopenable index.
+    if (args.keep_index) {
+      try {
+        bench::SniiAdapter reopened;
+        reopened.open_existing(snii_path);
+        std::vector<uint32_t> rdoc, sdoc;
+        snii::io::IoMetrics m;
+        reopened.term_query(high_term, &rdoc, &m);
+        snii_idx.term_query(high_term, &sdoc, &m);
+        if (rdoc != sdoc) {
+          all_match = false;
+          std::fprintf(stderr, "MISMATCH reopen: fresh=%zu original=%zu\n",
+                       rdoc.size(), sdoc.size());
+        } else {
+          std::printf("  reopen check: persisted SNII .idx reopened, "
+                      "term '%s' -> %zu docs (match)\n",
+                      high_term.c_str(), rdoc.size());
+        }
+      } catch (const std::exception& e) {
+        all_match = false;
+        std::fprintf(stderr, "FATAL: reopen of %s failed: %s\n",
+                     snii_path.c_str(), e.what());
+      }
+    }
+  }
+
+  // 5. Report: import CPU / peak RSS / index size.
+  std::printf("\n=== E2E import metrics (median of %u run%s) ===\n", args.runs,
+              args.runs == 1 ? "" : "s");
+  std::printf("  tokenize (shared): cpu_s=%.2f wall_s=%.2f threads=%u\n", tok_cpu,
+              tok_wall, threads);
+  if (want_snii) {
+    std::printf("  SNII     index_bytes=%-12llu (%7.2f MiB)  build_cpu_s=%.2f  "
+                "build_wall_s=%.2f\n",
+                static_cast<unsigned long long>(snii_bytes), mib(snii_bytes),
+                median(snii_cpu), median(snii_wall));
+  }
+  if (want_clu) {
+    std::printf("  CLucene  index_bytes=%-12llu (%7.2f MiB)  build_cpu_s=%.2f  "
+                "build_wall_s=%.2f\n",
+                static_cast<unsigned long long>(clu_bytes), mib(clu_bytes),
+                median(clu_cpu), median(clu_wall));
+  }
+  const double peak = peak_rss_mib();
+  std::printf("  peak_rss=%.1f MiB (process high-water; corpus floor=%.1f MiB; "
+              "engine-net=%.1f MiB)\n",
+              peak, corpus_floor, peak - corpus_floor);
+  if (args.engine == "both") {
+    std::printf("  NOTE: peak RSS covers BOTH builds; for clean per-engine memory "
+                "run --engine snii / --engine clucene in separate processes\n");
+  }
+
+  // 6. Show the real on-disk index files.
+  std::printf("\n");
+  if (want_snii && args.keep_index) print_index_files("SNII", snii_idx.index_files());
+  if (want_clu && args.keep_index) print_index_files("CLucene", cl_idx.index_files());
+
+  if (want_snii && want_clu) {
+    std::printf("\nresult: %s\n", all_match ? "ALL DOCIDS MATCH" : "DOCID MISMATCH");
+    return all_match ? 0 : 1;
+  }
+  std::printf("\nresult: built engine=%s (consistency check needs --engine both)\n",
+              args.engine.c_str());
+  return 0;
+}
+
+double wall_ms_since(std::chrono::steady_clock::time_point t0) {
+  return std::chrono::duration<double, std::milli>(
+             std::chrono::steady_clock::now() - t0)
+      .count();
+}
+
+std::vector<std::string> split_csv(const std::string& s) {
+  std::vector<std::string> out;
+  std::string cur;
+  for (char ch : s) {
+    if (ch == ',') {
+      if (!cur.empty()) out.push_back(cur);
+      cur.clear();
+    } else {
+      cur.push_back(ch);
+    }
+  }
+  if (!cur.empty()) out.push_back(cur);
+  return out;
+}
+
+std::vector<std::string> split_ws(const std::string& s) {
+  std::vector<std::string> out;
+  std::string cur;
+  for (char ch : s) {
+    if (ch == ' ' || ch == '\t') {
+      if (!cur.empty()) out.push_back(cur);
+      cur.clear();
+    } else {
+      cur.push_back(ch);
+    }
+  }
+  if (!cur.empty()) out.push_back(cur);
+  return out;
+}
+
+// One engine's result for a single query: ascending docids, the three gold I/O
+// metrics (captured on a cold run), and per-run wall-clock latency samples.
+struct EngineQueryResult {
+  std::vector<uint32_t> docids;
+  snii::io::IoMetrics metrics;
+  std::vector<double> latency_ms;
+};
+
+// Runs the query `runs` times on either adapter (each call resets the metered
+// reader to a cold cache, so latency includes the physical reads). Returns the
+// docids, the last run's I/O metrics, and all latency samples.
+template <class Adapter>
+EngineQueryResult run_query_n(Adapter& idx, bool is_phrase,
+                              const std::string& term,
+                              const std::vector<std::string>& words,
+                              uint32_t runs) {
+  EngineQueryResult r;
+  for (uint32_t i = 0; i < runs; ++i) {
+    const auto t0 = std::chrono::steady_clock::now();
+    if (is_phrase) {
+      idx.phrase_query(words, &r.docids, &r.metrics);
+    } else {
+      idx.term_query(term, &r.docids, &r.metrics);
+    }
+    r.latency_ms.push_back(wall_ms_since(t0));
+  }
+  return r;
+}
+
+// Latency distribution of one query's repeated runs. `cold` is the very FIRST
+// run (OS page cache cold); min/median/p90/mean summarise the whole sample so
+// warm-cache behaviour is visible alongside the cold first touch.
+struct LatStats {
+  double cold = 0.0, min = 0.0, median = 0.0, p90 = 0.0, mean = 0.0;
+};
+
+LatStats lat_stats(const std::vector<double>& samples) {
+  LatStats s;
+  if (samples.empty()) return s;
+  s.cold = samples.front();  // first run = cold page cache
+  std::vector<double> v = samples;
+  std::sort(v.begin(), v.end());
+  const size_t n = v.size();
+  s.min = v.front();
+  s.median = v[n / 2];
+  s.p90 = v[static_cast<size_t>(0.9 * (n - 1) + 0.5)];
+  double sum = 0.0;
+  for (double x : v) sum += x;
+  s.mean = sum / static_cast<double>(n);
+  return s;
+}
+
+void print_latency_row(const char* engine, const std::vector<double>& samples) {
+  const LatStats s = lat_stats(samples);
+  std::printf("  %-8s latency_ms: cold=%-9.2f min=%-9.2f median=%-9.2f "
+              "p90=%-9.2f mean=%-9.2f\n",
+              engine, s.cold, s.min, s.median, s.p90, s.mean);
+}
+
+// Query-only benchmark over a persisted index dir: opens snii/index.idx and (if
+// present) clucene/, then for a set of terms + one phrase asserts SNII docids ==
+// CLucene docids and reports query latency plus the design's THREE GOLD METRICS
+// (serial I/O rounds, range GETs, bytes read). No import / build.
+int run_query_mode(const Args& args) {
+  const std::string snii_path = args.query_dir + "/snii/index.idx";
+  const std::string clu_dir = args.query_dir + "/clucene";
+  const uint32_t R = std::max(args.runs, 5u);  // a small latency distribution
+
+  std::printf("=== query benchmark over persisted index ===\n");
+  std::printf("query_dir=%s runs=%u\n", args.query_dir.c_str(), R);
+
+  bench::SniiAdapter snii_idx;
+  try {
+    snii_idx.open_existing(snii_path);
+  } catch (const std::exception& e) {
+    std::fprintf(stderr, "FATAL: cannot open SNII index %s: %s\n",
+                 snii_path.c_str(), e.what());
+    return 1;
+  }
+
+  // CLucene is optional: it may be absent if its build did not survive this scale.
+  bool have_clu = false;
+  std::error_code ec;
+  if (std::filesystem::is_directory(clu_dir, ec)) {
+    for (const auto& f : std::filesystem::directory_iterator(clu_dir, ec)) {
+      if (f.is_regular_file(ec)) { have_clu = true; break; }
+    }
+  }
+  bench::CluceneAdapter cl_idx;
+  if (have_clu) {
+    try {
+      cl_idx.open_existing(clu_dir);
+    } catch (const std::exception& e) {
+      std::fprintf(stderr, "WARNING: cannot open CLucene index %s: %s\n",
+                   clu_dir.c_str(), e.what());
+      have_clu = false;
+    }
+  }
+  std::printf("engines: SNII=open CLucene=%s\n",
+              have_clu ? "open" : "ABSENT (SNII-only metrics)");
+
+  std::vector<std::string> terms =
+      split_csv(args.terms.empty()
+                    ? "error,failed,checkout,order,currency,rpc,connection,card"
+                    : args.terms);
+  std::vector<std::string> phrase =
+      split_ws(args.phrase.empty() ? "failed to place order" : args.phrase);
+
+  bool all_identical = true;
+
+  auto report = [&](const std::string& label, bool is_phrase,
+                    const std::string& term,
+                    const std::vector<std::string>& words) {
+    EngineQueryResult s, c;
+    try {
+      s = run_query_n(snii_idx, is_phrase, term, words, R);
+      if (have_clu) c = run_query_n(cl_idx, is_phrase, term, words, R);
+    } catch (const std::exception& e) {
+      std::fprintf(stderr, "FATAL: query '%s' failed: %s\n", label.c_str(),
+                   e.what());
+      std::exit(1);
+    }
+    const bool identical = !have_clu || (s.docids == c.docids);
+    if (have_clu && !identical) {
+      all_identical = false;
+      std::fprintf(stderr, "MISMATCH %s: snii=%zu clucene=%zu\n", label.c_str(),
+                   s.docids.size(), c.docids.size());
+    }
+    std::printf("\n[%s]  hits=%zu  identical=%s\n", label.c_str(),
+                s.docids.size(),
+                have_clu ? (identical ? "YES" : "NO") : "n/a");
+    // Three gold metrics (CLucene first to match the I/O-table style).
+    if (have_clu) {
+      std::printf("  %-8s gold: serial_rounds=%-5llu range_gets=%-5llu "
+                  "bytes=%-11llu\n",
+                  "CLucene",
+                  static_cast<unsigned long long>(c.metrics.serial_rounds),
+                  static_cast<unsigned long long>(c.metrics.range_gets),
+                  static_cast<unsigned long long>(c.metrics.total_request_bytes));
+    }
+    std::printf("  %-8s gold: serial_rounds=%-5llu range_gets=%-5llu "
+                "bytes=%-11llu\n",
+                "SNII",
+                static_cast<unsigned long long>(s.metrics.serial_rounds),
+                static_cast<unsigned long long>(s.metrics.range_gets),
+                static_cast<unsigned long long>(s.metrics.total_request_bytes));
+    if (have_clu) {
+      std::printf("  ratio(CL/SNII): serial_rounds=%.2f range_gets=%.2f bytes=%.2f\n",
+                  ratio(c.metrics.serial_rounds, s.metrics.serial_rounds),
+                  ratio(c.metrics.range_gets, s.metrics.range_gets),
+                  ratio(c.metrics.total_request_bytes, s.metrics.total_request_bytes));
+    }
+    // Full query-latency distribution over the repeated runs (cold = first run).
+    if (have_clu) print_latency_row("CLucene", c.latency_ms);
+    print_latency_row("SNII", s.latency_ms);
+    if (have_clu) {
+      const double sl = lat_stats(s.latency_ms).median;
+      const double cl = lat_stats(c.latency_ms).median;
+      std::printf("  latency ratio(CL/SNII): median=%.2f\n",
+                  sl > 0 ? cl / sl : 0.0);
+    }
+  };
+
+  for (const std::string& t : terms) report("TERM '" + t + "'", false, t, {});
+  if (!phrase.empty()) report("PHRASE '" + join_words(phrase) + "'", true,
+                              std::string(), phrase);
+
+  if (have_clu) {
+    std::printf("\nresult: %s\n",
+                all_identical ? "ALL DOCIDS IDENTICAL (SNII == CLucene)"
+                              : "DOCID MISMATCH");
+    return all_identical ? 0 : 1;
+  }
+  std::printf("\nresult: SNII-only query metrics (CLucene index absent at this "
+              "scale)\n");
+  return 0;
+}
+
+// Reads the parquet text column and tokenizes it into `*out` (Doris-english,
+// `threads` workers). Fills the timing/size out-params. Returns false (after
+// printing the error) on failure.
+bool load_and_tokenize(const Args& args, uint32_t threads, bench::Corpus* out,
+                       uint64_t* raw_bytes, double* tok_cpu, double* tok_wall) {
+  std::vector<std::string> bodies;
+  *raw_bytes = 0;
+  try {
+    const auto w0 = std::chrono::steady_clock::now();
+    bodies = bench::read_text_column(args.parquet_file, args.text_col, args.docs);
+    const double read_wall =
+        std::chrono::duration<double>(std::chrono::steady_clock::now() - w0).count();
+    for (const std::string& b : bodies) *raw_bytes += b.size();
+    std::printf("  read %zu rows (%.1f MiB raw) in %.2f s\n", bodies.size(),
+                mib(*raw_bytes), read_wall);
+  } catch (const std::exception& e) {
+    std::fprintf(stderr, "FATAL: parquet read failed: %s\n", e.what());
+    return false;
+  }
+  if (bodies.empty()) {
+    std::fprintf(stderr, "FATAL: parquet column yielded 0 rows\n");
+    return false;
+  }
+  const double c0 = cpu_seconds();
+  const auto t0 = std::chrono::steady_clock::now();
+  *out = bench::tokenize_corpus(bodies, threads);
+  *tok_cpu = cpu_seconds() - c0;
+  *tok_wall =
+      std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
+  return true;
+}
+
+// Runs a query on EVERY shard of one engine and merges the results into the
+// global docid space (shard s's local docids are offset by bases[s]). Shards are
+// in ascending doc-range order, so the concatenation is already globally
+// ascending. The three gold metrics are SUMMED across shards (the query touches
+// all shards); latency is the SUM of per-shard wall time per run.
+template <class Adapter>
+EngineQueryResult query_shards_merged(
+    std::vector<std::unique_ptr<Adapter>>& shards,
+    const std::vector<uint32_t>& bases, bool is_phrase, const std::string& term,
+    const std::vector<std::string>& words, uint32_t runs) {
+  EngineQueryResult agg;
+  for (uint32_t i = 0; i < runs; ++i) {
+    agg.docids.clear();
+    agg.metrics = snii::io::IoMetrics{};
+    double wall = 0.0;
+    for (size_t s = 0; s < shards.size(); ++s) {
+      std::vector<uint32_t> d;
+      snii::io::IoMetrics m;
+      const auto t0 = std::chrono::steady_clock::now();
+      if (is_phrase) {
+        shards[s]->phrase_query(words, &d, &m);
+      } else {
+        shards[s]->term_query(term, &d, &m);
+      }
+      wall += wall_ms_since(t0);
+      for (uint32_t x : d) agg.docids.push_back(bases[s] + x);
+      agg.metrics.read_at_calls += m.read_at_calls;
+      agg.metrics.serial_rounds += m.serial_rounds;
+      agg.metrics.range_gets += m.range_gets;
+      agg.metrics.remote_bytes += m.remote_bytes;
+      agg.metrics.total_request_bytes += m.total_request_bytes;
+    }
+    agg.latency_ms.push_back(wall);
+  }
+  return agg;
+}
+
+// Sharded large-scale head-to-head: both engines are sharded into contiguous
+// doc ranges of `shard_docs` (SNII: one .idx per shard; CLucene: one index dir
+// per shard), so each shard stays under CLucene's ~2^30-position ceiling. Queries
+// open every shard, offset local docids to the global space, and merge. This is
+// the only way to compare the two engines beyond ~95M docs (where a single
+// CLucene segment crashes). Both engines' global docids equal the corpus order,
+// so SNII == CLucene must hold.
+int run_sharded_e2e(const Args& args) {
+  const uint32_t threads =
+      args.threads != 0 ? args.threads
+                        : std::max(1u, std::thread::hardware_concurrency());
+  std::string out_dir = args.out_dir.empty()
+                            ? std::string("/mnt/disk15/jiangkai/e2e_data/sharded")
+                            : args.out_dir;
+  std::printf("=== sharded large-scale head-to-head "
+              "(SNII shards vs CLucene shards) ===\n");
+  std::printf("parquet=%s column=%s max_docs=%u threads=%u shard_docs=%u out=%s\n",
+              args.parquet_file.c_str(), args.text_col.c_str(), args.docs, threads,
+              args.shard_docs, out_dir.c_str());
+
+  bench::Corpus corpus;
+  uint64_t raw_bytes = 0;
+  double tok_cpu = 0, tok_wall = 0;
+  if (!load_and_tokenize(args, threads, &corpus, &raw_bytes, &tok_cpu, &tok_wall)) {
+    return 1;
+  }
+  uint64_t total_tokens = 0;
+  for (const auto& d : corpus.docs) total_tokens += d.size();
+  std::printf("  tokenized: docs=%u vocab=%zu tokens=%llu  tok_cpu_s=%.2f "
+              "tok_wall_s=%.2f (%.1f MiB/s @ %u threads)\n",
+              corpus.doc_count, corpus.vocab.size(),
+              static_cast<unsigned long long>(total_tokens), tok_cpu, tok_wall,
+              tok_wall > 0 ? mib(raw_bytes) / tok_wall : 0.0, threads);
+
+  // Plan contiguous shards. shard_docs==0 falls back to a single shard.
+  const uint32_t M = args.shard_docs != 0 ? args.shard_docs : corpus.doc_count;
+  std::vector<uint32_t> bases;
+  std::vector<std::pair<uint32_t, uint32_t>> ranges;  // [lo, hi)
+  for (uint32_t lo = 0; lo < corpus.doc_count; lo += M) {
+    const uint32_t hi = std::min(lo + M, corpus.doc_count);
+    bases.push_back(lo);
+    ranges.emplace_back(lo, hi);
+  }
+  const size_t K = ranges.size();
+  std::printf("  shards=%zu (%u docs each, last=%u)\n", K, M,
+              ranges.back().second - ranges.back().first);
+
+  // Build every shard for both engines, keeping each adapter alive for querying.
+  std::vector<std::unique_ptr<bench::SniiAdapter>> snii_shards;
+  std::vector<std::unique_ptr<bench::CluceneAdapter>> clu_shards;
+  uint64_t snii_bytes = 0, clu_bytes = 0;
+  const double bc0 = cpu_seconds();
+  const auto bw0 = std::chrono::steady_clock::now();
+  try {
+    for (size_t k = 0; k < K; ++k) {
+      char seg[32];
+      std::snprintf(seg, sizeof(seg), "seg_%03zu", k);
+      auto sn = std::make_unique<bench::SniiAdapter>();
+      apply_spill(*sn, args.spill_mib);
+      sn->build_range(out_dir + "/snii/" + seg + ".idx", corpus, ranges[k].first,
+                      ranges[k].second, args.keep_index);
+      snii_bytes += sn->index_bytes();
+      snii_shards.push_back(std::move(sn));
+
+      auto cl = std::make_unique<bench::CluceneAdapter>();
+      cl->build_range(out_dir + "/clucene/" + seg, corpus, ranges[k].first,
+                      ranges[k].second, args.keep_index);
+      clu_bytes += cl->index_bytes();
+      clu_shards.push_back(std::move(cl));
+      std::printf("  built %s [%u,%u)\n", seg, ranges[k].first, ranges[k].second);
+    }
+  } catch (const std::exception& e) {
+    std::fprintf(stderr, "FATAL: sharded build failed: %s\n", e.what());
+    return 1;
+  }
+  const double build_cpu = cpu_seconds() - bc0;
+  const double build_wall =
+      std::chrono::duration<double>(std::chrono::steady_clock::now() - bw0).count();
+  std::printf("  build: SNII=%llu B (%.2f MiB)  CLucene=%llu B (%.2f MiB)  "
+              "cpu_s=%.1f wall_s=%.1f  peak_rss=%.1f MiB\n",
+              static_cast<unsigned long long>(snii_bytes), mib(snii_bytes),
+              static_cast<unsigned long long>(clu_bytes), mib(clu_bytes),
+              build_cpu, build_wall, peak_rss_mib());
+
+  // Query suite: merge across shards for both engines; assert identical; report
+  // the three gold metrics (summed over shards) and per-query latency.
+  const uint32_t R = std::max(args.runs, 5u);
+  std::vector<std::string> terms = split_csv(
+      args.terms.empty() ? "error,failed,checkout,order,currency,rpc,connection,card"
+                         : args.terms);
+  std::vector<std::string> phrase =
+      split_ws(args.phrase.empty() ? "failed to place order" : args.phrase);
+  bool all_identical = true;
+
+  auto report = [&](const std::string& label, bool is_phrase,
+                    const std::string& term, const std::vector<std::string>& w) {
+    EngineQueryResult s = query_shards_merged(snii_shards, bases, is_phrase, term, w, R);
+    EngineQueryResult c = query_shards_merged(clu_shards, bases, is_phrase, term, w, R);
+    const bool identical = (s.docids == c.docids);
+    if (!identical) {
+      all_identical = false;
+      std::fprintf(stderr, "MISMATCH %s: snii=%zu clucene=%zu\n", label.c_str(),
+                   s.docids.size(), c.docids.size());
+    }
+    std::printf("\n[%s]  hits=%zu  identical=%s\n", label.c_str(), s.docids.size(),
+                identical ? "YES" : "NO");
+    std::printf("  CLucene gold: serial_rounds=%-6llu range_gets=%-6llu bytes=%-12llu\n",
+                static_cast<unsigned long long>(c.metrics.serial_rounds),
+                static_cast<unsigned long long>(c.metrics.range_gets),
+                static_cast<unsigned long long>(c.metrics.total_request_bytes));
+    std::printf("  SNII    gold: serial_rounds=%-6llu range_gets=%-6llu bytes=%-12llu\n",
+                static_cast<unsigned long long>(s.metrics.serial_rounds),
+                static_cast<unsigned long long>(s.metrics.range_gets),
+                static_cast<unsigned long long>(s.metrics.total_request_bytes));
+    std::printf("  ratio(CL/SNII): serial_rounds=%.2f range_gets=%.2f bytes=%.2f\n",
+                ratio(c.metrics.serial_rounds, s.metrics.serial_rounds),
+                ratio(c.metrics.range_gets, s.metrics.range_gets),
+                ratio(c.metrics.total_request_bytes, s.metrics.total_request_bytes));
+    print_latency_row("CLucene", c.latency_ms);
+    print_latency_row("SNII", s.latency_ms);
+    const double sl = lat_stats(s.latency_ms).median, clm = lat_stats(c.latency_ms).median;
+    std::printf("  latency ratio(CL/SNII): median=%.2f\n", sl > 0 ? clm / sl : 0.0);
+  };
+
+  for (const std::string& t : terms) report("TERM '" + t + "'", false, t, {});
+  if (!phrase.empty())
+    report("PHRASE '" + join_words(phrase) + "'", true, std::string(), phrase);
+
+  std::printf("\nresult: %s (shards=%zu, docs=%u)\n",
+              all_identical ? "ALL DOCIDS IDENTICAL (SNII == CLucene)"
+                            : "DOCID MISMATCH",
+              K, corpus.doc_count);
+  return all_identical ? 0 : 1;
 }
 
 }  // namespace
@@ -549,6 +1307,21 @@ int main(int argc, char** argv) {
   mallopt(M_TRIM_THRESHOLD, 128 * 1024);
 
   const Args args = parse_args(argc, argv);
+
+  // Query-only mode: benchmark queries over a persisted index dir (no build).
+  if (!args.query_dir.empty()) {
+    return run_query_mode(args);
+  }
+
+  // Sharded large-scale head-to-head (both engines sharded; query merges).
+  if (!args.parquet_file.empty() && args.shard_docs != 0) {
+    return run_sharded_e2e(args);
+  }
+
+  // E2E real-dataset import mode (parquet source) bypasses the synthetic corpus.
+  if (!args.parquet_file.empty()) {
+    return run_e2e_mode(args);
+  }
 
   std::printf("=== SNII vs CLucene S3-access benchmark ===\n");
   std::printf("corpus: docs=%u vocab=%u zipf=%.2f doclen=%u seed=%llu\n",

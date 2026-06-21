@@ -227,6 +227,7 @@ class DocidCollector : public cl_search::HitCollector {
 
 struct CluceneAdapter::Impl {
   std::string dir_path;
+  bool keep_dir = false;  // when true, leave the segment files on disk
   std::unique_ptr<MeteredDirectory> directory;
   std::unique_ptr<cl_search::IndexSearcher> searcher;
   cl_index::IndexReader* reader = nullptr;
@@ -238,7 +239,7 @@ struct CluceneAdapter::Impl {
       _CLLDELETE(reader);
     }
     directory.reset();
-    if (!dir_path.empty()) {
+    if (!dir_path.empty() && !keep_dir) {
       (void)std::system(("rm -rf '" + dir_path + "'").c_str());
     }
   }
@@ -248,7 +249,34 @@ CluceneAdapter::CluceneAdapter() : impl_(std::make_unique<Impl>()) {}
 CluceneAdapter::~CluceneAdapter() = default;
 
 void CluceneAdapter::build_and_open(const Corpus& c) {
-  impl_->dir_path = make_temp_dir();
+  build_at(make_temp_dir(), c, /*keep_on_disk=*/false);
+}
+
+std::vector<std::string> CluceneAdapter::index_files() const {
+  if (impl_ == nullptr || impl_->dir_path.empty()) return {};
+  std::vector<std::string> files;
+  std::error_code ec;
+  for (const auto& e :
+       std::filesystem::directory_iterator(impl_->dir_path, ec)) {
+    if (e.is_regular_file(ec)) files.push_back(e.path().string());
+  }
+  std::sort(files.begin(), files.end());
+  return files;
+}
+
+void CluceneAdapter::build_at(const std::string& dir, const Corpus& c,
+                              bool keep_on_disk) {
+  build_range(dir, c, 0, c.doc_count, keep_on_disk);
+}
+
+void CluceneAdapter::build_range(const std::string& dir, const Corpus& c,
+                                 uint32_t doc_lo, uint32_t doc_hi,
+                                 bool keep_on_disk) {
+  if (doc_hi > c.doc_count || doc_lo > doc_hi) {
+    fail("build_range bad [lo,hi)");
+  }
+  impl_->dir_path = dir;
+  impl_->keep_dir = keep_on_disk;
   run_shell("mkdir -p '" + impl_->dir_path + "'");
 
   // --- Build phase: write the compound index with a plain FSDirectory. ---
@@ -285,7 +313,12 @@ void CluceneAdapter::build_and_open(const Corpus& c) {
     // (i.e. MORE often than SNII), so the memory comparison is, if anything,
     // generous to CLucene there. flush_doc_count() is retained for the model and a
     // future fork that does not crash.
-    if (ram_buffer_mb_ <= 0.0) {
+    if (no_merge_) {
+      // Keep the stable constructor-default (~16 MiB) periodic flush so each
+      // segment stays small; do NOT set a RAM-buffer (setters destabilise this
+      // fork) and do NOT optimize() later -- this is the only path that survives
+      // corpora exceeding ~2^30 total positions.
+    } else if (ram_buffer_mb_ <= 0.0) {
       writer->setRAMBufferSizeMB(1.0e9f);  // no auto flush (in-RAM build)
     } else {
       (void)flush_doc_count(c);  // computed for the fairness model; see note above
@@ -301,7 +334,10 @@ void CluceneAdapter::build_and_open(const Corpus& c) {
     field->setOmitTermFreqAndPositions(false);  // keep positions for PhraseQuery
     doc->add(*field);
 
-    for (uint32_t d = 0; d < c.doc_count; ++d) {
+    // Docs in [doc_lo, doc_hi) are added in order, so CLucene assigns this
+    // shard LOCAL docids 0..(doc_hi-doc_lo-1); the caller maps back to the global
+    // docid by adding doc_lo.
+    for (uint32_t d = doc_lo; d < doc_hi; ++d) {
       std::string joined;
       const auto& toks = c.docs[d];
       for (uint32_t k = 0; k < toks.size(); ++k) {
@@ -314,7 +350,9 @@ void CluceneAdapter::build_and_open(const Corpus& c) {
       field->setValue(stream);
       writer->addDocument(doc);  // doc/field reused across all documents
     }
-    writer->optimize();  // collapse to a single compound segment
+    if (!no_merge_) {
+      writer->optimize();  // collapse to a single compound segment
+    }
     writer->close();
 
     _CLLDELETE(writer);
@@ -325,6 +363,16 @@ void CluceneAdapter::build_and_open(const Corpus& c) {
   }
 
   // --- Read phase: open through the metered directory. ---
+  open_metered_reader();
+}
+
+void CluceneAdapter::open_existing(const std::string& dir) {
+  impl_->dir_path = dir;
+  impl_->keep_dir = true;  // we did not create it; never delete it
+  open_metered_reader();
+}
+
+void CluceneAdapter::open_metered_reader() {
   impl_->directory = std::make_unique<MeteredDirectory>(impl_->dir_path);
   impl_->reader = cl_index::IndexReader::open(impl_->directory.get());
   if (impl_->reader == nullptr) fail("IndexReader::open returned null");

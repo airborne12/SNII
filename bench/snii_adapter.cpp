@@ -30,10 +30,26 @@ std::string make_temp_path() {
 }  // namespace
 
 SniiAdapter::~SniiAdapter() {
-  if (!path_.empty()) std::remove(path_.c_str());
+  if (!path_.empty() && !keep_path_) std::remove(path_.c_str());
 }
 
 void SniiAdapter::build_and_open(const Corpus& c) {
+  build_at(make_temp_path(), c, /*keep_on_disk=*/false);
+}
+
+std::vector<std::string> SniiAdapter::index_files() const {
+  if (path_.empty()) return {};
+  return {path_};
+}
+
+void SniiAdapter::build_at(const std::string& path, const Corpus& c,
+                           bool keep_on_disk) {
+  build_range(path, c, 0, c.doc_count, keep_on_disk);
+}
+
+void SniiAdapter::build_range(const std::string& path, const Corpus& c,
+                              uint32_t doc_lo, uint32_t doc_hi,
+                              bool keep_on_disk) {
   using namespace snii;
   using snii::format::IndexConfig;
   using snii::writer::SniiCompoundWriter;
@@ -41,17 +57,21 @@ void SniiAdapter::build_and_open(const Corpus& c) {
   using snii::writer::SpimiTermBuffer;
   using snii::writer::TermPostings;
 
-  // 1. Accumulate every (term-id, doc, position) into the SPIMI buffer. The
-  // corpus tokens are ALREADY dense integer ids into c.vocab, so feed the raw id
-  // (buf borrows c.vocab) -- no per-token string hashing/construction. A non-zero
-  // spill threshold bounds input RAM: once the live buffer exceeds it, a sorted
-  // run is spilled to disk and memory cleared; the final build k-way-merges all
-  // runs, materializing one term at a time (peak RSS independent of postings).
+  if (doc_hi > c.doc_count || doc_lo > doc_hi) {
+    throw std::runtime_error("SNII adapter: build_range bad [lo,hi)");
+  }
+  const uint32_t seg_docs = doc_hi - doc_lo;
+
+  // 1. Accumulate every (term-id, LOCAL doc, position) for docs in [doc_lo,doc_hi)
+  // into the SPIMI buffer. Local docids are d - doc_lo so this segment's docid
+  // space is 0..seg_docs-1; the caller maps back to the global docid by adding
+  // doc_lo. The corpus tokens are ALREADY dense ids into c.vocab (shared across
+  // segments, no copy). A non-zero spill threshold bounds input RAM.
   SpimiTermBuffer buf(&c.vocab, /*has_positions=*/true, spill_threshold_bytes_);
-  for (uint32_t d = 0; d < c.doc_count; ++d) {
+  for (uint32_t d = doc_lo; d < doc_hi; ++d) {
     const auto& toks = c.docs[d];
     for (uint32_t pos = 0; pos < toks.size(); ++pos) {
-      buf.add_token(toks[pos], d, pos);
+      buf.add_token(toks[pos], d - doc_lo, pos);
     }
   }
 
@@ -62,7 +82,7 @@ void SniiAdapter::build_and_open(const Corpus& c) {
   in.index_id = 1;
   in.index_suffix = "body";
   in.config = IndexConfig::kDocsPositions;
-  in.doc_count = c.doc_count;
+  in.doc_count = seg_docs;
   in.term_source = &buf;
   // A larger DICT block target (64 KiB) yields far fewer blocks: it shrinks the
   // dict_block_directory (one BlockRef/block) and the sampled_term_index (one
@@ -72,8 +92,16 @@ void SniiAdapter::build_and_open(const Corpus& c) {
   // reads a larger dict block per term, but the I/O-metric thesis is unaffected.
   in.target_dict_block_bytes = 64 * 1024;
 
-  // 3. Write the compound container to a temp file.
-  path_ = make_temp_path();
+  // 3. Write the compound container to `path` (creating parent dirs first).
+  path_ = path;
+  keep_path_ = keep_on_disk;
+  if (const auto parent = std::filesystem::path(path_).parent_path();
+      !parent.empty()) {
+    std::error_code ec;
+    std::filesystem::create_directories(parent, ec);
+    if (ec) throw std::runtime_error("SNII adapter: mkdir " + parent.string() +
+                                     ": " + ec.message());
+  }
   io::LocalFileWriter writer;
   if (Status s = writer.open(path_); !s.ok()) fail("open writer", s);
   SniiCompoundWriter compound(&writer);
@@ -81,6 +109,17 @@ void SniiAdapter::build_and_open(const Corpus& c) {
   if (Status s = compound.finish(); !s.ok()) fail("finish writer", s);
 
   // 4. Open it through a metered local reader.
+  open_reader();
+}
+
+void SniiAdapter::open_existing(const std::string& path) {
+  path_ = path;
+  keep_path_ = true;  // we did not create it; never delete it on destruction
+  open_reader();
+}
+
+void SniiAdapter::open_reader() {
+  using namespace snii;
   local_ = std::make_unique<io::LocalFileReader>();
   if (Status s = local_->open(path_); !s.ok()) fail("open reader", s);
   metered_ = std::make_unique<io::MeteredFileReader>(local_.get());

@@ -33,9 +33,42 @@ class CluceneAdapter {
   // matching SNII's spill-at-`mb` behavior.
   void set_ram_buffer_mb(double mb) { ram_buffer_mb_ = mb; }
 
+  // When true, the writer keeps periodic segment flushes but SKIPS optimize()
+  // (no segment merge). This both (a) bounds each in-RAM segment so its posting
+  // pool never overflows the 32-bit position offset, and (b) avoids the merge
+  // path entirely -- the two ways a single huge segment crashes this CLucene
+  // fork past ~2^30 positions. The resulting multi-segment index is read
+  // natively by IndexReader (a multi-segment reader); docids stay in corpus
+  // insertion order across segments. Required to index corpora whose total
+  // positions exceed ~2^30.
+  void set_no_merge(bool v) { no_merge_ = v; }
+
   // Builds the compound index in a temp directory and opens a searcher over a
   // metered directory. Throws std::runtime_error on failure.
   void build_and_open(const Corpus& c);
+
+  // Builds the index into the EXACT directory `dir` (created if absent) and opens
+  // a searcher over it. When `keep_on_disk` is true the directory is NOT removed
+  // on destruction, so the E2E harness can leave the real segment files behind.
+  // Throws std::runtime_error on failure.
+  void build_at(const std::string& dir, const Corpus& c, bool keep_on_disk);
+
+  // Builds a CLucene index for the corpus doc range [doc_lo, doc_hi) into `dir`,
+  // with LOCAL docids 0..(doc_hi-doc_lo-1) (CLucene assigns them in add order).
+  // Used to build a multi-shard CLucene index (one dir per shard) so each shard's
+  // total positions stay under this fork's ~2^30 limit; queries open every shard
+  // and merge with a base-docid offset. Throws std::runtime_error on failure.
+  void build_range(const std::string& dir, const Corpus& c, uint32_t doc_lo,
+                   uint32_t doc_hi, bool keep_on_disk);
+
+  // The on-disk segment files backing this index, for `ls`-style reporting.
+  // Empty if not built.
+  std::vector<std::string> index_files() const;
+
+  // Opens an ALREADY-built index directory `dir` for reading only (no build),
+  // through the same metered directory used after a build. The directory is left
+  // on disk on destruction. Throws std::runtime_error on failure.
+  void open_existing(const std::string& dir);
 
   // Runs a TermQuery on field "body" and returns ascending docids plus the
   // aggregated I/O metrics for this query alone (the metered directory is reset
@@ -57,8 +90,14 @@ class CluceneAdapter {
   // from the corpus's average doc length and the same per-doc byte model SNII uses.
   int32_t flush_doc_count(const Corpus& c) const;
 
+  // Opens impl_->directory + IndexReader + searcher over impl_->dir_path (shared
+  // by build_at's read phase and open_existing).
+  void open_metered_reader();
+
   // RAM-buffer flush threshold (MiB); <=0 = no auto flush (build fully in RAM).
   double ram_buffer_mb_ = 0.0;
+  // When true: periodic flush + skip optimize() (multi-segment, no merge).
+  bool no_merge_ = false;
   // Opaque handles; concrete CLucene types live in the .cpp to keep this header
   // free of CLucene includes.
   struct Impl;
