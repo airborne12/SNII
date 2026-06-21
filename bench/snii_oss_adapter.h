@@ -35,6 +35,9 @@ class SniiOssAdapter {
   SniiOssAdapter(const SniiOssAdapter&) = delete;
   SniiOssAdapter& operator=(const SniiOssAdapter&) = delete;
 
+  // Keyword (non-tokenized, docs-only) build: set before build_upload_and_open.
+  void set_docs_only(bool v) { docs_only_ = v; }
+
   // Builds the .idx locally, uploads it to OSS under cfg.prefix, and opens it
   // over an S3FileReader. Throws std::runtime_error on failure.
   void build_upload_and_open(const Corpus& c, const snii::io::S3Config& cfg);
@@ -58,7 +61,22 @@ class SniiOssAdapter {
   void phrase_query(const std::vector<std::string>& words,
                     std::vector<uint32_t>* docids, snii::io::IoMetrics* metrics);
 
+  // Boolean / match-all / prefix / match_phrase_prefix -- same surface as the local
+  // SniiAdapter, over the OSS reader. Each fills docids + per-query I/O metrics.
+  void boolean_and(const std::vector<std::string>& terms,
+                   std::vector<uint32_t>* docids, snii::io::IoMetrics* metrics);
+  void boolean_or(const std::vector<std::string>& terms,
+                  std::vector<uint32_t>* docids, snii::io::IoMetrics* metrics);
+  void match_all(std::vector<uint32_t>* docids, snii::io::IoMetrics* metrics);
+  void prefix_query(const std::string& prefix, std::vector<uint32_t>* docids,
+                    snii::io::IoMetrics* metrics);
+  std::vector<std::string> enumerate_prefix(const std::string& prefix);
+  void phrase_prefix_query(const std::vector<std::string>& fixed,
+                           const std::vector<std::string>& expansions,
+                           std::vector<uint32_t>* docids, snii::io::IoMetrics* metrics);
+
  private:
+  bool docs_only_ = false;
   std::string local_path_;   // temp local .idx (removed in dtor)
   std::string uploaded_key_;  // full OSS key (prefix + "/" + key)
   std::string object_key_;    // raw key for S3FileReader::open / open_uploaded

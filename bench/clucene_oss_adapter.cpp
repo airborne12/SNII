@@ -15,6 +15,8 @@
 #include <vector>
 
 #include "CLucene.h"
+#include "CLucene/search/BooleanQuery.h"
+#include "CLucene/search/PrefixQuery.h"
 #include "CLucene/store/Directory.h"
 #include "CLucene/store/FSDirectory.h"
 #include "CLucene/util/CLStreams.h"
@@ -131,7 +133,7 @@ void CluceneOssAdapter::build_upload_and_open(const Corpus& c,
         cl_doc::Field::STORE_NO | cl_doc::Field::INDEX_TOKENIZED;
     auto* doc = _CLNEW cl_doc::Document();
     auto* field = _CLNEW cl_doc::Field(field_name.c_str(), field_config);
-    field->setOmitTermFreqAndPositions(false);  // keep positions for PhraseQuery
+    field->setOmitTermFreqAndPositions(docs_only_);  // keyword -> docs-only
     doc->add(*field);
 
     for (uint32_t d = 0; d < c.doc_count; ++d) {
@@ -218,6 +220,105 @@ void CluceneOssAdapter::term_query(const std::string& term,
 
   std::sort(collector.docids.begin(), collector.docids.end());
   *docids = std::move(collector.docids);
+  *metrics = impl_->directory->aggregate_metrics();
+}
+
+void CluceneOssAdapter::boolean_and(const std::vector<std::string>& terms,
+                                    std::vector<uint32_t>* docids,
+                                    snii::io::IoMetrics* metrics) {
+  boolean_query(terms, /*conjunction=*/true, docids, metrics);
+}
+
+void CluceneOssAdapter::boolean_or(const std::vector<std::string>& terms,
+                                   std::vector<uint32_t>* docids,
+                                   snii::io::IoMetrics* metrics) {
+  boolean_query(terms, /*conjunction=*/false, docids, metrics);
+}
+
+void CluceneOssAdapter::boolean_query(const std::vector<std::string>& terms,
+                                      bool conjunction, std::vector<uint32_t>* docids,
+                                      snii::io::IoMetrics* metrics) {
+  impl_->directory->reset_metrics();
+  const std::wstring field = widen("body");
+  auto* bq = _CLNEW cl_search::BooleanQuery();
+  const cl_search::BooleanClause::Occur occur =
+      conjunction ? cl_search::BooleanClause::MUST : cl_search::BooleanClause::SHOULD;
+  std::vector<std::wstring> texts;
+  texts.reserve(terms.size());
+  for (const std::string& w : terms) {
+    texts.push_back(widen(w));
+    auto* t = _CLNEW cl_index::Term(field.c_str(), texts.back().c_str());
+    auto* tq = _CLNEW cl_search::TermQuery(t);
+    _CLDECDELETE(t);
+    bq->add(tq, /*deleteQuery=*/true, occur);
+  }
+  DocidCollector collector;
+  impl_->searcher->_search(bq, /*filter=*/nullptr, &collector);
+  _CLDELETE(bq);
+  std::sort(collector.docids.begin(), collector.docids.end());
+  *docids = std::move(collector.docids);
+  *metrics = impl_->directory->aggregate_metrics();
+}
+
+void CluceneOssAdapter::match_all(std::vector<uint32_t>* docids,
+                                  snii::io::IoMetrics* metrics) {
+  impl_->directory->reset_metrics();
+  const int32_t n = impl_->reader->numDocs();
+  docids->resize(n);
+  for (int32_t i = 0; i < n; ++i) (*docids)[i] = static_cast<uint32_t>(i);
+  *metrics = impl_->directory->aggregate_metrics();
+}
+
+void CluceneOssAdapter::prefix_query(const std::string& prefix,
+                                     std::vector<uint32_t>* docids,
+                                     snii::io::IoMetrics* metrics) {
+  impl_->directory->reset_metrics();
+  cl_search::BooleanQuery::setMaxClauseCount(1u << 24);
+  const std::wstring field = widen("body");
+  const std::wstring text = widen(prefix);
+  auto* t = _CLNEW cl_index::Term(field.c_str(), text.c_str());
+  auto* q = _CLNEW cl_search::PrefixQuery(t);
+  _CLDECDELETE(t);
+  DocidCollector collector;
+  impl_->searcher->_search(q, /*filter=*/nullptr, &collector);
+  _CLDELETE(q);
+  std::sort(collector.docids.begin(), collector.docids.end());
+  *docids = std::move(collector.docids);
+  *metrics = impl_->directory->aggregate_metrics();
+}
+
+void CluceneOssAdapter::phrase_prefix_query(const std::vector<std::string>& fixed,
+                                            const std::vector<std::string>& expansions,
+                                            std::vector<uint32_t>* docids,
+                                            snii::io::IoMetrics* metrics) {
+  impl_->directory->reset_metrics();
+  const std::wstring field = widen("body");
+  std::vector<uint32_t> acc;
+  for (const std::string& exp : expansions) {
+    auto* q = _CLNEW cl_search::PhraseQuery();
+    std::vector<std::wstring> texts;
+    texts.reserve(fixed.size() + 1);
+    for (const std::string& w : fixed) {
+      texts.push_back(widen(w));
+      auto* t = _CLNEW cl_index::Term(field.c_str(), texts.back().c_str());
+      q->add(t);
+      _CLDECDELETE(t);
+    }
+    texts.push_back(widen(exp));
+    auto* te = _CLNEW cl_index::Term(field.c_str(), texts.back().c_str());
+    q->add(te);
+    _CLDECDELETE(te);
+    DocidCollector collector;
+    impl_->searcher->_search(q, /*filter=*/nullptr, &collector);
+    _CLDELETE(q);
+    std::sort(collector.docids.begin(), collector.docids.end());
+    std::vector<uint32_t> merged;
+    merged.reserve(acc.size() + collector.docids.size());
+    std::set_union(acc.begin(), acc.end(), collector.docids.begin(),
+                   collector.docids.end(), std::back_inserter(merged));
+    acc = std::move(merged);
+  }
+  *docids = std::move(acc);
   *metrics = impl_->directory->aggregate_metrics();
 }
 

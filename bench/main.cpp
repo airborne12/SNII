@@ -451,6 +451,126 @@ int run_oss_mode(const Args& args, const bench::Corpus& corpus,
     std::fprintf(stderr, "WARNING: no 5-token phrase found in corpus\n");
   }
 
+  // --- Boolean / match-all / prefix / match_phrase_prefix on the tokenized index. ---
+  auto run_op2 = [&](const std::string& label, auto snii_fn, auto clu_fn) {
+    OssQueryResult r;
+    r.label = label;
+    std::vector<uint32_t> sdoc, cdoc;
+    try {
+      auto t0 = std::chrono::steady_clock::now();
+      snii_fn(&sdoc, &r.snii);
+      r.snii_wall_ms = ms_since(t0);
+      t0 = std::chrono::steady_clock::now();
+      clu_fn(&cdoc, &r.clucene);
+      r.clucene_wall_ms = ms_since(t0);
+    } catch (const std::exception& e) {
+      std::fprintf(stderr, "WARNING: OSS op '%s' failed: %s\n", label.c_str(),
+                   e.what());
+      return;
+    }
+    r.hits = sdoc.size();
+    r.docids_match = (sdoc == cdoc);
+    if (!r.docids_match) {
+      all_match = false;
+      std::fprintf(stderr, "MISMATCH on %s: snii=%zu clucene=%zu\n", label.c_str(),
+                   sdoc.size(), cdoc.size());
+    }
+    results.push_back(r);
+  };
+
+  const std::vector<std::string> and_terms = {high_term, low_term};
+  run_op2("AND high+low",
+          [&](std::vector<uint32_t>* d, snii::io::IoMetrics* m) {
+            snii_idx.boolean_and(and_terms, d, m);
+          },
+          [&](std::vector<uint32_t>* d, snii::io::IoMetrics* m) {
+            cl_idx.boolean_and(and_terms, d, m);
+          });
+  const std::vector<std::string> or_terms = {high_term, mid_term, low_term};
+  run_op2("OR high+mid+low",
+          [&](std::vector<uint32_t>* d, snii::io::IoMetrics* m) {
+            snii_idx.boolean_or(or_terms, d, m);
+          },
+          [&](std::vector<uint32_t>* d, snii::io::IoMetrics* m) {
+            cl_idx.boolean_or(or_terms, d, m);
+          });
+  run_op2("MATCH-ALL",
+          [&](std::vector<uint32_t>* d, snii::io::IoMetrics* m) {
+            snii_idx.match_all(d, m);
+          },
+          [&](std::vector<uint32_t>* d, snii::io::IoMetrics* m) {
+            cl_idx.match_all(d, m);
+          });
+
+  // Bounded prefix (<=200 expansions) from a real word, via SNII's enumeration.
+  auto bounded_prefix = [&](const std::string& w) -> std::string {
+    for (size_t L = 1; L <= w.size(); ++L) {
+      std::string p = w.substr(0, L);
+      if (snii_idx.enumerate_prefix(p).size() <= 200) return p;
+    }
+    return w;
+  };
+  const std::string pfx = bounded_prefix(high_term);
+  if (!pfx.empty()) {
+    run_op2("PREFIX '" + pfx + "*'",
+            [&](std::vector<uint32_t>* d, snii::io::IoMetrics* m) {
+              snii_idx.prefix_query(pfx, d, m);
+            },
+            [&](std::vector<uint32_t>* d, snii::io::IoMetrics* m) {
+              cl_idx.prefix_query(pfx, d, m);
+            });
+  }
+  if (phrase.size() >= 2) {
+    const std::vector<std::string> fixed(phrase.begin(), phrase.end() - 1);
+    const std::string pfx2 = bounded_prefix(phrase.back());
+    const std::vector<std::string> exp = snii_idx.enumerate_prefix(pfx2);
+    run_op2("MATCH_PHRASE_PREFIX (" + std::to_string(exp.size()) + " exp)",
+            [&](std::vector<uint32_t>* d, snii::io::IoMetrics* m) {
+              snii_idx.phrase_prefix_query(fixed, exp, d, m);
+            },
+            [&](std::vector<uint32_t>* d, snii::io::IoMetrics* m) {
+              cl_idx.phrase_prefix_query(fixed, exp, d, m);
+            });
+  }
+
+  // --- Keyword (non-tokenized, docs-only): a SECOND OSS index pair. ---
+  bench::SniiOssAdapter snii_kw;
+  bench::CluceneOssAdapter cl_kw;
+  snii_kw.set_docs_only(true);
+  cl_kw.set_docs_only(true);
+  {
+    static const char* kSvc[] = {"frontend",     "cartservice", "checkoutservice",
+                                 "paymentservice", "shippingservice",
+                                 "emailservice", "currencyservice"};
+    std::vector<std::string> values(corpus.doc_count);
+    for (uint32_t i = 0; i < corpus.doc_count; ++i) values[i] = kSvc[i % 7];
+    for (uint32_t i = 0; i < corpus.doc_count / 1000; ++i)
+      values[i] = "trace" + std::to_string(i);
+    bench::Corpus kw = bench::keyword_corpus(values);
+    try {
+      snii_kw.build_upload_and_open(kw, cfg);
+      all_keys.push_back(snii_kw.uploaded_key());
+      cl_kw.build_upload_and_open(kw, cfg);
+      for (const std::string& k : cl_kw.uploaded_keys()) all_keys.push_back(k);
+      const std::string kv = kw.vocab[bench::term_in_df_bucket(kw, 0.1, 1.0)];
+      OssQueryResult r;
+      r.label = "KEYWORD exact '" + kv + "'";
+      std::vector<uint32_t> sdoc, cdoc;
+      auto t0 = std::chrono::steady_clock::now();
+      snii_kw.term_query(kv, &sdoc, &r.snii);
+      r.snii_wall_ms = ms_since(t0);
+      t0 = std::chrono::steady_clock::now();
+      cl_kw.term_query(kv, &cdoc, &r.clucene);
+      r.clucene_wall_ms = ms_since(t0);
+      r.hits = sdoc.size();
+      r.docids_match = (sdoc == cdoc);
+      if (!r.docids_match) all_match = false;
+      results.push_back(r);
+    } catch (const std::exception& e) {
+      std::fprintf(stderr, "WARNING: OSS keyword build failed: %s\n", e.what());
+    }
+  }
+
   std::printf("\n=== REAL-OSS wall-clock comparison (CLucene vs SNII, "
               "same cost model, real OSS GETs) ===\n");
   for (const OssQueryResult& r : results) {
@@ -1739,10 +1859,14 @@ int run_prefix_mode(const Args& args) {
     if (!id) all_identical = false;
     std::printf("\n[%s] SNII=%zu CLucene=%zu %s\n", label, a.size(), b.size(),
                 id ? "IDENTICAL" : "MISMATCH");
-    std::printf("  gold CL/SNII: serial_rounds=%.2f range_gets=%.2f bytes=%.2f\n",
-                ratio(mc.serial_rounds, ms.serial_rounds),
-                ratio(mc.range_gets, ms.range_gets),
-                ratio(mc.total_request_bytes, ms.total_request_bytes));
+    std::printf("  CLucene gold: serial_rounds=%llu range_gets=%llu bytes=%llu\n",
+                static_cast<unsigned long long>(mc.serial_rounds),
+                static_cast<unsigned long long>(mc.range_gets),
+                static_cast<unsigned long long>(mc.total_request_bytes));
+    std::printf("  SNII    gold: serial_rounds=%llu range_gets=%llu bytes=%llu\n",
+                static_cast<unsigned long long>(ms.serial_rounds),
+                static_cast<unsigned long long>(ms.range_gets),
+                static_cast<unsigned long long>(ms.total_request_bytes));
   };
 
   if (!prefix.empty()) {
@@ -2059,18 +2183,18 @@ int run_scenario_mode(const Args& args) {
                     snii::io::IoMetrics* m) { run_one(a, s, d, m); };
     const double secs = args.concurrency_seconds;
     const uint32_t W = args.concurrency;
-    std::printf("\n=== concurrent throughput (local, %.0fs/pass, warmup=%u/thread) ===\n",
-                secs, args.concurrency_warmup);
-    std::vector<uint32_t> levels = {1u};
-    if (W != 1) levels.push_back(W);
-    for (uint32_t N : levels) {
-      print_conc_row("CLucene", run_concurrent(make_clu, run_q, scenarios, N, secs,
-                                               args.concurrency_warmup));
-      print_conc_row("SNII", run_concurrent(make_snii, run_q, scenarios, N, secs,
-                                            args.concurrency_warmup));
+    std::printf("\n=== per-scenario concurrent QPS (local, N=%u threads, %.0fs each) ===\n",
+                W, secs);
+    for (const Scenario& s : scenarios) {
+      const std::vector<Scenario> one = {s};
+      const ConcResult c =
+          run_concurrent(make_clu, run_q, one, W, secs, args.concurrency_warmup);
+      const ConcResult x =
+          run_concurrent(make_snii, run_q, one, W, secs, args.concurrency_warmup);
+      std::printf("[%s] CLucene QPS=%.0f p50=%.3f p99=%.3f ms | SNII QPS=%.0f "
+                  "p50=%.3f p99=%.3f ms\n",
+                  s.id.c_str(), c.qps, c.p50, c.p99, x.qps, x.p50, x.p99);
     }
-    std::printf("  peak_rss=%.1f MiB (process high-water across all passes)\n",
-                peak_rss_mib());
   }
 
   std::printf("\nresult: %s (%zu scenarios)\n",

@@ -35,6 +35,10 @@ class CluceneOssAdapter {
   CluceneOssAdapter(const CluceneOssAdapter&) = delete;
   CluceneOssAdapter& operator=(const CluceneOssAdapter&) = delete;
 
+  // Keyword (non-tokenized, docs-only via omitTermFreqAndPositions) build: set
+  // before build_upload_and_open.
+  void set_docs_only(bool v) { docs_only_ = v; }
+
   // Builds the index locally, uploads it to OSS under cfg.prefix, and opens a
   // searcher over the OSS directory. Throws std::runtime_error on failure.
   void build_upload_and_open(const Corpus& c, const snii::io::S3Config& cfg);
@@ -62,7 +66,23 @@ class CluceneOssAdapter {
   void phrase_query(const std::vector<std::string>& words,
                     std::vector<uint32_t>* docids, snii::io::IoMetrics* metrics);
 
+  // Boolean / match-all / prefix / match_phrase_prefix -- same surface as the local
+  // CluceneAdapter, over the OSS directory. Each fills docids + per-query metrics.
+  void boolean_and(const std::vector<std::string>& terms,
+                   std::vector<uint32_t>* docids, snii::io::IoMetrics* metrics);
+  void boolean_or(const std::vector<std::string>& terms,
+                  std::vector<uint32_t>* docids, snii::io::IoMetrics* metrics);
+  void match_all(std::vector<uint32_t>* docids, snii::io::IoMetrics* metrics);
+  void prefix_query(const std::string& prefix, std::vector<uint32_t>* docids,
+                    snii::io::IoMetrics* metrics);
+  void phrase_prefix_query(const std::vector<std::string>& fixed,
+                           const std::vector<std::string>& expansions,
+                           std::vector<uint32_t>* docids, snii::io::IoMetrics* metrics);
+
  private:
+  void boolean_query(const std::vector<std::string>& terms, bool conjunction,
+                     std::vector<uint32_t>* docids, snii::io::IoMetrics* metrics);
+  bool docs_only_ = false;
   struct Impl;
   std::unique_ptr<Impl> impl_;
 };

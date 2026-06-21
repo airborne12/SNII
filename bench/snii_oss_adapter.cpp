@@ -4,6 +4,7 @@
 
 #include <unistd.h>
 
+#include <algorithm>
 #include <cstdio>
 #include <stdexcept>
 #include <utility>
@@ -59,7 +60,7 @@ void SniiOssAdapter::build_upload_and_open(const Corpus& c,
   // 1. Accumulate every (term-id, doc, position) into the SPIMI buffer. Corpus
   // tokens are dense ids into c.vocab; feed the raw id (buf borrows c.vocab) so
   // there is no per-token string work.
-  SpimiTermBuffer buf(&c.vocab, /*has_positions=*/true);
+  SpimiTermBuffer buf(&c.vocab, /*has_positions=*/!docs_only_);
   for (uint32_t d = 0; d < c.doc_count; ++d) {
     const auto& toks = c.docs[d];
     for (uint32_t pos = 0; pos < toks.size(); ++pos) {
@@ -68,11 +69,11 @@ void SniiOssAdapter::build_upload_and_open(const Corpus& c,
   }
   std::vector<TermPostings> terms = buf.finalize_sorted();
 
-  // 2. Describe the single logical index (docid + freq + positions).
+  // 2. Describe the single logical index (keyword: docs-only; else docs+positions).
   SniiIndexInput in;
   in.index_id = 1;
   in.index_suffix = "body";
-  in.config = IndexConfig::kDocsPositions;
+  in.config = docs_only_ ? IndexConfig::kDocsOnly : IndexConfig::kDocsPositions;
   in.doc_count = c.doc_count;
   in.terms = std::move(terms);
   in.target_dict_block_bytes = 512;
@@ -145,6 +146,108 @@ void SniiOssAdapter::phrase_query(const std::vector<std::string>& words,
       !s.ok()) {
     fail("phrase_query", s);
   }
+  *metrics = metered_->metrics();
+}
+
+void SniiOssAdapter::boolean_and(const std::vector<std::string>& terms,
+                                 std::vector<uint32_t>* docids,
+                                 snii::io::IoMetrics* metrics) {
+  metered_->reset_metrics();
+  docids->clear();
+  if (snii::Status s = snii::query::boolean_and(*index_, terms, docids); !s.ok()) {
+    fail("boolean_and", s);
+  }
+  *metrics = metered_->metrics();
+}
+
+void SniiOssAdapter::boolean_or(const std::vector<std::string>& terms,
+                                std::vector<uint32_t>* docids,
+                                snii::io::IoMetrics* metrics) {
+  metered_->reset_metrics();
+  docids->clear();
+  std::vector<uint32_t> acc;
+  for (const std::string& t : terms) {
+    std::vector<uint32_t> d;
+    if (snii::Status s = snii::query::term_query(*index_, t, &d); !s.ok()) {
+      fail("boolean_or(" + t + ")", s);
+    }
+    std::vector<uint32_t> merged;
+    merged.reserve(acc.size() + d.size());
+    std::set_union(acc.begin(), acc.end(), d.begin(), d.end(),
+                   std::back_inserter(merged));
+    acc = std::move(merged);
+  }
+  *docids = std::move(acc);
+  *metrics = metered_->metrics();
+}
+
+void SniiOssAdapter::match_all(std::vector<uint32_t>* docids,
+                               snii::io::IoMetrics* metrics) {
+  metered_->reset_metrics();
+  const uint32_t n = index_->stats().doc_count;
+  docids->resize(n);
+  for (uint32_t i = 0; i < n; ++i) (*docids)[i] = i;
+  *metrics = metered_->metrics();
+}
+
+void SniiOssAdapter::prefix_query(const std::string& prefix,
+                                  std::vector<uint32_t>* docids,
+                                  snii::io::IoMetrics* metrics) {
+  metered_->reset_metrics();
+  docids->clear();
+  std::vector<snii::reader::LogicalIndexReader::PrefixHit> hits;
+  if (snii::Status s = index_->prefix_terms(prefix, &hits); !s.ok()) {
+    fail("prefix_terms", s);
+  }
+  std::vector<uint32_t> acc;
+  for (const auto& h : hits) {
+    std::vector<uint32_t> d;
+    if (snii::Status s = snii::query::term_query(*index_, h.term, &d); !s.ok()) {
+      fail("prefix term_query(" + h.term + ")", s);
+    }
+    std::vector<uint32_t> merged;
+    merged.reserve(acc.size() + d.size());
+    std::set_union(acc.begin(), acc.end(), d.begin(), d.end(),
+                   std::back_inserter(merged));
+    acc = std::move(merged);
+  }
+  *docids = std::move(acc);
+  *metrics = metered_->metrics();
+}
+
+std::vector<std::string> SniiOssAdapter::enumerate_prefix(const std::string& prefix) {
+  std::vector<snii::reader::LogicalIndexReader::PrefixHit> hits;
+  if (snii::Status s = index_->prefix_terms(prefix, &hits); !s.ok()) {
+    fail("prefix_terms", s);
+  }
+  std::vector<std::string> out;
+  out.reserve(hits.size());
+  for (auto& h : hits) out.push_back(std::move(h.term));
+  return out;
+}
+
+void SniiOssAdapter::phrase_prefix_query(const std::vector<std::string>& fixed,
+                                         const std::vector<std::string>& expansions,
+                                         std::vector<uint32_t>* docids,
+                                         snii::io::IoMetrics* metrics) {
+  metered_->reset_metrics();
+  docids->clear();
+  std::vector<uint32_t> acc;
+  std::vector<std::string> phrase = fixed;
+  phrase.push_back(std::string());
+  for (const std::string& exp : expansions) {
+    phrase.back() = exp;
+    std::vector<uint32_t> d;
+    if (snii::Status s = snii::query::phrase_query(*index_, phrase, &d); !s.ok()) {
+      fail("phrase_prefix phrase_query", s);
+    }
+    std::vector<uint32_t> merged;
+    merged.reserve(acc.size() + d.size());
+    std::set_union(acc.begin(), acc.end(), d.begin(), d.end(),
+                   std::back_inserter(merged));
+    acc = std::move(merged);
+  }
+  *docids = std::move(acc);
   *metrics = metered_->metrics();
 }
 
