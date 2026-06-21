@@ -574,6 +574,24 @@ SNII prelude:
 - slim && encoded_bytes <= inline_threshold：inline，posting 全部写入 DictEntry。
 - df < 512 && encoded_bytes > inline_threshold：pod_ref slim，posting 写入外部 `.frq/.prx` range，由 DictEntry 记录 offset / length。
 inline 用于减少低频 term 的额外 payload 读取；windowed 用于让中高 df term 在命中后可以先读 prelude，再生成 `.frq/.prx `的批量 range 读取计划。
+## 短语查询执行（计划取窗 + 游标流式求值）
+`MATCH_PHRASE` 是读路径上最重的查询：需要多 term 的 docid 合取 + 位置相邻性判断。若按执行期 cursor 逐段推进（CLucene 式），既会随 postings/positions 推进触发串行 seek，又会为大量最终不命中的 doc 解码位置。SNII 将其拆为「计划阶段批量取窗（docid 先行）」与「求值阶段游标流式单遍」两步，使三个金指标同时受控，位置解码与内存只花在最终幸存候选上。计划阶段决定 S3 读取形态（不可变的 S3-native 原则），求值阶段是取回内存后的纯列式流。
+
+### 计划阶段：docid 先行的批量取窗
+- 按 df 升序，最小 df 的 term 作 **driver**。driver 通过其 prelude 窗口目录取**全部窗口的 dd 子段**（连续 dd-block，一次并发 range），仅解 docid（整段跳过 freq-block）。
+- 其余 term 用 prelude 暴露的窗口 docid 范围，只选**覆盖当前候选集**的窗口（covering windows），把这些窗口的 dd 与 `.prx` 子段**同批一次取回**（dd 供本阶段求交、`.prx` 留给求值阶段），docid-only 解码后与候选求交收窄。
+- 关键：每个 term 命中窗口的 dd 与 `.prx` 字节在此阶段**一次性批量并发取回内存**，位置**不在此解码**。串行 I/O 轮次 ≈ 计划轮数（每 term 一批），与 df / 命中量无关——这正是相对 CLucene 执行期逐段 seek（轮次随 iterator 推进增长）的核心优势。
+
+### 求值阶段：游标流式单遍
+- 每 term 一个 **PostingCursor**，在已取回的内存窗口（按 docid 升序的 chunk 列表）上**单调前进**；docid 在计划阶段已解出并复用，dd 区每窗只解一次。
+- **单遍**遍历升序候选：各游标 `seek` 到候选（窗口级前移 + 窗口内局部下标前移，**无逐候选 docid 二分**）；按短语位置取各 term 该候选的位置——当前窗口的 `.prx` **懒解一次**进扁平列（`pos_flat` + per-doc offset 的 CSR 布局，PFOR 顺序解码，**无逐 doc 堆分配**），按局部下标 O(1) 取得 position span；相邻性 `term[0]@p / term[t]@p+t` 逐 start 校验、**词级短路**。
+- 位置只为**最终幸存候选所在的窗口**解码；每个 term 只缓存**当前窗口**的位置列，不物化全候选位置。候选升序 ⇒ 命中 docid 天然有序输出。
+
+### 与三金指标的对应
+- **串行 I/O 轮次**：计划阶段批量并发取窗 → 轮次少且与命中量无关。
+- **Range GET / 读取字节**：docid-only 求交跳过 freq-block；位置只解幸存覆盖窗 → range 数与字节随查询选择性收缩。
+- **求值 CPU**：纯内存列式流（每窗 dd / 位置各解一次），无逐候选二分、无全候选位置物化；CPU 受位置 PFOR 顺序解码下限约束。slim/inline 形态的 term 视为单 chunk，走同一游标路径。
+
 ## footer元信息
 ### 设计原则
 Doris BE 可能同时打开大量 segment。SNII 的 tail meta region 必须保持紧凑，只保存查询规划所需的元数据。
