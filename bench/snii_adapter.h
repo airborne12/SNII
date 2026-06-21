@@ -65,6 +65,15 @@ class SniiAdapter {
   void phrase_query(const std::vector<std::string>& words,
                     std::vector<uint32_t>* docids, snii::io::IoMetrics* metrics);
 
+  // Boolean AND (docs containing every term; docid-only conjunction, no positions),
+  // boolean OR (union), and match-all (every docid; no postings I/O). Each fills
+  // ascending docids + the I/O metrics for that query alone. Throw on error.
+  void boolean_and(const std::vector<std::string>& terms,
+                   std::vector<uint32_t>* docids, snii::io::IoMetrics* metrics);
+  void boolean_or(const std::vector<std::string>& terms,
+                  std::vector<uint32_t>* docids, snii::io::IoMetrics* metrics);
+  void match_all(std::vector<uint32_t>* docids, snii::io::IoMetrics* metrics);
+
   // On-disk byte size of the built .idx container (0 if not built).
   uint64_t index_bytes() const;
 

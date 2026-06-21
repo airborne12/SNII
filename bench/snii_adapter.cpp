@@ -2,6 +2,7 @@
 
 #include <unistd.h>
 
+#include <algorithm>
 #include <cstdio>
 #include <filesystem>
 #include <stdexcept>
@@ -155,6 +156,50 @@ void SniiAdapter::phrase_query(const std::vector<std::string>& words,
       !s.ok()) {
     fail("phrase_query", s);
   }
+  *metrics = metered_->metrics();
+}
+
+void SniiAdapter::boolean_and(const std::vector<std::string>& terms,
+                              std::vector<uint32_t>* docids,
+                              snii::io::IoMetrics* metrics) {
+  metered_->reset_metrics();
+  docids->clear();
+  if (snii::Status s = snii::query::boolean_and(*index_, terms, docids); !s.ok()) {
+    fail("boolean_and", s);
+  }
+  *metrics = metered_->metrics();
+}
+
+void SniiAdapter::boolean_or(const std::vector<std::string>& terms,
+                             std::vector<uint32_t>* docids,
+                             snii::io::IoMetrics* metrics) {
+  // One cold measurement covering the whole disjunction: read each term's posting
+  // (no reset between terms) and union the docid sets.
+  metered_->reset_metrics();
+  docids->clear();
+  std::vector<uint32_t> acc;
+  for (const std::string& t : terms) {
+    std::vector<uint32_t> d;
+    if (snii::Status s = snii::query::term_query(*index_, t, &d); !s.ok()) {
+      fail("boolean_or(" + t + ")", s);
+    }
+    std::vector<uint32_t> merged;
+    merged.reserve(acc.size() + d.size());
+    std::set_union(acc.begin(), acc.end(), d.begin(), d.end(),
+                   std::back_inserter(merged));
+    acc = std::move(merged);
+  }
+  *docids = std::move(acc);
+  *metrics = metered_->metrics();
+}
+
+void SniiAdapter::match_all(std::vector<uint32_t>* docids,
+                            snii::io::IoMetrics* metrics) {
+  // Every docid from the resident doc count -- no posting I/O.
+  metered_->reset_metrics();
+  const uint32_t n = index_->stats().doc_count;
+  docids->resize(n);
+  for (uint32_t i = 0; i < n; ++i) (*docids)[i] = i;
   *metrics = metered_->metrics();
 }
 

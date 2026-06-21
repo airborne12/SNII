@@ -16,6 +16,7 @@
 #include "snii/io/local_file.h"
 #include "snii/io/metered_file_reader.h"
 #include "snii/query/phrase_query.h"
+#include "snii/query/term_query.h"
 #include "snii/reader/logical_index_reader.h"
 #include "snii/reader/snii_segment_reader.h"
 #include "snii/reader/windowed_posting.h"
@@ -258,6 +259,57 @@ void HighDfStats(const LogicalIndexReader& idx, const std::string& term,
 }
 
 }  // namespace
+
+// boolean_and (MATCH all-terms) must equal the intersection of the per-term docid
+// sets (term_query is the trusted oracle). Covers high+low df mix, all-present,
+// an absent term (-> empty), and single-term (-> that term's docs).
+TEST(BooleanAnd, EqualsTermIntersection) {
+  Corpus c = BuildCorpus();
+  const std::string path = TempPath();
+  WriteCorpus(c, path);
+  io::LocalFileReader local;
+  ASSERT_TRUE(local.open(path).ok());
+  io::MeteredFileReader metered(&local, /*block_size=*/4096);
+  SniiSegmentReader seg;
+  ASSERT_TRUE(SniiSegmentReader::open(&metered, &seg).ok());
+  LogicalIndexReader idx;
+  ASSERT_TRUE(seg.open_index(1, "body", &idx).ok());
+
+  auto intersect_terms = [&](const std::vector<std::string>& terms) {
+    std::vector<uint32_t> acc;
+    bool first = true;
+    for (const auto& t : terms) {
+      std::vector<uint32_t> d;
+      EXPECT_TRUE(query::term_query(idx, t, &d).ok());
+      if (first) {
+        acc = d;
+        first = false;
+      } else {
+        std::vector<uint32_t> out;
+        std::set_intersection(acc.begin(), acc.end(), d.begin(), d.end(),
+                              std::back_inserter(out));
+        acc = std::move(out);
+      }
+    }
+    return acc;
+  };
+
+  const std::vector<std::vector<std::string>> cases = {
+      {"aa_hi", "aa_quick"},            // high + low df
+      {"aa_quick", "aa_brown", "aa_fox"},
+      {"aa_hi", "nope_absent"},         // absent term -> empty
+      {"aa_hi"},                        // single term -> its docs
+  };
+  for (const auto& terms : cases) {
+    std::string label;
+    for (const auto& t : terms) label += t + " ";
+    std::vector<uint32_t> got;
+    ASSERT_TRUE(query::boolean_and(idx, terms, &got).ok()) << label;
+    EXPECT_TRUE(std::is_sorted(got.begin(), got.end())) << label;
+    EXPECT_EQ(got, intersect_terms(terms)) << "boolean_and != term-intersection: [" << label << "]";
+  }
+  std::remove(path.c_str());
+}
 
 TEST(PhraseSkip, SkippingEqualsOracleAndFullRead) {
   Corpus c = BuildCorpus();

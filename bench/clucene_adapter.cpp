@@ -15,6 +15,7 @@
 #include <vector>
 
 #include "CLucene.h"
+#include "CLucene/search/BooleanQuery.h"
 #include "CLucene/store/FSDirectory.h"
 #include "CLucene/util/CLStreams.h"
 #include "snii/io/local_file.h"
@@ -397,6 +398,55 @@ void CluceneAdapter::term_query(const std::string& term,
 
   std::sort(collector.docids.begin(), collector.docids.end());
   *docids = std::move(collector.docids);
+  *metrics = impl_->directory->aggregate_metrics();
+}
+
+void CluceneAdapter::boolean_and(const std::vector<std::string>& terms,
+                                 std::vector<uint32_t>* docids,
+                                 snii::io::IoMetrics* metrics) {
+  boolean_query(terms, /*conjunction=*/true, docids, metrics);
+}
+
+void CluceneAdapter::boolean_or(const std::vector<std::string>& terms,
+                                std::vector<uint32_t>* docids,
+                                snii::io::IoMetrics* metrics) {
+  boolean_query(terms, /*conjunction=*/false, docids, metrics);
+}
+
+void CluceneAdapter::boolean_query(const std::vector<std::string>& terms,
+                                   bool conjunction, std::vector<uint32_t>* docids,
+                                   snii::io::IoMetrics* metrics) {
+  impl_->directory->reset_metrics();
+  const std::wstring field = widen("body");
+  auto* bq = _CLNEW cl_search::BooleanQuery();
+  const cl_search::BooleanClause::Occur occur =
+      conjunction ? cl_search::BooleanClause::MUST
+                  : cl_search::BooleanClause::SHOULD;
+  std::vector<std::wstring> texts;  // keep widened texts alive during add()
+  texts.reserve(terms.size());
+  for (const std::string& w : terms) {
+    texts.push_back(widen(w));
+    auto* t = _CLNEW cl_index::Term(field.c_str(), texts.back().c_str());
+    auto* tq = _CLNEW cl_search::TermQuery(t);
+    _CLDECDELETE(t);
+    bq->add(tq, /*deleteQuery=*/true, occur);
+  }
+  DocidCollector collector;
+  impl_->searcher->_search(bq, /*filter=*/nullptr, &collector);
+  _CLDELETE(bq);
+
+  std::sort(collector.docids.begin(), collector.docids.end());
+  *docids = std::move(collector.docids);
+  *metrics = impl_->directory->aggregate_metrics();
+}
+
+void CluceneAdapter::match_all(std::vector<uint32_t>* docids,
+                               snii::io::IoMetrics* metrics) {
+  // Every docid (no deletions) -- no posting I/O, like the SNII path.
+  impl_->directory->reset_metrics();
+  const int32_t n = impl_->reader->numDocs();
+  docids->resize(n);
+  for (int32_t i = 0; i < n; ++i) (*docids)[i] = static_cast<uint32_t>(i);
   *metrics = impl_->directory->aggregate_metrics();
 }
 

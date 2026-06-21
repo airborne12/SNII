@@ -81,6 +81,15 @@ class CluceneAdapter {
   void phrase_query(const std::vector<std::string>& words,
                     std::vector<uint32_t>* docids, snii::io::IoMetrics* metrics);
 
+  // Boolean AND (BooleanQuery, MUST clauses), boolean OR (SHOULD clauses), and
+  // match-all (every docid; no query). Each fills ascending docids + aggregated
+  // I/O metrics for that query alone. Throw on failure.
+  void boolean_and(const std::vector<std::string>& terms,
+                   std::vector<uint32_t>* docids, snii::io::IoMetrics* metrics);
+  void boolean_or(const std::vector<std::string>& terms,
+                  std::vector<uint32_t>* docids, snii::io::IoMetrics* metrics);
+  void match_all(std::vector<uint32_t>* docids, snii::io::IoMetrics* metrics);
+
   // Total on-disk byte size of all index segment files (0 if not built).
   uint64_t index_bytes() const;
 
@@ -93,6 +102,10 @@ class CluceneAdapter {
   // Opens impl_->directory + IndexReader + searcher over impl_->dir_path (shared
   // by build_at's read phase and open_existing).
   void open_metered_reader();
+
+  // Shared BooleanQuery runner: MUST clauses (conjunction) or SHOULD (disjunction).
+  void boolean_query(const std::vector<std::string>& terms, bool conjunction,
+                     std::vector<uint32_t>* docids, snii::io::IoMetrics* metrics);
 
   // RAM-buffer flush threshold (MiB); <=0 = no auto flush (build fully in RAM).
   double ram_buffer_mb_ = 0.0;

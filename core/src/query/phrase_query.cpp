@@ -96,7 +96,8 @@ Status InlineDdRegion(const DictEntry& entry, Slice* out) {
 Status PlanTerms(const LogicalIndexReader& idx,
                  const std::vector<std::string>& terms,
                  snii::io::BatchRangeFetcher* fetcher,
-                 std::vector<TermPlan>* plans, bool* all_present) {
+                 std::vector<TermPlan>* plans, bool* all_present,
+                 bool need_positions) {
   *all_present = true;
   plans->resize(terms.size());
   for (size_t i = 0; i < terms.size(); ++i) {
@@ -120,26 +121,31 @@ Status PlanTerms(const LogicalIndexReader& idx,
     } else if (p.pod_ref) {
       uint64_t foff = 0, flen = 0, poff = 0, plen = 0;
       SNII_RETURN_IF_ERROR(idx.resolve_frq_window(p.entry, p.frq_base, &foff, &flen));
-      SNII_RETURN_IF_ERROR(idx.resolve_prx_window(p.entry, p.prx_base, &poff, &plen));
-      // Phrase needs docids + positions but NOT freqs: fetch only the .frq
-      // docs-only prefix (frq_docs_len) when recorded; .prx is fetched in full.
+      // Docids (always): only the .frq docs-only prefix (frq_docs_len) when
+      // recorded. Positions (.prx) only when needed (phrase); a docid-only
+      // conjunction (boolean AND) or a docs-only index skips the prx range.
       uint64_t frq_fetch = flen;
       SNII_RETURN_IF_ERROR(SlimFrqDocsLen(p.entry, flen, &frq_fetch));
       p.frq_handle = fetcher->add(foff, static_cast<size_t>(frq_fetch));
-      p.prx_handle = fetcher->add(poff, static_cast<size_t>(plen));
+      if (need_positions) {
+        SNII_RETURN_IF_ERROR(idx.resolve_prx_window(p.entry, p.prx_base, &poff, &plen));
+        p.prx_handle = fetcher->add(poff, static_cast<size_t>(plen));
+      }
     }
   }
   return Status::OK();
 }
 
-// Opens each windowed term's prelude from the round-1 batch result.
+// Opens each windowed term's prelude from the round-1 batch result. When
+// need_positions, the index must carry positions (phrase); a docid-only
+// conjunction (boolean AND) or a docs-only index does not require prx.
 Status OpenPreludes(const snii::io::BatchRangeFetcher& fetcher,
-                    std::vector<TermPlan>* plans) {
+                    std::vector<TermPlan>* plans, bool need_positions) {
   for (TermPlan& p : *plans) {
     if (!p.windowed) continue;
     SNII_RETURN_IF_ERROR(
         FrqPreludeReader::open(fetcher.get(p.prelude_handle), &p.prelude));
-    if (!p.prelude.has_prx()) {
+    if (need_positions && !p.prelude.has_prx()) {
       return Status::Corruption("phrase_query: windowed prelude has no positions");
     }
   }
@@ -196,7 +202,7 @@ struct PosSource {
 // DECODE is deferred to the survivors.
 Status DecodeWindowedDocids(
     const LogicalIndexReader& idx, const TermPlan& p,
-    const std::vector<uint32_t>& windows,
+    const std::vector<uint32_t>& windows, bool need_positions,
     std::vector<std::unique_ptr<snii::io::BatchRangeFetcher>>* owners,
     PosSource* src, std::vector<uint32_t>* term_docids) {
   auto fetcher = std::make_unique<snii::io::BatchRangeFetcher>(
@@ -209,11 +215,13 @@ Status DecodeWindowedDocids(
     snii::reader::WindowAbsRange r;
     SNII_RETURN_IF_ERROR(snii::reader::windowed_window_range(
         idx, p.entry, p.frq_base, p.prx_base, p.prelude, w,
-        /*want_positions=*/true, /*want_freq=*/false, &r));
+        /*want_positions=*/need_positions, /*want_freq=*/false, &r));
     WindowMeta m;
     SNII_RETURN_IF_ERROR(p.prelude.window(w, &m));
     const size_t dh = fetcher->add(r.dd_off, static_cast<size_t>(r.dd_len));
-    const size_t ph = fetcher->add(r.prx_off, static_cast<size_t>(r.prx_len));
+    const size_t ph = need_positions
+                          ? fetcher->add(r.prx_off, static_cast<size_t>(r.prx_len))
+                          : 0;
     handles.emplace_back(dh, ph);
     metas.push_back(m);
   }
@@ -227,7 +235,7 @@ Status DecodeWindowedDocids(
         metas[k], fetcher->get(handles[k].first), Slice(), Slice(),
         /*want_positions=*/false, /*want_freq=*/false, &chunk.docids, &freqs, &pos));
     for (uint32_t d : chunk.docids) term_docids->push_back(d);
-    chunk.prx = fetcher->get(handles[k].second);
+    if (need_positions) chunk.prx = fetcher->get(handles[k].second);
     src->chunks.push_back(std::move(chunk));
   }
   owners->push_back(std::move(fetcher));  // unique_ptr move keeps the buffer fixed
@@ -235,17 +243,19 @@ Status DecodeWindowedDocids(
 }
 
 // Phase A (slim/inline term): decode DOCIDS ONLY from the round-1 dd region into
-// *term_docids, and retain the dd/prx slices in *src for Phase B.
+// *term_docids, and retain the dd/prx slices in *src for Phase B (prx only when
+// need_positions; a docid-only conjunction / docs-only index leaves it empty).
 Status DecodeFlatDocids(const snii::io::BatchRangeFetcher& round1, const TermPlan& p,
-                        PosSource* src, std::vector<uint32_t>* term_docids) {
+                        bool need_positions, PosSource* src,
+                        std::vector<uint32_t>* term_docids) {
   PosChunk chunk;
   Slice dd;
   if (p.pod_ref) {
     dd = round1.get(p.frq_handle);
-    chunk.prx = round1.get(p.prx_handle);
+    if (need_positions) chunk.prx = round1.get(p.prx_handle);
   } else {
     SNII_RETURN_IF_ERROR(InlineDdRegion(p.entry, &dd));
-    chunk.prx = Slice(p.entry.prx_bytes);
+    if (need_positions) chunk.prx = Slice(p.entry.prx_bytes);
   }
   SNII_RETURN_IF_ERROR(snii::format::decode_dd_region(
       dd, p.entry.dd_meta, /*win_base=*/0, &chunk.docids));
@@ -341,7 +351,7 @@ std::vector<size_t> AscendingDfOrder(const std::vector<TermPlan>& plans) {
 // reference them). No positions are decoded here.
 Status BuildConjunction(
     const LogicalIndexReader& idx, const snii::io::BatchRangeFetcher& round1,
-    const std::vector<TermPlan>& plans,
+    const std::vector<TermPlan>& plans, bool need_positions,
     std::vector<std::unique_ptr<snii::io::BatchRangeFetcher>>* owners,
     std::vector<PosSource>* srcs, std::vector<uint32_t>* candidates) {
   const std::vector<size_t> order = AscendingDfOrder(plans);
@@ -357,10 +367,11 @@ Status BuildConjunction(
         SNII_RETURN_IF_ERROR(
             SelectCoveringWindows(p.prelude, *candidates, &windows));
       }
-      SNII_RETURN_IF_ERROR(DecodeWindowedDocids(idx, p, windows, owners,
-                                                &(*srcs)[ti], &term_docids));
+      SNII_RETURN_IF_ERROR(DecodeWindowedDocids(
+          idx, p, windows, need_positions, owners, &(*srcs)[ti], &term_docids));
     } else {
-      SNII_RETURN_IF_ERROR(DecodeFlatDocids(round1, p, &(*srcs)[ti], &term_docids));
+      SNII_RETURN_IF_ERROR(
+          DecodeFlatDocids(round1, p, need_positions, &(*srcs)[ti], &term_docids));
     }
     if (k == 0) {
       *candidates = std::move(term_docids);
@@ -433,10 +444,11 @@ Status phrase_query(const LogicalIndexReader& idx,
   snii::io::BatchRangeFetcher round1(idx.reader());
   std::vector<TermPlan> plans;
   bool all_present = false;
-  SNII_RETURN_IF_ERROR(PlanTerms(idx, terms, &round1, &plans, &all_present));
+  SNII_RETURN_IF_ERROR(
+      PlanTerms(idx, terms, &round1, &plans, &all_present, /*need_positions=*/true));
   if (!all_present) return Status::OK();
   if (round1.pending() > 0) SNII_RETURN_IF_ERROR(round1.fetch());
-  SNII_RETURN_IF_ERROR(OpenPreludes(round1, &plans));
+  SNII_RETURN_IF_ERROR(OpenPreludes(round1, &plans, /*need_positions=*/true));
 
   // Phase 1: DOCID-ONLY conjunction (S3-native batch fetch). `owners` holds the
   // per-term fetchers; it MUST outlive the verification pass below because the
@@ -444,12 +456,41 @@ Status phrase_query(const LogicalIndexReader& idx,
   std::vector<PosSource> srcs(plans.size());
   std::vector<std::unique_ptr<snii::io::BatchRangeFetcher>> owners;
   std::vector<uint32_t> candidates;
-  SNII_RETURN_IF_ERROR(
-      BuildConjunction(idx, round1, plans, &owners, &srcs, &candidates));
+  SNII_RETURN_IF_ERROR(BuildConjunction(idx, round1, plans, /*need_positions=*/true,
+                                        &owners, &srcs, &candidates));
   if (candidates.empty()) return Status::OK();
 
   // Phase 2: single streaming pass -- positional verify via per-term cursors.
   SNII_RETURN_IF_ERROR(EmitPhraseStreaming(plans, srcs, candidates, docids));
+  return Status::OK();
+}
+
+// boolean AND (MATCH all-terms): the sorted docid set of docs containing EVERY
+// term, with NO positional constraint. Reuses the docid-only conjunction (driver =
+// min-df term, high-df terms read only the windows covering the running
+// candidates) but fetches NO positions -- so the high-df term's bytes scale with
+// selectivity, not df. Works on docs-only indexes (no .prx required). Empty term
+// list or any absent term -> empty result.
+Status boolean_and(const LogicalIndexReader& idx,
+                   const std::vector<std::string>& terms,
+                   std::vector<uint32_t>* docids) {
+  if (docids == nullptr) return Status::InvalidArgument("boolean_and: null out");
+  docids->clear();
+  if (terms.empty()) return Status::OK();
+
+  snii::io::BatchRangeFetcher round1(idx.reader());
+  std::vector<TermPlan> plans;
+  bool all_present = false;
+  SNII_RETURN_IF_ERROR(PlanTerms(idx, terms, &round1, &plans, &all_present,
+                                 /*need_positions=*/false));
+  if (!all_present) return Status::OK();
+  if (round1.pending() > 0) SNII_RETURN_IF_ERROR(round1.fetch());
+  SNII_RETURN_IF_ERROR(OpenPreludes(round1, &plans, /*need_positions=*/false));
+
+  std::vector<PosSource> srcs(plans.size());
+  std::vector<std::unique_ptr<snii::io::BatchRangeFetcher>> owners;
+  SNII_RETURN_IF_ERROR(BuildConjunction(idx, round1, plans, /*need_positions=*/false,
+                                        &owners, &srcs, docids));
   return Status::OK();
 }
 

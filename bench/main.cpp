@@ -1298,33 +1298,72 @@ int run_sharded_e2e(const Args& args) {
   return all_identical ? 0 : 1;
 }
 
-// One resolved benchmark scenario (Wave 1: term / phrase kinds).
+// One resolved benchmark scenario. `words` holds phrase tokens (kPhrase) or the
+// term list (kAnd / kOr); `term` holds the single term (kTerm).
+enum class SKind { kTerm, kPhrase, kAnd, kOr, kMatchAll };
 struct Scenario {
   std::string id;
-  bool is_phrase = false;
-  std::string term;                 // for term kinds
-  std::vector<std::string> words;   // for phrase kinds
+  SKind kind = SKind::kTerm;
+  std::string term;
+  std::vector<std::string> words;
 };
 
-// Resolves the enriched term/phrase catalog from the corpus via the df-bucket
-// selectors -- a calibrated df sweep plus a phrase length sweep, replacing the
-// thin high/mid/low + one-phrase suite.
+// Resolves the enriched catalog from the corpus via the df-bucket selectors: a
+// calibrated term df sweep, a phrase length sweep, boolean AND (mixed-df, the
+// driver+covering-window claim), boolean OR (df mix), and match-all.
 std::vector<Scenario> resolve_scenarios(const bench::Corpus& c) {
   std::vector<Scenario> out;
   auto add_term = [&](const std::string& id, uint32_t tid) {
-    if (tid < c.vocab.size()) out.push_back({id, false, c.vocab[tid], {}});
+    if (tid < c.vocab.size()) out.push_back({id, SKind::kTerm, c.vocab[tid], {}});
   };
   add_term("TERM-very-high", bench::term_in_df_bucket(c, 0.5, 1.0));
   add_term("TERM-high", bench::term_in_df_bucket(c, 0.1, 0.5));
   add_term("TERM-mid", bench::mid_df_term(c));
   add_term("TERM-low", bench::low_df_term(c));
   add_term("TERM-df1", bench::df1_term(c));
-  out.push_back({"TERM-absent", false, bench::absent_token(c), {}});  // df=0
+  out.push_back({"TERM-absent", SKind::kTerm, bench::absent_token(c), {}});  // df=0
   for (uint32_t n : {2u, 3u, 5u, 8u}) {
     std::vector<std::string> ph = bench::extract_phrase(c, n);
-    if (!ph.empty()) out.push_back({"PHRASE-" + std::to_string(n), true, "", ph});
+    if (!ph.empty())
+      out.push_back({"PHRASE-" + std::to_string(n), SKind::kPhrase, "", ph});
   }
+  // AND-HIGH-LOW: very-high-df stopword AND a co-occurring rare term (driver=rare).
+  const auto pr = bench::cooccurring_pair(c, 0.5, 1.0, 0.0, 0.01);
+  if (pr.first != pr.second) {
+    out.push_back({"AND-HIGH-LOW", SKind::kAnd, "",
+                   {c.vocab[pr.first], c.vocab[pr.second]}});
+  }
+  // OR-MIXED-DF: union over a high + mid + low term (distinct).
+  {
+    std::vector<uint32_t> ids = {bench::term_in_df_bucket(c, 0.1, 0.5),
+                                 bench::mid_df_term(c), bench::low_df_term(c)};
+    std::vector<std::string> terms;
+    for (uint32_t id : ids)
+      if (id < c.vocab.size() &&
+          std::find(terms.begin(), terms.end(), c.vocab[id]) == terms.end())
+        terms.push_back(c.vocab[id]);
+    if (terms.size() >= 2) out.push_back({"OR-MIXED-DF", SKind::kOr, "", terms});
+  }
+  out.push_back({"MATCH-ALL", SKind::kMatchAll, "", {}});
   return out;
+}
+
+// Runs one scenario `runs` times on an adapter, dispatching on its kind.
+template <class Adapter>
+EngineQueryResult run_scenario_on(Adapter& idx, const Scenario& s, uint32_t runs) {
+  EngineQueryResult r;
+  for (uint32_t i = 0; i < runs; ++i) {
+    const auto t0 = std::chrono::steady_clock::now();
+    switch (s.kind) {
+      case SKind::kTerm: idx.term_query(s.term, &r.docids, &r.metrics); break;
+      case SKind::kPhrase: idx.phrase_query(s.words, &r.docids, &r.metrics); break;
+      case SKind::kAnd: idx.boolean_and(s.words, &r.docids, &r.metrics); break;
+      case SKind::kOr: idx.boolean_or(s.words, &r.docids, &r.metrics); break;
+      case SKind::kMatchAll: idx.match_all(&r.docids, &r.metrics); break;
+    }
+    r.latency_ms.push_back(wall_ms_since(t0));
+  }
+  return r;
 }
 
 void report_scenario(const Scenario& s, const EngineQueryResult& sn,
@@ -1395,8 +1434,8 @@ int run_scenario_mode(const Args& args) {
   for (const Scenario& s : scenarios) {
     EngineQueryResult sn, cl;
     try {
-      sn = run_query_n(snii_idx, s.is_phrase, s.term, s.words, R);
-      cl = run_query_n(cl_idx, s.is_phrase, s.term, s.words, R);
+      sn = run_scenario_on(snii_idx, s, R);
+      cl = run_scenario_on(cl_idx, s, R);
     } catch (const std::exception& e) {
       std::fprintf(stderr, "FATAL: scenario %s: %s\n", s.id.c_str(), e.what());
       return 1;
