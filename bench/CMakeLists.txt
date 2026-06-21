@@ -72,8 +72,17 @@ if(SNII_BUILD_TESTS)
   target_link_libraries(snii_bench_parquet_corpus_reader_test
     PRIVATE snii_gtest snii_arrow)
 
+  # df-bucket term selection (no Arrow/CLucene): pure Corpus selectors.
+  add_executable(snii_bench_corpus_gen_test
+    ${CMAKE_CURRENT_SOURCE_DIR}/corpus_gen_test.cpp
+    ${CMAKE_CURRENT_SOURCE_DIR}/corpus_gen.cpp)
+  target_include_directories(snii_bench_corpus_gen_test
+    PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
+  target_link_libraries(snii_bench_corpus_gen_test PRIVATE snii_gtest)
+
   include(GoogleTest)
   gtest_discover_tests(snii_bench_corpus_loader_test)
+  gtest_discover_tests(snii_bench_corpus_gen_test)
   gtest_discover_tests(snii_bench_doris_english_analyzer_test)
   gtest_discover_tests(snii_bench_parallel_tokenizer_test)
   gtest_discover_tests(snii_bench_parquet_corpus_reader_test)
