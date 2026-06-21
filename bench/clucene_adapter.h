@@ -95,6 +95,15 @@ class CluceneAdapter {
                   std::vector<uint32_t>* docids, snii::io::IoMetrics* metrics);
   void match_all(std::vector<uint32_t>* docids, snii::io::IoMetrics* metrics);
 
+  // Prefix query (PrefixQuery -> union docids) and MATCH_PHRASE_PREFIX (union of
+  // PhraseQuery(fixed + expansion) over every expansion). Each fills docids +
+  // metrics. Throw on failure.
+  void prefix_query(const std::string& prefix, std::vector<uint32_t>* docids,
+                    snii::io::IoMetrics* metrics);
+  void phrase_prefix_query(const std::vector<std::string>& fixed,
+                           const std::vector<std::string>& expansions,
+                           std::vector<uint32_t>* docids, snii::io::IoMetrics* metrics);
+
   // Total on-disk byte size of all index segment files (0 if not built).
   uint64_t index_bytes() const;
 

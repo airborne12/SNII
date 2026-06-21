@@ -16,6 +16,7 @@
 
 #include "CLucene.h"
 #include "CLucene/search/BooleanQuery.h"
+#include "CLucene/search/PrefixQuery.h"
 #include "CLucene/store/FSDirectory.h"
 #include "CLucene/util/CLStreams.h"
 #include "snii/io/local_file.h"
@@ -399,6 +400,61 @@ void CluceneAdapter::term_query(const std::string& term,
 
   std::sort(collector.docids.begin(), collector.docids.end());
   *docids = std::move(collector.docids);
+  *metrics = impl_->directory->aggregate_metrics();
+}
+
+void CluceneAdapter::prefix_query(const std::string& prefix,
+                                  std::vector<uint32_t>* docids,
+                                  snii::io::IoMetrics* metrics) {
+  impl_->directory->reset_metrics();
+  // PrefixQuery rewrites to a BooleanQuery (one clause per matched term); lift the
+  // default 1024 clause cap so a broad prefix enumerates instead of throwing.
+  cl_search::BooleanQuery::setMaxClauseCount(1u << 24);
+  const std::wstring field = widen("body");
+  const std::wstring text = widen(prefix);
+  auto* t = _CLNEW cl_index::Term(field.c_str(), text.c_str());
+  auto* q = _CLNEW cl_search::PrefixQuery(t);
+  _CLDECDELETE(t);
+  DocidCollector collector;
+  impl_->searcher->_search(q, /*filter=*/nullptr, &collector);
+  _CLDELETE(q);
+  std::sort(collector.docids.begin(), collector.docids.end());
+  *docids = std::move(collector.docids);
+  *metrics = impl_->directory->aggregate_metrics();
+}
+
+void CluceneAdapter::phrase_prefix_query(const std::vector<std::string>& fixed,
+                                         const std::vector<std::string>& expansions,
+                                         std::vector<uint32_t>* docids,
+                                         snii::io::IoMetrics* metrics) {
+  impl_->directory->reset_metrics();
+  const std::wstring field = widen("body");
+  std::vector<uint32_t> acc;  // union of per-expansion PhraseQuery docids
+  for (const std::string& exp : expansions) {
+    auto* q = _CLNEW cl_search::PhraseQuery();
+    std::vector<std::wstring> texts;
+    texts.reserve(fixed.size() + 1);
+    for (const std::string& w : fixed) {
+      texts.push_back(widen(w));
+      auto* t = _CLNEW cl_index::Term(field.c_str(), texts.back().c_str());
+      q->add(t);
+      _CLDECDELETE(t);
+    }
+    texts.push_back(widen(exp));
+    auto* te = _CLNEW cl_index::Term(field.c_str(), texts.back().c_str());
+    q->add(te);
+    _CLDECDELETE(te);
+    DocidCollector collector;
+    impl_->searcher->_search(q, /*filter=*/nullptr, &collector);
+    _CLDELETE(q);
+    std::sort(collector.docids.begin(), collector.docids.end());
+    std::vector<uint32_t> merged;
+    merged.reserve(acc.size() + collector.docids.size());
+    std::set_union(acc.begin(), acc.end(), collector.docids.begin(),
+                   collector.docids.end(), std::back_inserter(merged));
+    acc = std::move(merged);
+  }
+  *docids = std::move(acc);
   *metrics = impl_->directory->aggregate_metrics();
 }
 

@@ -119,6 +119,18 @@ class SniiAdapter {
                   std::vector<uint32_t>* docids, snii::io::IoMetrics* metrics);
   void match_all(std::vector<uint32_t>* docids, snii::io::IoMetrics* metrics);
 
+  // Prefix query (every term sharing `prefix`, union of their docids) via the
+  // ordered term enumeration. enumerate_prefix returns just the matching terms (for
+  // building a MATCH_PHRASE_PREFIX). phrase_prefix_query unions phrase(fixed +
+  // expansion) over every expansion -- docs where `fixed` occurs consecutively
+  // followed by ANY term in `expansions`. Each fills docids + metrics. Throw on error.
+  void prefix_query(const std::string& prefix, std::vector<uint32_t>* docids,
+                    snii::io::IoMetrics* metrics);
+  std::vector<std::string> enumerate_prefix(const std::string& prefix);
+  void phrase_prefix_query(const std::vector<std::string>& fixed,
+                           const std::vector<std::string>& expansions,
+                           std::vector<uint32_t>* docids, snii::io::IoMetrics* metrics);
+
   // On-disk byte size of the built .idx container (0 if not built).
   uint64_t index_bytes() const;
 

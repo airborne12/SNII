@@ -78,6 +78,7 @@ struct Args {
   bool keyword = false;       // run the non-tokenized (keyword) docs-only comparison
   bool multi_index = false;   // run the SNII multi-logical-index write self-check
   bool scoring = false;       // run the SNII BM25 scoring path-equivalence check
+  bool prefix = false;        // run prefix / match_phrase_prefix head-to-head
   uint32_t concurrency = 0;   // >0: also run a concurrent throughput pass (N threads)
   double concurrency_seconds = 5.0;  // wall-clock duration of each concurrent pass
   uint32_t concurrency_warmup = 50;  // queries discarded per thread before timing
@@ -154,6 +155,8 @@ Args parse_args(int argc, char** argv) {
       a.multi_index = true;
     } else if (flag == "--scoring") {
       a.scoring = true;
+    } else if (flag == "--prefix") {
+      a.prefix = true;
     } else if (flag == "--concurrency") {
       a.concurrency =
           static_cast<uint32_t>(std::strtoul(next("--concurrency"), nullptr, 10));
@@ -1679,6 +1682,96 @@ int run_scoring_mode(const Args& args) {
   return all_ok ? 0 : 1;
 }
 
+// Prefix + MATCH_PHRASE_PREFIX head-to-head: builds both engines (tokenized) and
+// compares prefix_query (SNII ordered term enumeration + union vs CLucene
+// PrefixQuery) and match_phrase_prefix (union of phrase(fixed + expansion) over the
+// prefix's terms, both engines), with the three gold metrics + latency.
+int run_prefix_mode(const Args& args) {
+  const uint32_t threads =
+      args.threads != 0 ? args.threads
+                        : std::max(1u, std::thread::hardware_concurrency());
+  bench::Corpus corpus;
+  if (!args.parquet_file.empty()) {
+    uint64_t raw = 0;
+    double tc = 0, tw = 0;
+    if (!load_and_tokenize(args, threads, &corpus, &raw, &tc, &tw)) return 1;
+  } else {
+    corpus = bench::generate(args.docs, args.vocab, args.zipf, args.doclen, args.seed);
+  }
+  std::printf("prefix corpus: docs=%u vocab=%zu\n", corpus.doc_count,
+              corpus.vocab.size());
+
+  bench::SniiAdapter snii_idx;
+  bench::CluceneAdapter cl_idx;
+  apply_spill(snii_idx, args.spill_mib);
+  apply_spill(cl_idx, args.spill_mib);
+  const std::string out =
+      args.out_dir.empty() ? std::string("/mnt/disk15/jiangkai/e2e_data/prefix")
+                           : args.out_dir;
+  try {
+    snii_idx.build_at(out + "/snii/index.idx", corpus, args.keep_index);
+    cl_idx.build_at(out + "/clucene", corpus, args.keep_index);
+  } catch (const std::exception& e) {
+    std::fprintf(stderr, "FATAL: prefix build failed: %s\n", e.what());
+    return 1;
+  }
+
+  // Choose the SHORTEST prefix of a term whose expansion count is bounded (<=200),
+  // so the comparison stays meaningful and CLucene's PrefixQuery stays under its
+  // BooleanQuery clause cap (a broad prefix would otherwise throw "Too Many Clauses").
+  auto bounded_prefix = [&](const std::string& w) -> std::string {
+    for (size_t L = 1; L <= w.size(); ++L) {
+      std::string p = w.substr(0, L);
+      if (snii_idx.enumerate_prefix(p).size() <= 200) return p;
+    }
+    return w;
+  };
+  // Use real content words (a 2-gram) so the prefixes are meaningful word stems.
+  const std::vector<std::string> bigram = bench::extract_phrase(corpus, 2);
+  const std::string prefix = bigram.size() == 2 ? bounded_prefix(bigram[0])
+                                                : std::string();
+
+  bool all_identical = true;
+  snii::io::IoMetrics ms, mc;
+  auto compare = [&](const char* label, std::vector<uint32_t>& a,
+                     std::vector<uint32_t>& b) {
+    const bool id = (a == b);
+    if (!id) all_identical = false;
+    std::printf("\n[%s] SNII=%zu CLucene=%zu %s\n", label, a.size(), b.size(),
+                id ? "IDENTICAL" : "MISMATCH");
+    std::printf("  gold CL/SNII: serial_rounds=%.2f range_gets=%.2f bytes=%.2f\n",
+                ratio(mc.serial_rounds, ms.serial_rounds),
+                ratio(mc.range_gets, ms.range_gets),
+                ratio(mc.total_request_bytes, ms.total_request_bytes));
+  };
+
+  if (!prefix.empty()) {
+    std::vector<uint32_t> sd, cd;
+    snii_idx.prefix_query(prefix, &sd, &ms);
+    cl_idx.prefix_query(prefix, &cd, &mc);
+    const std::vector<std::string> exp = snii_idx.enumerate_prefix(prefix);
+    std::printf("prefix='%s' (%zu expansion terms)", prefix.c_str(), exp.size());
+    compare(("PREFIX '" + prefix + "*'").c_str(), sd, cd);
+
+    if (bigram.size() == 2) {
+      const std::string p2 = bounded_prefix(bigram[1]);
+      const std::vector<std::string> exp2 = snii_idx.enumerate_prefix(p2);
+      const std::vector<std::string> fixed = {bigram[0]};
+      std::vector<uint32_t> sp, cp;
+      snii_idx.phrase_prefix_query(fixed, exp2, &sp, &ms);
+      cl_idx.phrase_prefix_query(fixed, exp2, &cp, &mc);
+      std::printf("phrase-prefix '%s %s*' (%zu expansions)", bigram[0].c_str(),
+                  p2.c_str(), exp2.size());
+      compare(("MATCH_PHRASE_PREFIX '" + bigram[0] + " " + p2 + "*'").c_str(), sp, cp);
+    }
+  }
+
+  std::printf("\nresult: %s (prefix / match_phrase_prefix)\n",
+              all_identical ? "ALL DOCIDS IDENTICAL (SNII == CLucene)"
+                            : "DOCID MISMATCH");
+  return all_identical ? 0 : 1;
+}
+
 // SNII multi-index WRITE test: one container holds multiple logical indexes
 // (tokenized Body + keyword ServiceName). Verifies each field, queried from the
 // multi-container, returns EXACTLY the same docids as a single-field index built
@@ -2003,6 +2096,11 @@ int main(int argc, char** argv) {
   // SNII BM25 scoring path-equivalence (exhaustive == wand == wand_selective).
   if (args.scoring) {
     return run_scoring_mode(args);
+  }
+
+  // Prefix / MATCH_PHRASE_PREFIX head-to-head (ordered term enumeration).
+  if (args.prefix) {
+    return run_prefix_mode(args);
   }
 
   // SNII multi-logical-index write self-consistency (tokenized + keyword mix).

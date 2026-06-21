@@ -311,6 +311,67 @@ void SniiAdapter::match_all(std::vector<uint32_t>* docids,
   *metrics = metered_->metrics();
 }
 
+void SniiAdapter::prefix_query(const std::string& prefix,
+                               std::vector<uint32_t>* docids,
+                               snii::io::IoMetrics* metrics) {
+  metered_->reset_metrics();
+  docids->clear();
+  std::vector<snii::reader::LogicalIndexReader::PrefixHit> hits;
+  if (snii::Status s = index_->prefix_terms(prefix, &hits); !s.ok()) {
+    fail("prefix_terms", s);
+  }
+  std::vector<uint32_t> acc;
+  for (const auto& h : hits) {
+    std::vector<uint32_t> d;
+    if (snii::Status s = snii::query::term_query(*index_, h.term, &d); !s.ok()) {
+      fail("prefix term_query(" + h.term + ")", s);
+    }
+    std::vector<uint32_t> merged;
+    merged.reserve(acc.size() + d.size());
+    std::set_union(acc.begin(), acc.end(), d.begin(), d.end(),
+                   std::back_inserter(merged));
+    acc = std::move(merged);
+  }
+  *docids = std::move(acc);
+  *metrics = metered_->metrics();
+}
+
+std::vector<std::string> SniiAdapter::enumerate_prefix(const std::string& prefix) {
+  std::vector<snii::reader::LogicalIndexReader::PrefixHit> hits;
+  if (snii::Status s = index_->prefix_terms(prefix, &hits); !s.ok()) {
+    fail("prefix_terms", s);
+  }
+  std::vector<std::string> out;
+  out.reserve(hits.size());
+  for (auto& h : hits) out.push_back(std::move(h.term));
+  return out;
+}
+
+void SniiAdapter::phrase_prefix_query(const std::vector<std::string>& fixed,
+                                      const std::vector<std::string>& expansions,
+                                      std::vector<uint32_t>* docids,
+                                      snii::io::IoMetrics* metrics) {
+  metered_->reset_metrics();
+  docids->clear();
+  std::vector<uint32_t> acc;
+  std::vector<std::string> phrase = fixed;
+  phrase.push_back(std::string());
+  for (const std::string& exp : expansions) {
+    phrase.back() = exp;
+    std::vector<uint32_t> d;
+    if (snii::Status s = snii::query::phrase_query(*index_, phrase, &d); !s.ok()) {
+      fail("phrase_prefix phrase_query", s);
+    }
+    std::vector<uint32_t> merged;
+    merged.reserve(acc.size() + d.size());
+    std::set_union(acc.begin(), acc.end(), d.begin(), d.end(),
+                   std::back_inserter(merged));
+    acc = std::move(merged);
+  }
+  *docids = std::move(acc);
+  *metrics = metered_->metrics();
+}
+
 uint64_t SniiAdapter::index_bytes() const {
   if (path_.empty()) return 0;
   std::error_code ec;
