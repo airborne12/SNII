@@ -21,4 +21,11 @@ namespace bench {
 // 0,1,2,..., independent of `threads`.
 Corpus tokenize_corpus(const std::vector<std::string>& bodies, uint32_t threads);
 
+// Builds a NON-TOKENIZED (keyword) corpus: each document's whole raw value becomes
+// exactly ONE term (identity, no splitting/lowercasing) -- the Doris non-tokenized
+// inverted index shape (exact-match / range on the raw field value). vocab is the
+// set of distinct values in first-occurrence order; docs[d] = [id(values[d])]. An
+// empty value yields an empty document (no term), keeping docid == row index.
+Corpus keyword_corpus(const std::vector<std::string>& values);
+
 }  // namespace bench

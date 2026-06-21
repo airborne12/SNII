@@ -114,4 +114,25 @@ Corpus tokenize_corpus(const std::vector<std::string>& bodies, uint32_t threads)
   return c;
 }
 
+Corpus keyword_corpus(const std::vector<std::string>& values) {
+  Corpus c;
+  c.doc_count = checked_u32(values.size(), "doc count");
+  c.docs.resize(values.size());
+  std::unordered_map<std::string, uint32_t> index;
+  for (size_t d = 0; d < values.size(); ++d) {
+    if (values[d].empty()) continue;  // empty value -> empty document
+    auto it = index.find(values[d]);
+    uint32_t id;
+    if (it == index.end()) {
+      id = checked_u32(c.vocab.size(), "vocab size");
+      c.vocab.push_back(values[d]);
+      index.emplace(values[d], id);
+    } else {
+      id = it->second;
+    }
+    c.docs[d].push_back(id);
+  }
+  return c;
+}
+
 }  // namespace bench

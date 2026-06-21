@@ -94,6 +94,25 @@ TEST(ParallelTokenizer, ZeroThreadsTreatedAsOne) {
                    serial_oracle(sample_bodies()));
 }
 
+TEST(KeywordCorpus, WholeValueIsOneTermEmptyKept) {
+  std::vector<std::string> values = {"Failed to place order", "Checkout",
+                                     "Failed to place order", "", "Checkout"};
+  bench::Corpus c = bench::keyword_corpus(values);
+  EXPECT_EQ(c.doc_count, 5u);
+  // distinct whole values (with spaces) -> 2 vocab terms, NOT split.
+  ASSERT_EQ(c.vocab.size(), 2u);
+  EXPECT_EQ(c.vocab[0], "Failed to place order");
+  EXPECT_EQ(c.vocab[1], "Checkout");
+  EXPECT_EQ(c.docs[0], (std::vector<uint32_t>{0}));
+  EXPECT_EQ(c.docs[1], (std::vector<uint32_t>{1}));
+  EXPECT_EQ(c.docs[2], (std::vector<uint32_t>{0}));
+  EXPECT_TRUE(c.docs[3].empty());  // empty value -> empty doc
+  EXPECT_EQ(c.docs[4], (std::vector<uint32_t>{1}));
+  // df: "Failed to place order" in docs {0,2}=2; "Checkout" in {1,4}=2.
+  EXPECT_EQ(c.document_frequency(0), 2u);
+  EXPECT_EQ(c.document_frequency(1), 2u);
+}
+
 TEST(ParallelTokenizer, VocabIdOrderIsFirstOccurrenceAcrossShards) {
   // With a doc boundary that lands inside a multi-thread split, a term first
   // seen in an earlier document must keep the lower global id even if a later
