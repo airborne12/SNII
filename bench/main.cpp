@@ -72,6 +72,7 @@ struct Args {
   std::string phrase;         // space-separated phrase words (empty = default)
   bool no_merge = false;      // CLucene: flush segments but skip optimize() (no merge)
   uint32_t shard_docs = 0;    // SNII: docs per segment (0 = single segment)
+  bool scenarios = false;     // run the enriched scenario catalog (build + compare)
 };
 
 Args parse_args(int argc, char** argv) {
@@ -137,6 +138,8 @@ Args parse_args(int argc, char** argv) {
     } else if (flag == "--shard-docs") {
       a.shard_docs =
           static_cast<uint32_t>(std::strtoul(next("--shard-docs"), nullptr, 10));
+    } else if (flag == "--scenarios") {
+      a.scenarios = true;
     } else {
       std::fprintf(stderr, "unknown argument: %s\n", flag.c_str());
       std::exit(2);
@@ -1295,6 +1298,118 @@ int run_sharded_e2e(const Args& args) {
   return all_identical ? 0 : 1;
 }
 
+// One resolved benchmark scenario (Wave 1: term / phrase kinds).
+struct Scenario {
+  std::string id;
+  bool is_phrase = false;
+  std::string term;                 // for term kinds
+  std::vector<std::string> words;   // for phrase kinds
+};
+
+// Resolves the enriched term/phrase catalog from the corpus via the df-bucket
+// selectors -- a calibrated df sweep plus a phrase length sweep, replacing the
+// thin high/mid/low + one-phrase suite.
+std::vector<Scenario> resolve_scenarios(const bench::Corpus& c) {
+  std::vector<Scenario> out;
+  auto add_term = [&](const std::string& id, uint32_t tid) {
+    if (tid < c.vocab.size()) out.push_back({id, false, c.vocab[tid], {}});
+  };
+  add_term("TERM-very-high", bench::term_in_df_bucket(c, 0.5, 1.0));
+  add_term("TERM-high", bench::term_in_df_bucket(c, 0.1, 0.5));
+  add_term("TERM-mid", bench::mid_df_term(c));
+  add_term("TERM-low", bench::low_df_term(c));
+  add_term("TERM-df1", bench::df1_term(c));
+  out.push_back({"TERM-absent", false, bench::absent_token(c), {}});  // df=0
+  for (uint32_t n : {2u, 3u, 5u, 8u}) {
+    std::vector<std::string> ph = bench::extract_phrase(c, n);
+    if (!ph.empty()) out.push_back({"PHRASE-" + std::to_string(n), true, "", ph});
+  }
+  return out;
+}
+
+void report_scenario(const Scenario& s, const EngineQueryResult& sn,
+                     const EngineQueryResult& cl, bool* all_identical) {
+  const bool id = (sn.docids == cl.docids);
+  if (!id) *all_identical = false;
+  std::printf("\n[%s] hits=%zu identical=%s\n", s.id.c_str(), sn.docids.size(),
+              id ? "YES" : "NO");
+  std::printf("  CLucene gold: serial_rounds=%-5llu range_gets=%-5llu bytes=%-11llu\n",
+              static_cast<unsigned long long>(cl.metrics.serial_rounds),
+              static_cast<unsigned long long>(cl.metrics.range_gets),
+              static_cast<unsigned long long>(cl.metrics.total_request_bytes));
+  std::printf("  SNII    gold: serial_rounds=%-5llu range_gets=%-5llu bytes=%-11llu\n",
+              static_cast<unsigned long long>(sn.metrics.serial_rounds),
+              static_cast<unsigned long long>(sn.metrics.range_gets),
+              static_cast<unsigned long long>(sn.metrics.total_request_bytes));
+  std::printf("  ratio(CL/SNII): serial_rounds=%.2f range_gets=%.2f bytes=%.2f\n",
+              ratio(cl.metrics.serial_rounds, sn.metrics.serial_rounds),
+              ratio(cl.metrics.range_gets, sn.metrics.range_gets),
+              ratio(cl.metrics.total_request_bytes, sn.metrics.total_request_bytes));
+  print_latency_row("CLucene", cl.latency_ms);
+  print_latency_row("SNII", sn.latency_ms);
+  const double sl = lat_stats(sn.latency_ms).median;
+  const double clm = lat_stats(cl.latency_ms).median;
+  std::printf("  latency ratio(CL/SNII): median=%.2f\n", sl > 0 ? clm / sl : 0.0);
+}
+
+// Enriched scenario suite (local): build both engines from the corpus, resolve the
+// df-calibrated catalog, run every scenario on both, compare docids + the three
+// gold metrics + latency. Corpus from parquet (--parquet-file) or synthetic.
+int run_scenario_mode(const Args& args) {
+  const uint32_t threads =
+      args.threads != 0 ? args.threads
+                        : std::max(1u, std::thread::hardware_concurrency());
+  bench::Corpus corpus;
+  if (!args.parquet_file.empty()) {
+    uint64_t raw = 0;
+    double tc = 0, tw = 0;
+    if (!load_and_tokenize(args, threads, &corpus, &raw, &tc, &tw)) return 1;
+    std::printf("scenario corpus: parquet docs=%u vocab=%zu\n", corpus.doc_count,
+                corpus.vocab.size());
+  } else {
+    corpus = bench::generate(args.docs, args.vocab, args.zipf, args.doclen, args.seed);
+    std::printf("scenario corpus: synthetic docs=%u vocab=%zu\n", corpus.doc_count,
+                corpus.vocab.size());
+  }
+
+  bench::SniiAdapter snii_idx;
+  bench::CluceneAdapter cl_idx;
+  apply_spill(snii_idx, args.spill_mib);
+  apply_spill(cl_idx, args.spill_mib);
+  const std::string out =
+      args.out_dir.empty() ? std::string("/mnt/disk15/jiangkai/e2e_data/scenario")
+                           : args.out_dir;
+  try {
+    snii_idx.build_at(out + "/snii/index.idx", corpus, args.keep_index);
+    cl_idx.build_at(out + "/clucene", corpus, args.keep_index);
+  } catch (const std::exception& e) {
+    std::fprintf(stderr, "FATAL: scenario build failed: %s\n", e.what());
+    return 1;
+  }
+
+  const std::vector<Scenario> scenarios = resolve_scenarios(corpus);
+  const uint32_t R = std::max(args.runs, 5u);
+  std::printf("=== scenario suite (local cost-model + wall, %zu scenarios, runs=%u) ===\n",
+              scenarios.size(), R);
+  bool all_identical = true;
+  for (const Scenario& s : scenarios) {
+    EngineQueryResult sn, cl;
+    try {
+      sn = run_query_n(snii_idx, s.is_phrase, s.term, s.words, R);
+      cl = run_query_n(cl_idx, s.is_phrase, s.term, s.words, R);
+    } catch (const std::exception& e) {
+      std::fprintf(stderr, "FATAL: scenario %s: %s\n", s.id.c_str(), e.what());
+      return 1;
+    }
+    report_scenario(s, sn, cl, &all_identical);
+  }
+  std::printf("\nresult: %s (%zu scenarios)\n",
+              all_identical ? "ALL DOCIDS IDENTICAL (SNII == CLucene)"
+                            : "DOCID MISMATCH",
+              scenarios.size());
+  return all_identical ? 0 : 1;
+}
+
 }  // namespace
 
 int main(int argc, char** argv) {
@@ -1307,6 +1422,11 @@ int main(int argc, char** argv) {
   mallopt(M_TRIM_THRESHOLD, 128 * 1024);
 
   const Args args = parse_args(argc, argv);
+
+  // Enriched scenario suite (build both engines + run the df-calibrated catalog).
+  if (args.scenarios) {
+    return run_scenario_mode(args);
+  }
 
   // Query-only mode: benchmark queries over a persisted index dir (no build).
   if (!args.query_dir.empty()) {
