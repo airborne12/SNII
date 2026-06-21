@@ -34,6 +34,25 @@ class SniiAdapter {
   // (tokenized docs+positions). Set before build_at/build_range.
   void set_docs_only(bool v) { docs_only_ = v; }
 
+  // One logical index in a multi-index container: its own corpus (vocab + docs),
+  // a unique suffix, and whether it is keyword (docs-only) or tokenized.
+  struct LogicalSpec {
+    const Corpus* corpus;
+    std::string suffix;
+    bool docs_only;
+  };
+
+  // Builds ONE container at `path` holding multiple logical indexes (index_id =
+  // 1..N in spec order), e.g. several tokenized fields or a tokenized + keyword
+  // mix. Opens index_id 1 for reading; use open_logical to query another. Throws
+  // std::runtime_error on failure.
+  void build_multi(const std::string& path, const std::vector<LogicalSpec>& specs,
+                   bool keep_on_disk);
+
+  // Re-points the active reader to logical index (index_id, suffix) in the open
+  // container so term_query/phrase_query/etc. address that field. Throws on error.
+  void open_logical(uint32_t index_id, const std::string& suffix);
+
   // Builds the index at a temporary path and opens it for reading. Throws
   // std::runtime_error on any failure (writer, reader, or open_index).
   void build_and_open(const Corpus& c);

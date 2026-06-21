@@ -114,6 +114,62 @@ void SniiAdapter::build_range(const std::string& path, const Corpus& c,
   open_reader();
 }
 
+void SniiAdapter::build_multi(const std::string& path,
+                             const std::vector<LogicalSpec>& specs,
+                             bool keep_on_disk) {
+  using namespace snii;
+  using snii::format::IndexConfig;
+  using snii::writer::SniiCompoundWriter;
+  using snii::writer::SniiIndexInput;
+  using snii::writer::SpimiTermBuffer;
+
+  if (specs.empty()) throw std::runtime_error("SNII adapter: build_multi no specs");
+  path_ = path;
+  keep_path_ = keep_on_disk;
+  if (const auto parent = std::filesystem::path(path_).parent_path();
+      !parent.empty()) {
+    std::error_code ec;
+    std::filesystem::create_directories(parent, ec);
+    if (ec) throw std::runtime_error("SNII adapter: mkdir " + parent.string() +
+                                     ": " + ec.message());
+  }
+  io::LocalFileWriter writer;
+  if (Status s = writer.open(path_); !s.ok()) fail("open writer", s);
+  SniiCompoundWriter compound(&writer);
+  // Each logical index gets its own SPIMI buffer; add_logical_index builds it
+  // immediately (consumes term_source), so the buffer is freed before the next.
+  uint32_t index_id = 1;
+  for (const LogicalSpec& spec : specs) {
+    const Corpus& c = *spec.corpus;
+    SpimiTermBuffer buf(&c.vocab, /*has_positions=*/!spec.docs_only,
+                        spill_threshold_bytes_);
+    for (uint32_t d = 0; d < c.doc_count; ++d) {
+      const auto& toks = c.docs[d];
+      for (uint32_t pos = 0; pos < toks.size(); ++pos) buf.add_token(toks[pos], d, pos);
+    }
+    SniiIndexInput in;
+    in.index_id = index_id++;
+    in.index_suffix = spec.suffix;
+    in.config = spec.docs_only ? IndexConfig::kDocsOnly : IndexConfig::kDocsPositions;
+    in.doc_count = c.doc_count;
+    in.term_source = &buf;
+    in.target_dict_block_bytes = 64 * 1024;
+    if (Status s = compound.add_logical_index(in); !s.ok())
+      fail("add index " + spec.suffix, s);
+  }
+  if (Status s = compound.finish(); !s.ok()) fail("finish writer", s);
+  open_reader();  // opens index_id 1; use open_logical for others
+}
+
+void SniiAdapter::open_logical(uint32_t index_id, const std::string& suffix) {
+  using namespace snii;
+  if (segment_ == nullptr) throw std::runtime_error("SNII adapter: no open segment");
+  index_ = std::make_unique<reader::LogicalIndexReader>();
+  if (Status s = segment_->open_index(index_id, suffix, index_.get()); !s.ok()) {
+    fail("open logical index " + suffix, s);
+  }
+}
+
 void SniiAdapter::open_existing(const std::string& path) {
   path_ = path;
   keep_path_ = true;  // we did not create it; never delete it on destruction

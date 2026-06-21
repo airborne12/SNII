@@ -75,6 +75,7 @@ struct Args {
   uint32_t shard_docs = 0;    // SNII: docs per segment (0 = single segment)
   bool scenarios = false;     // run the enriched scenario catalog (build + compare)
   bool keyword = false;       // run the non-tokenized (keyword) docs-only comparison
+  bool multi_index = false;   // run the SNII multi-logical-index write self-check
 };
 
 Args parse_args(int argc, char** argv) {
@@ -144,6 +145,8 @@ Args parse_args(int argc, char** argv) {
       a.scenarios = true;
     } else if (flag == "--keyword") {
       a.keyword = true;
+    } else if (flag == "--multi-index") {
+      a.multi_index = true;
     } else {
       std::fprintf(stderr, "unknown argument: %s\n", flag.c_str());
       std::exit(2);
@@ -1395,6 +1398,115 @@ void report_scenario(const Scenario& s, const EngineQueryResult& sn,
   std::printf("  latency ratio(CL/SNII): median=%.2f\n", sl > 0 ? clm / sl : 0.0);
 }
 
+// SNII multi-index WRITE test: one container holds multiple logical indexes
+// (tokenized Body + keyword ServiceName). Verifies each field, queried from the
+// multi-container, returns EXACTLY the same docids as a single-field index built
+// alone (multi-write does not corrupt any index), and reports the container size
+// vs the sum of single indexes. Corpus from parquet (Body + ServiceName) or synthetic.
+int run_multi_index_mode(const Args& args) {
+  const uint32_t threads =
+      args.threads != 0 ? args.threads
+                        : std::max(1u, std::thread::hardware_concurrency());
+  bench::Corpus body, service;
+  if (!args.parquet_file.empty()) {
+    std::vector<std::string> bodies, svcs;
+    try {
+      bodies = bench::read_text_column(args.parquet_file, "Body", args.docs);
+      svcs = bench::read_text_column(args.parquet_file, "ServiceName", args.docs);
+    } catch (const std::exception& e) {
+      std::fprintf(stderr, "FATAL: parquet read failed: %s\n", e.what());
+      return 1;
+    }
+    const size_t n = std::min(bodies.size(), svcs.size());
+    bodies.resize(n);
+    svcs.resize(n);
+    for (std::string& v : svcs)
+      for (char& ch : v)
+        ch = static_cast<char>(std::tolower(static_cast<unsigned char>(ch)));
+    body = bench::tokenize_corpus(bodies, threads);
+    service = bench::keyword_corpus(svcs);
+  } else {
+    body = bench::generate(args.docs, args.vocab, args.zipf, args.doclen, args.seed);
+    static const char* kSvc[] = {"frontend", "cartservice", "checkoutservice",
+                                 "paymentservice", "shippingservice"};
+    std::vector<std::string> svcs(body.doc_count);
+    for (uint32_t i = 0; i < body.doc_count; ++i) svcs[i] = kSvc[i % 5];
+    service = bench::keyword_corpus(svcs);
+  }
+  std::printf("multi-index corpus: docs=%u body_vocab=%zu service_vocab=%zu\n",
+              body.doc_count, body.vocab.size(), service.vocab.size());
+
+  const std::string out =
+      args.out_dir.empty() ? std::string("/mnt/disk15/jiangkai/e2e_data/multi")
+                           : args.out_dir;
+  bench::SniiAdapter multi;
+  apply_spill(multi, args.spill_mib);
+  std::vector<bench::SniiAdapter::LogicalSpec> specs = {
+      {&body, "body", /*docs_only=*/false},
+      {&service, "service", /*docs_only=*/true}};
+  bench::SniiAdapter single_body, single_service;
+  single_service.set_docs_only(true);
+  apply_spill(single_body, args.spill_mib);
+  apply_spill(single_service, args.spill_mib);
+  try {
+    multi.build_multi(out + "/multi.idx", specs, args.keep_index);
+    single_body.build_at(out + "/single_body.idx", body, args.keep_index);
+    single_service.build_at(out + "/single_service.idx", service, args.keep_index);
+  } catch (const std::exception& e) {
+    std::fprintf(stderr, "FATAL: multi-index build failed: %s\n", e.what());
+    return 1;
+  }
+
+  // Self-consistency: each field queried from the multi-container == single-built.
+  bool ok = true;
+  snii::io::IoMetrics m;
+  auto cmp = [&](const char* label, std::vector<uint32_t>& a,
+                 std::vector<uint32_t>& b) {
+    const bool eq = (a == b);
+    if (!eq) ok = false;
+    std::printf("  [%s] multi=%zu single=%zu %s\n", label, a.size(), b.size(),
+                eq ? "IDENTICAL" : "MISMATCH");
+  };
+  // body field (tokenized): a high-df term + a real phrase.
+  const uint32_t bt = bench::term_in_df_bucket(body, 0.1, 0.5);
+  if (bt < body.vocab.size()) {
+    std::vector<uint32_t> a, b;
+    multi.open_logical(1, "body");
+    multi.term_query(body.vocab[bt], &a, &m);
+    single_body.term_query(body.vocab[bt], &b, &m);
+    cmp("body-term", a, b);
+    std::vector<std::string> ph = bench::extract_phrase(body, 3);
+    if (!ph.empty()) {
+      std::vector<uint32_t> pa, pb;
+      multi.phrase_query(ph, &pa, &m);
+      single_body.phrase_query(ph, &pb, &m);
+      cmp("body-phrase", pa, pb);
+    }
+  }
+  // service field (keyword docs-only): a high-df value.
+  const uint32_t st = bench::term_in_df_bucket(service, 0.1, 1.0);
+  if (st < service.vocab.size()) {
+    std::vector<uint32_t> a, b;
+    multi.open_logical(2, "service");
+    multi.term_query(service.vocab[st], &a, &m);
+    single_service.term_query(service.vocab[st], &b, &m);
+    cmp("service-term", a, b);
+  }
+
+  const uint64_t mb = multi.index_bytes();
+  const uint64_t sb = single_body.index_bytes();
+  const uint64_t ss = single_service.index_bytes();
+  std::printf("index bytes: multi=%llu  single(body=%llu + service=%llu = %llu)  multi/sum=%.3f\n",
+              static_cast<unsigned long long>(mb),
+              static_cast<unsigned long long>(sb),
+              static_cast<unsigned long long>(ss),
+              static_cast<unsigned long long>(sb + ss),
+              (sb + ss) ? static_cast<double>(mb) / static_cast<double>(sb + ss) : 0.0);
+  std::printf("\nresult: %s (SNII multi-index write self-consistency)\n",
+              ok ? "ALL FIELDS IDENTICAL (multi == single)" : "FIELD MISMATCH");
+  return ok ? 0 : 1;
+}
+
 // Non-tokenized (keyword) index comparison: each document's WHOLE field value is
 // one term. Both engines build a DOCS-ONLY index (SNII kDocsOnly; CLucene
 // omitTermFreqAndPositions) and answer exact-value lookups. Values are lowercased
@@ -1558,6 +1670,11 @@ int main(int argc, char** argv) {
   mallopt(M_TRIM_THRESHOLD, 128 * 1024);
 
   const Args args = parse_args(argc, argv);
+
+  // SNII multi-logical-index write self-consistency (tokenized + keyword mix).
+  if (args.multi_index) {
+    return run_multi_index_mode(args);
+  }
 
   // Non-tokenized (keyword) docs-only index comparison.
   if (args.keyword) {
