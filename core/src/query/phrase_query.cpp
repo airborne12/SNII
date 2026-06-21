@@ -3,6 +3,7 @@
 #include <algorithm>
 #include <cstdint>
 #include <iterator>
+#include <memory>
 #include <unordered_map>
 #include <utility>
 #include <vector>
@@ -60,30 +61,18 @@ struct TermPlan {
   FrqPreludeReader prelude;  // valid for windowed terms after round 1
 };
 
-// Decoded postings for one term: docid -> aligned position list. For windowed
-// terms this holds only the candidate docids that were located (a partial view).
+// Decoded postings for one term, candidate-aligned, in CSR layout: docids[i]'s
+// positions are pos_flat[pos_off[i] .. pos_off[i+1]). The flat layout replaces a
+// per-doc std::vector<uint32_t> (which dominated phrase CPU via per-doc malloc);
+// pos_flat/pos_off are flat uint32 buffers whose capacity is retained across decode
+// calls (clear()), so the survivor positions are gathered with ~no allocation.
 struct TermPostings {
-  std::vector<uint32_t> docids;                  // ascending
-  std::vector<std::vector<uint32_t>> positions;  // positions[i] for docids[i]
+  std::vector<uint32_t> docids;    // ascending
+  std::vector<uint32_t> pos_flat;  // all docs' positions concatenated
+  std::vector<uint32_t> pos_off;   // size docids.size()+1; pos_off[0]==0
 };
 
-// Decodes a full slim/inline posting (single dd region, win_base=0) from slices.
-// dd_region is the entry's dd region on-disk bytes; entry.dd_meta drives decode.
-Status DecodeFullPosting(const DictEntry& entry, Slice dd_region, Slice prx_window,
-                         TermPostings* out) {
-  SNII_RETURN_IF_ERROR(snii::format::decode_dd_region(dd_region, entry.dd_meta,
-                                                      /*win_base=*/0, &out->docids));
-  ByteSource psrc(prx_window);
-  SNII_RETURN_IF_ERROR(snii::format::read_prx_window(&psrc, &out->positions));
-  if (out->positions.size() != out->docids.size()) {
-    return Status::Corruption("phrase_query: prx/frq doc-count mismatch");
-  }
-  return Status::OK();
-}
-
-// Intersects two ascending docid sets, projecting the surviving docs of the
-// driver's postings; positions are kept for the driver term only here (callers
-// keep each term's own positions in its TermPostings).
+// Intersects two ascending docid sets.
 std::vector<uint32_t> IntersectSorted(const std::vector<uint32_t>& a,
                                       const std::vector<uint32_t>& b) {
   std::vector<uint32_t> out;
@@ -93,22 +82,25 @@ std::vector<uint32_t> IntersectSorted(const std::vector<uint32_t>& a,
   return out;
 }
 
-// Returns the position list aligned to docid (binary search; docid must exist).
-const std::vector<uint32_t>& PositionsFor(const TermPostings& post, uint32_t docid) {
+// [begin,end) of the doc's positions in the CSR (docid must exist in post.docids).
+std::pair<const uint32_t*, const uint32_t*> PositionsSpan(const TermPostings& post,
+                                                          uint32_t docid) {
   const auto it = std::lower_bound(post.docids.begin(), post.docids.end(), docid);
   const size_t i = static_cast<size_t>(it - post.docids.begin());
-  return post.positions[i];
+  return {post.pos_flat.data() + post.pos_off[i],
+          post.pos_flat.data() + post.pos_off[i + 1]};
 }
 
 // Checks term[0]@p, term[1]@p+1, ... consecutively in docid across ordered posts.
 bool PhraseInDoc(const std::vector<const TermPostings*>& posts, uint32_t docid) {
-  const std::vector<uint32_t>& first = PositionsFor(*posts[0], docid);
-  for (uint32_t start : first) {
+  const auto first = PositionsSpan(*posts[0], docid);
+  for (const uint32_t* pp = first.first; pp != first.second; ++pp) {
+    const uint32_t start = *pp;
     bool ok = true;
     for (size_t t = 1; t < posts.size(); ++t) {
-      const std::vector<uint32_t>& ps = PositionsFor(*posts[t], docid);
+      const auto ps = PositionsSpan(*posts[t], docid);
       const uint32_t want = start + static_cast<uint32_t>(t);
-      if (!std::binary_search(ps.begin(), ps.end(), want)) {
+      if (!std::binary_search(ps.first, ps.second, want)) {
         ok = false;
         break;
       }
@@ -194,43 +186,6 @@ Status OpenPreludes(const snii::io::BatchRangeFetcher& fetcher,
   return Status::OK();
 }
 
-// Materializes a slim/inline term's full posting from round-1 results.
-Status MaterializeFlat(const snii::io::BatchRangeFetcher& fetcher, const TermPlan& p,
-                       TermPostings* out) {
-  if (p.pod_ref) {
-    return DecodeFullPosting(p.entry, fetcher.get(p.frq_handle),
-                             fetcher.get(p.prx_handle), out);
-  }
-  Slice dd_region;
-  SNII_RETURN_IF_ERROR(InlineDdRegion(p.entry, &dd_region));
-  return DecodeFullPosting(p.entry, dd_region, Slice(p.entry.prx_bytes), out);
-}
-
-// Fully materializes a windowed term (driver path): decode every window. Phrase
-// needs docids + positions but NOT freqs (want_freq=false): each window fetches
-// only its docs-only .frq prefix while .prx is fetched in full.
-Status MaterializeWindowedFull(const LogicalIndexReader& idx, const TermPlan& p,
-                               TermPostings* out) {
-  snii::reader::DecodedPosting posting;
-  SNII_RETURN_IF_ERROR(snii::reader::read_windowed_posting(
-      idx, p.entry, p.frq_base, p.prx_base, /*want_positions=*/true,
-      /*want_freq=*/false, &posting));
-  out->docids = std::move(posting.docids);
-  out->positions = std::move(posting.positions);
-  if (out->positions.size() != out->docids.size()) {
-    return Status::Corruption("phrase_query: windowed prx/frq doc-count mismatch");
-  }
-  return Status::OK();
-}
-
-// Materializes any driver term (windowed full-decode or slim/inline flat decode).
-Status MaterializeDriver(const LogicalIndexReader& idx,
-                         const snii::io::BatchRangeFetcher& round1, const TermPlan& p,
-                         TermPostings* out) {
-  if (p.windowed) return MaterializeWindowedFull(idx, p, out);
-  return MaterializeFlat(round1, p, out);
-}
-
 // Collects (deduplicated, ascending) the windows of a windowed term that cover
 // the given candidate docids. Candidates beyond the term's last docid are simply
 // not located (the term cannot match them).
@@ -253,66 +208,185 @@ Status SelectCoveringWindows(const FrqPreludeReader& prelude,
   return Status::OK();
 }
 
-// Plans + fetches only the selected windows of a windowed term (round 2..N), then
-// decodes them into a candidate-aligned posting. The covering windows are read
-// instead of the full posting -- this is the byte-saving core.
-Status MaterializeWindowedSkipped(const LogicalIndexReader& idx, const TermPlan& p,
-                                  const std::vector<uint32_t>& windows,
-                                  TermPostings* out) {
-  // Same-term multi-window batch: coalesce near-contiguous dd sub-ranges (and prx)
-  // into fewer GETs. The dd regions live contiguously in the dd-block, so selected
-  // windows' dd sub-ranges merge well under the coalesce gap.
-  snii::io::BatchRangeFetcher fetcher(idx.reader(),
-                                      snii::reader::kSameTermCoalesceGap);
+// Retained position source for a NON-driver term after Phase A (docid narrowing):
+// the FETCHED covering-window slices (windowed) or the flat dd/prx slices
+// (slim/inline), so Phase B can decode positions ONLY for the final surviving
+// candidates instead of for every doc the term touches. The referenced byte slices
+// live in `round1` / the per-term fetchers kept alive in NarrowCandidates::owners.
+struct PosSource {
+  bool windowed = false;
+  const DictEntry* entry = nullptr;  // points into the plan (alive for the query)
+  // windowed: one entry per fetched covering window (slices reference a fetcher).
+  std::vector<WindowMeta> metas;
+  std::vector<Slice> dd_slices;
+  std::vector<Slice> prx_slices;
+  // slim/inline:
+  Slice flat_dd;
+  Slice flat_prx;
+};
+
+// Phase A (windowed term): fetch the given `windows` (dd + prx in one batch),
+// decode DOCIDS ONLY (no positions -> no per-doc allocation) into *term_docids, and
+// retain the fetched window slices in *src for the Phase-B positions pass. The
+// fetcher is moved into *owners so the slices stay valid. For the driver `windows`
+// is every window (its full docid set); for a narrowing term it is only the windows
+// covering the current candidates. The fetch (dd + prx in one batch) matches the
+// previous one-pass path, so the I/O metrics are unchanged -- only the position
+// DECODE is deferred to the survivors.
+Status DecodeWindowedDocids(
+    const LogicalIndexReader& idx, const TermPlan& p,
+    const std::vector<uint32_t>& windows,
+    std::vector<std::unique_ptr<snii::io::BatchRangeFetcher>>* owners,
+    PosSource* src, std::vector<uint32_t>* term_docids) {
+  auto fetcher = std::make_unique<snii::io::BatchRangeFetcher>(
+      idx.reader(), snii::reader::kSameTermCoalesceGap);
   std::vector<std::pair<size_t, size_t>> handles;  // (dd_handle, prx_handle)
   std::vector<WindowMeta> metas;
   handles.reserve(windows.size());
   metas.reserve(windows.size());
   for (uint32_t w : windows) {
     snii::reader::WindowAbsRange r;
-    // Phrase needs positions, not freqs: fetch only the dd sub-range + .prx window.
     SNII_RETURN_IF_ERROR(snii::reader::windowed_window_range(
         idx, p.entry, p.frq_base, p.prx_base, p.prelude, w,
         /*want_positions=*/true, /*want_freq=*/false, &r));
     WindowMeta m;
     SNII_RETURN_IF_ERROR(p.prelude.window(w, &m));
-    const size_t dh = fetcher.add(r.dd_off, static_cast<size_t>(r.dd_len));
-    const size_t ph = fetcher.add(r.prx_off, static_cast<size_t>(r.prx_len));
+    const size_t dh = fetcher->add(r.dd_off, static_cast<size_t>(r.dd_len));
+    const size_t ph = fetcher->add(r.prx_off, static_cast<size_t>(r.prx_len));
     handles.emplace_back(dh, ph);
     metas.push_back(m);
   }
-  if (fetcher.pending() > 0) SNII_RETURN_IF_ERROR(fetcher.fetch());
+  if (fetcher->pending() > 0) SNII_RETURN_IF_ERROR(fetcher->fetch());
 
+  src->windowed = true;
   for (size_t k = 0; k < metas.size(); ++k) {
     std::vector<uint32_t> docids, freqs;
-    std::vector<std::vector<uint32_t>> pos;
+    std::vector<std::vector<uint32_t>> pos;  // stays empty (want_positions=false)
     SNII_RETURN_IF_ERROR(snii::reader::decode_window_slices(
-        metas[k], fetcher.get(handles[k].first), Slice(),
-        fetcher.get(handles[k].second), /*want_positions=*/true,
-        /*want_freq=*/false, &docids, &freqs, &pos));
-    for (size_t i = 0; i < docids.size(); ++i) {
-      out->docids.push_back(docids[i]);
-      out->positions.push_back(std::move(pos[i]));
+        metas[k], fetcher->get(handles[k].first), Slice(), Slice(),
+        /*want_positions=*/false, /*want_freq=*/false, &docids, &freqs, &pos));
+    for (uint32_t d : docids) term_docids->push_back(d);
+    src->metas.push_back(metas[k]);
+    src->dd_slices.push_back(fetcher->get(handles[k].first));
+    src->prx_slices.push_back(fetcher->get(handles[k].second));
+  }
+  owners->push_back(std::move(fetcher));  // unique_ptr move keeps the buffer fixed
+  return Status::OK();
+}
+
+// Phase A (slim/inline term): decode DOCIDS ONLY from the round-1 dd region into
+// *term_docids, and retain the dd/prx slices in *src for Phase B.
+Status DecodeFlatDocids(const snii::io::BatchRangeFetcher& round1, const TermPlan& p,
+                        PosSource* src, std::vector<uint32_t>* term_docids) {
+  src->windowed = false;
+  src->entry = &p.entry;
+  if (p.pod_ref) {
+    src->flat_dd = round1.get(p.frq_handle);
+    src->flat_prx = round1.get(p.prx_handle);
+  } else {
+    SNII_RETURN_IF_ERROR(InlineDdRegion(p.entry, &src->flat_dd));
+    src->flat_prx = Slice(p.entry.prx_bytes);
+  }
+  SNII_RETURN_IF_ERROR(snii::format::decode_dd_region(
+      src->flat_dd, p.entry.dd_meta, /*win_base=*/0, term_docids));
+  return Status::OK();
+}
+
+// All windows of a windowed term in ascending order (the driver reads its full
+// docid set; a narrowing term reads only SelectCoveringWindows).
+std::vector<uint32_t> AllWindows(const FrqPreludeReader& prelude) {
+  std::vector<uint32_t> ws(prelude.n_windows());
+  for (uint32_t i = 0; i < prelude.n_windows(); ++i) ws[i] = i;
+  return ws;
+}
+
+// Appends doc-source-index `si`'s positions (CSR span [soff[si],soff[si+1]) of
+// sflat) as candidate `ci`'s positions in the output CSR.
+inline void AppendSpan(const std::vector<uint32_t>& sflat,
+                       const std::vector<uint32_t>& soff, size_t si, size_t ci,
+                       TermPostings* out) {
+  out->pos_off[ci] = static_cast<uint32_t>(out->pos_flat.size());
+  for (uint32_t j = soff[si]; j < soff[si + 1]; ++j) out->pos_flat.push_back(sflat[j]);
+  out->pos_off[ci + 1] = static_cast<uint32_t>(out->pos_flat.size());
+}
+
+// Phase B (windowed): decode positions for the FINAL candidates only, from the
+// retained covering windows, into the output CSR. Each window's positions are
+// decoded into a FLAT buffer (read_prx_window_csr -- no per-doc allocation) and
+// only the surviving candidates' spans are copied out. Windows with no surviving
+// candidate are skipped entirely (the dominant decode saving for the lazily-read
+// driver). Windows + candidates are ascending, so one forward merge suffices.
+Status MaterializeCandidatePositionsWindowed(const PosSource& src,
+                                             const std::vector<uint32_t>& candidates,
+                                             TermPostings* out) {
+  out->docids = candidates;
+  out->pos_flat.clear();
+  out->pos_off.assign(candidates.size() + 1, 0);
+  size_t ci = 0;
+  for (size_t k = 0; k < src.metas.size() && ci < candidates.size(); ++k) {
+    if (candidates[ci] > src.metas[k].last_docid) continue;  // no survivor here
+    std::vector<uint32_t> wdocids, wfreqs;
+    std::vector<std::vector<uint32_t>> wpos_unused;  // stays empty
+    SNII_RETURN_IF_ERROR(snii::reader::decode_window_slices(
+        src.metas[k], src.dd_slices[k], Slice(), Slice(),
+        /*want_positions=*/false, /*want_freq=*/false, &wdocids, &wfreqs,
+        &wpos_unused));
+    std::vector<uint32_t> wflat, woff;
+    ByteSource psrc(src.prx_slices[k]);
+    SNII_RETURN_IF_ERROR(snii::format::read_prx_window_csr(&psrc, &wflat, &woff));
+    if (woff.size() != wdocids.size() + 1) {
+      return Status::Corruption("phrase_query: window prx/dd doc-count mismatch");
+    }
+    size_t di = 0;
+    while (di < wdocids.size() && ci < candidates.size()) {
+      if (wdocids[di] < candidates[ci]) {
+        ++di;
+      } else if (wdocids[di] == candidates[ci]) {
+        AppendSpan(wflat, woff, di, ci, out);
+        ++di;
+        ++ci;
+      } else {
+        out->pos_off[ci + 1] = out->pos_off[ci];  // unreachable for valid input
+        ++ci;
+      }
     }
   }
+  for (; ci < candidates.size(); ++ci) out->pos_off[ci + 1] = out->pos_off[ci];
   return Status::OK();
 }
 
-// Narrows candidates by a windowed term, reading only covering windows.
-Status NarrowByWindowed(const LogicalIndexReader& idx, const TermPlan& p,
-                        std::vector<uint32_t>* candidates, TermPostings* out) {
-  std::vector<uint32_t> windows;
-  SNII_RETURN_IF_ERROR(SelectCoveringWindows(p.prelude, *candidates, &windows));
-  SNII_RETURN_IF_ERROR(MaterializeWindowedSkipped(idx, p, windows, out));
-  *candidates = IntersectSorted(*candidates, out->docids);
-  return Status::OK();
-}
-
-// Narrows candidates by a slim/inline term (its full posting was read in round 1).
-Status NarrowByFlat(const snii::io::BatchRangeFetcher& round1, const TermPlan& p,
-                    std::vector<uint32_t>* candidates, TermPostings* out) {
-  SNII_RETURN_IF_ERROR(MaterializeFlat(round1, p, out));
-  *candidates = IntersectSorted(*candidates, out->docids);
+// Phase B (slim/inline): decode the full posting's docids + positions (positions
+// into a FLAT CSR -- no per-doc allocation), then copy only the final candidates'
+// spans into the output CSR.
+Status MaterializeCandidatePositionsFlat(const PosSource& src,
+                                         const std::vector<uint32_t>& candidates,
+                                         TermPostings* out) {
+  std::vector<uint32_t> fdocids;
+  SNII_RETURN_IF_ERROR(snii::format::decode_dd_region(
+      src.flat_dd, src.entry->dd_meta, /*win_base=*/0, &fdocids));
+  std::vector<uint32_t> fflat, foff;
+  ByteSource psrc(src.flat_prx);
+  SNII_RETURN_IF_ERROR(snii::format::read_prx_window_csr(&psrc, &fflat, &foff));
+  if (foff.size() != fdocids.size() + 1) {
+    return Status::Corruption("phrase_query: slim prx/dd doc-count mismatch");
+  }
+  out->docids = candidates;
+  out->pos_flat.clear();
+  out->pos_off.assign(candidates.size() + 1, 0);
+  size_t di = 0, ci = 0;
+  while (di < fdocids.size() && ci < candidates.size()) {
+    if (fdocids[di] < candidates[ci]) {
+      ++di;
+    } else if (fdocids[di] == candidates[ci]) {
+      AppendSpan(fflat, foff, di, ci, out);
+      ++di;
+      ++ci;
+    } else {
+      out->pos_off[ci + 1] = out->pos_off[ci];  // unreachable for valid input
+      ++ci;
+    }
+  }
+  for (; ci < candidates.size(); ++ci) out->pos_off[ci + 1] = out->pos_off[ci];
   return Status::OK();
 }
 
@@ -326,27 +400,58 @@ std::vector<size_t> AscendingDfOrder(const std::vector<TermPlan>& plans) {
   return order;
 }
 
-// Lead-term-driven narrowing: fully materialize the driver, then narrow the
-// candidate set by every other term (windowed terms read only covering windows).
+// Lead-term-driven narrowing in TWO phases. EVERY term (the driver included) is
+// read DOCID-ONLY in Phase A; positions are decoded in Phase B ONLY for the final
+// surviving candidates -- so no term, not even the driver, allocates a position
+// vector for a doc that the phrase conjunction rejects. The fetch pattern matches
+// the previous one-pass path (dd + prx batched per term), so the I/O metrics are
+// unchanged; only position-decode CPU + allocation move to the survivor set.
 Status NarrowCandidates(const LogicalIndexReader& idx,
                         const snii::io::BatchRangeFetcher& round1,
                         const std::vector<TermPlan>& plans,
                         std::vector<TermPostings>* posts,
                         std::vector<uint32_t>* candidates) {
   const std::vector<size_t> order = AscendingDfOrder(plans);
+  std::vector<PosSource> srcs(plans.size());
+  std::vector<std::unique_ptr<snii::io::BatchRangeFetcher>> owners;
+
+  // Phase A: docid-only. Driver (k==0) reads its full docid set; each later term
+  // reads only the windows / posting covering the running candidate set.
   for (size_t k = 0; k < order.size(); ++k) {
     const size_t ti = order[k];
     const TermPlan& p = plans[ti];
-    TermPostings* out = &(*posts)[ti];
-    if (k == 0) {
-      SNII_RETURN_IF_ERROR(MaterializeDriver(idx, round1, p, out));
-      *candidates = out->docids;
-    } else if (p.windowed) {
-      SNII_RETURN_IF_ERROR(NarrowByWindowed(idx, p, candidates, out));
+    std::vector<uint32_t> term_docids;
+    if (p.windowed) {
+      std::vector<uint32_t> windows;
+      if (k == 0) {
+        windows = AllWindows(p.prelude);
+      } else {
+        SNII_RETURN_IF_ERROR(
+            SelectCoveringWindows(p.prelude, *candidates, &windows));
+      }
+      SNII_RETURN_IF_ERROR(
+          DecodeWindowedDocids(idx, p, windows, &owners, &srcs[ti], &term_docids));
     } else {
-      SNII_RETURN_IF_ERROR(NarrowByFlat(round1, p, candidates, out));
+      SNII_RETURN_IF_ERROR(DecodeFlatDocids(round1, p, &srcs[ti], &term_docids));
     }
-    if (candidates->empty()) break;
+    if (k == 0) {
+      *candidates = std::move(term_docids);
+    } else {
+      *candidates = IntersectSorted(*candidates, term_docids);
+    }
+    if (candidates->empty()) return Status::OK();  // no survivors -> no positions
+  }
+
+  // Phase B: positions for the final candidates of EVERY term.
+  for (size_t k = 0; k < order.size(); ++k) {
+    const size_t ti = order[k];
+    if (srcs[ti].windowed) {
+      SNII_RETURN_IF_ERROR(
+          MaterializeCandidatePositionsWindowed(srcs[ti], *candidates, &(*posts)[ti]));
+    } else {
+      SNII_RETURN_IF_ERROR(
+          MaterializeCandidatePositionsFlat(srcs[ti], *candidates, &(*posts)[ti]));
+    }
   }
   return Status::OK();
 }

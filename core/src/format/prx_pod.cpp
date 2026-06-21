@@ -229,6 +229,76 @@ Status decode_payload(Slice plain, std::vector<std::vector<uint32_t>>* out) {
   return Status::OK();
 }
 
+// CSR decode of a PFOR payload: all docs' positions into one flat buffer + per-doc
+// offsets, with NO per-doc std::vector allocation. `pos_off` has doc_count+1 entries
+// (pos_off[0]==0); doc d's positions are pos_flat[pos_off[d] .. pos_off[d+1]).
+Status decode_pfor_payload_csr(Slice plain, std::vector<uint32_t>* pos_flat,
+                               std::vector<uint32_t>* pos_off) {
+  ByteSource src(plain);
+  uint32_t doc_count = 0, total_pos = 0;
+  SNII_RETURN_IF_ERROR(src.get_varint32(&doc_count));
+  SNII_RETURN_IF_ERROR(src.get_varint32(&total_pos));
+  if (total_pos > kMaxWindowPositions) {
+    return Status::Corruption("prx: position count exceeds sane cap");
+  }
+  if (doc_count > kMaxWindowDocs) {
+    return Status::Corruption("prx: doc count exceeds sane cap");
+  }
+  std::vector<uint32_t> pos_counts;
+  SNII_RETURN_IF_ERROR(decode_pfor_runs(&src, doc_count, &pos_counts));
+  uint64_t sum = 0;
+  for (uint32_t d = 0; d < doc_count; ++d) sum += pos_counts[d];
+  if (sum != total_pos) return Status::Corruption("prx: pos_count sum mismatch");
+  std::vector<uint32_t> deltas;
+  SNII_RETURN_IF_ERROR(decode_pfor_runs(&src, total_pos, &deltas));
+  pos_flat->clear();      // clear keeps capacity -> reusable, no per-doc malloc
+  pos_off->clear();
+  pos_flat->reserve(total_pos);
+  pos_off->reserve(static_cast<size_t>(doc_count) + 1);
+  pos_off->push_back(0);
+  size_t off = 0;
+  for (uint32_t d = 0; d < doc_count; ++d) {
+    uint32_t prev = 0;
+    for (uint32_t i = 0; i < pos_counts[d]; ++i) {
+      prev = (i == 0) ? deltas[off + i] : prev + deltas[off + i];
+      pos_flat->push_back(prev);
+    }
+    off += pos_counts[d];
+    pos_off->push_back(static_cast<uint32_t>(pos_flat->size()));
+  }
+  if (!src.eof()) return Status::Corruption("prx: trailing bytes after pfor payload");
+  return Status::OK();
+}
+
+// CSR decode of a plain (raw) payload. See decode_pfor_payload_csr.
+Status decode_payload_csr(Slice plain, std::vector<uint32_t>* pos_flat,
+                          std::vector<uint32_t>* pos_off) {
+  ByteSource src(plain);
+  uint32_t doc_count = 0;
+  SNII_RETURN_IF_ERROR(src.get_varint32(&doc_count));
+  if (doc_count > kMaxWindowDocs) {
+    return Status::Corruption("prx: doc count exceeds sane cap");
+  }
+  pos_flat->clear();
+  pos_off->clear();
+  pos_off->reserve(static_cast<size_t>(doc_count) + 1);
+  pos_off->push_back(0);
+  for (uint32_t d = 0; d < doc_count; ++d) {
+    uint32_t pos_count = 0;
+    SNII_RETURN_IF_ERROR(src.get_varint32(&pos_count));
+    uint32_t prev = 0;
+    for (uint32_t i = 0; i < pos_count; ++i) {
+      uint32_t delta = 0;
+      SNII_RETURN_IF_ERROR(src.get_varint32(&delta));
+      prev = (i == 0) ? delta : prev + delta;
+      pos_flat->push_back(prev);
+    }
+    pos_off->push_back(static_cast<uint32_t>(pos_flat->size()));
+  }
+  if (!src.eof()) return Status::Corruption("prx: trailing bytes after payload");
+  return Status::OK();
+}
+
 // Decision: given level and plain length, determine whether to compress.
 bool should_compress(int level, size_t plain_len) {
   if (level == 0) return false;            // force raw
@@ -351,6 +421,26 @@ Status read_prx_window(ByteSource* source,
   std::vector<uint8_t> plain;
   SNII_RETURN_IF_ERROR(zstd_decompress(payload, uncomp_len, &plain));
   return decode_payload(Slice(plain), per_doc_positions);
+}
+
+Status read_prx_window_csr(ByteSource* source, std::vector<uint32_t>* pos_flat,
+                           std::vector<uint32_t>* pos_off) {
+  if (source == nullptr || pos_flat == nullptr || pos_off == nullptr) {
+    return Status::InvalidArgument("prx: null arg");
+  }
+  uint8_t codec = 0;
+  uint32_t uncomp_len = 0;
+  Slice payload;
+  SNII_RETURN_IF_ERROR(read_framed(source, &codec, &uncomp_len, &payload));
+  if (codec == static_cast<uint8_t>(PrxCodec::kPfor)) {
+    return decode_pfor_payload_csr(payload, pos_flat, pos_off);
+  }
+  if (codec == static_cast<uint8_t>(PrxCodec::kRaw)) {
+    return decode_payload_csr(payload, pos_flat, pos_off);
+  }
+  std::vector<uint8_t> plain;
+  SNII_RETURN_IF_ERROR(zstd_decompress(payload, uncomp_len, &plain));
+  return decode_payload_csr(Slice(plain), pos_flat, pos_off);
 }
 
 }  // namespace snii::format
