@@ -10,7 +10,9 @@
 #include <utility>
 
 #include "snii/format/format_constants.h"
+#include "snii/query/bm25_scorer.h"
 #include "snii/query/phrase_query.h"
+#include "snii/query/scoring_query.h"
 #include "snii/query/term_query.h"
 #include "snii/writer/snii_compound_writer.h"
 #include "snii/writer/spimi_term_buffer.h"
@@ -83,9 +85,19 @@ void SniiAdapter::build_range(const std::string& path, const Corpus& c,
   SniiIndexInput in;
   in.index_id = 1;
   in.index_suffix = "body";
-  in.config = docs_only_ ? IndexConfig::kDocsOnly : IndexConfig::kDocsPositions;
+  in.config = docs_only_  ? IndexConfig::kDocsOnly
+              : scoring_   ? IndexConfig::kDocsPositionsScoring
+                           : IndexConfig::kDocsPositions;
   in.doc_count = seg_docs;
   in.term_source = &buf;
+  // A scoring index needs per-doc length norms (BM25 length normalization); the
+  // doc length is its token count in [doc_lo, doc_hi).
+  if (scoring_) {
+    in.encoded_norms.resize(seg_docs);
+    for (uint32_t d = doc_lo; d < doc_hi; ++d)
+      in.encoded_norms[d - doc_lo] = snii::query::encode_norm(
+          static_cast<uint32_t>(c.docs[d].size()));
+  }
   // A larger DICT block target (64 KiB) yields far fewer blocks: it shrinks the
   // dict_block_directory (one BlockRef/block) and the sampled_term_index (one
   // sampled term/block) on disk, AND cuts the writer's per-block accumulation
@@ -191,6 +203,45 @@ void SniiAdapter::open_reader() {
   if (Status s = segment_->open_index(1, "body", index_.get()); !s.ok()) {
     fail("open logical index", s);
   }
+  // A scoring index carries norms; materialize the resident stats provider once so
+  // per-query scoring reads only postings (norms are resident metadata).
+  stats_.reset();
+  if (scoring_) {
+    stats_ = std::make_unique<snii::stats::SniiStatsProvider>();
+    if (Status s = snii::stats::SniiStatsProvider::open(index_.get(), stats_.get());
+        !s.ok()) {
+      fail("open stats provider", s);
+    }
+  }
+}
+
+void SniiAdapter::score_query(const std::vector<std::string>& terms, uint32_t k,
+                              ScorePath path, std::vector<ScoredHit>* out,
+                              snii::io::IoMetrics* metrics) {
+  using namespace snii;
+  if (stats_ == nullptr) {
+    throw std::runtime_error("SNII adapter: score_query needs a scoring index");
+  }
+  metered_->reset_metrics();
+  out->clear();
+  const query::Bm25Params params;  // k1=1.2, b=0.75
+  std::vector<query::ScoredDoc> hits;
+  Status s;
+  switch (path) {
+    case ScorePath::kExhaustive:
+      s = query::scoring_query_exhaustive(*index_, *stats_, terms, k, params, &hits);
+      break;
+    case ScorePath::kWand:
+      s = query::scoring_query_wand(*index_, *stats_, terms, k, params, &hits);
+      break;
+    case ScorePath::kWandSelective:
+      s = query::scoring_query_wand_selective(*index_, *stats_, terms, k, params, &hits);
+      break;
+  }
+  if (!s.ok()) fail("score_query", s);
+  out->reserve(hits.size());
+  for (const auto& h : hits) out->push_back({h.docid, h.score});
+  *metrics = metered_->metrics();
 }
 
 void SniiAdapter::term_query(const std::string& term,

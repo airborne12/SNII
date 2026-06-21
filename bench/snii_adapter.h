@@ -10,6 +10,7 @@
 #include "snii/io/metered_file_reader.h"
 #include "snii/reader/logical_index_reader.h"
 #include "snii/reader/snii_segment_reader.h"
+#include "snii/stats/snii_stats_provider.h"
 
 // SNII benchmark adapter: builds a single-segment .idx from a Corpus and exposes
 // metered term / phrase queries. Each query resets the metered reader first so
@@ -33,6 +34,26 @@ class SniiAdapter {
   // positions/freqs) for exact-match/range on whole-value terms. Default false
   // (tokenized docs+positions). Set before build_at/build_range.
   void set_docs_only(bool v) { docs_only_ = v; }
+
+  // Build a SCORING index (IndexConfig::kDocsPositionsScoring: docs+freq+positions
+  // + per-doc norms + stats) for BM25 top-K. Default false. Set before build_at.
+  void set_scoring(bool v) { scoring_ = v; }
+
+  // BM25 top-K retrieval path: exhaustive baseline, WAND block-max pruning, or
+  // selective-fetch WAND (reads only surviving windows). All three MUST return the
+  // same top-K (the design invariant); they differ only in I/O / scoring work.
+  enum class ScorePath { kExhaustive, kWand, kWandSelective };
+
+  // One scored hit (docid + BM25 score).
+  struct ScoredHit {
+    uint32_t docid;
+    double score;
+  };
+
+  // BM25 top-`k` over `terms` via `path`, filling `out` (score-desc, docid-tiebreak)
+  // and `metrics` (this query's I/O alone). Requires a scoring index. Throws on error.
+  void score_query(const std::vector<std::string>& terms, uint32_t k, ScorePath path,
+                   std::vector<ScoredHit>* out, snii::io::IoMetrics* metrics);
 
   // One logical index in a multi-index container: its own corpus (vocab + docs),
   // a unique suffix, and whether it is keyword (docs-only) or tokenized.
@@ -110,6 +131,8 @@ class SniiAdapter {
   bool keep_path_ = false;  // when true, the destructor leaves path_ on disk
   size_t spill_threshold_bytes_ = 0;  // 0 = unlimited (in-memory build)
   bool docs_only_ = false;            // true = keyword (docs-only, no positions)
+  bool scoring_ = false;              // true = scoring index (norms + stats)
+  std::unique_ptr<snii::stats::SniiStatsProvider> stats_;  // resident, for scoring
   std::unique_ptr<snii::io::LocalFileReader> local_;
   std::unique_ptr<snii::io::MeteredFileReader> metered_;
   std::unique_ptr<snii::reader::SniiSegmentReader> segment_;

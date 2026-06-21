@@ -76,6 +76,7 @@ struct Args {
   bool scenarios = false;     // run the enriched scenario catalog (build + compare)
   bool keyword = false;       // run the non-tokenized (keyword) docs-only comparison
   bool multi_index = false;   // run the SNII multi-logical-index write self-check
+  bool scoring = false;       // run the SNII BM25 scoring path-equivalence check
 };
 
 Args parse_args(int argc, char** argv) {
@@ -147,6 +148,8 @@ Args parse_args(int argc, char** argv) {
       a.keyword = true;
     } else if (flag == "--multi-index") {
       a.multi_index = true;
+    } else if (flag == "--scoring") {
+      a.scoring = true;
     } else {
       std::fprintf(stderr, "unknown argument: %s\n", flag.c_str());
       std::exit(2);
@@ -1398,6 +1401,102 @@ void report_scenario(const Scenario& s, const EngineQueryResult& sn,
   std::printf("  latency ratio(CL/SNII): median=%.2f\n", sl > 0 ? clm / sl : 0.0);
 }
 
+// SNII BM25 scoring path-equivalence (SCORE-PATH-EQUIV): builds a scoring index and
+// runs exhaustive / WAND / selective-WAND top-K for high-idf + low-idf term mixes.
+// All three MUST return the identical top-K (the design invariant); the I/O metrics
+// show the window block-max pruning benefit (bytes: exhaustive >= wand >= selective).
+// CLucene head-to-head is intentionally omitted: its searchable Similarity is TF-IDF
+// (DefaultSimilarity); BM25 lives only in the index-side BlockMaxBM25 path, so a fair
+// BM25 ranking comparison needs the Doris block-max query path (a separate follow-up).
+int run_scoring_mode(const Args& args) {
+  const uint32_t threads =
+      args.threads != 0 ? args.threads
+                        : std::max(1u, std::thread::hardware_concurrency());
+  bench::Corpus corpus;
+  if (!args.parquet_file.empty()) {
+    uint64_t raw = 0;
+    double tc = 0, tw = 0;
+    if (!load_and_tokenize(args, threads, &corpus, &raw, &tc, &tw)) return 1;
+  } else {
+    corpus = bench::generate(args.docs, args.vocab, args.zipf, args.doclen, args.seed);
+  }
+  std::printf("scoring corpus: docs=%u vocab=%zu\n", corpus.doc_count,
+              corpus.vocab.size());
+
+  bench::SniiAdapter idx;
+  idx.set_scoring(true);
+  apply_spill(idx, args.spill_mib);
+  const std::string out =
+      args.out_dir.empty() ? std::string("/mnt/disk15/jiangkai/e2e_data/scoring")
+                           : args.out_dir;
+  try {
+    idx.build_at(out + "/snii/index.idx", corpus, args.keep_index);
+  } catch (const std::exception& e) {
+    std::fprintf(stderr, "FATAL: scoring build failed: %s\n", e.what());
+    return 1;
+  }
+
+  auto vocab = [&](uint32_t t) {
+    return t < corpus.vocab.size() ? corpus.vocab[t] : std::string();
+  };
+  const std::string hi = vocab(bench::term_in_df_bucket(corpus, 0.1, 0.5));
+  const std::string mid = vocab(bench::mid_df_term(corpus));
+  const std::string lo = vocab(bench::low_df_term(corpus));
+  struct SQ {
+    std::string id;
+    std::vector<std::string> terms;
+  };
+  std::vector<SQ> queries;
+  if (!hi.empty() && !lo.empty()) queries.push_back({"SCORE-high+low", {hi, lo}});
+  if (!hi.empty() && !mid.empty() && !lo.empty())
+    queries.push_back({"SCORE-high+mid+low", {hi, mid, lo}});
+
+  using SP = bench::SniiAdapter::ScorePath;
+  using Hit = bench::SniiAdapter::ScoredHit;
+  auto eq = [](const std::vector<Hit>& a, const std::vector<Hit>& b) {
+    if (a.size() != b.size()) return false;
+    for (size_t i = 0; i < a.size(); ++i)
+      if (a[i].docid != b[i].docid || a[i].score != b[i].score) return false;
+    return true;
+  };
+  auto row = [](const char* name, const snii::io::IoMetrics& m) {
+    std::printf("  %-11s rounds=%-3llu gets=%-3llu bytes=%llu\n", name,
+                static_cast<unsigned long long>(m.serial_rounds),
+                static_cast<unsigned long long>(m.range_gets),
+                static_cast<unsigned long long>(m.total_request_bytes));
+  };
+
+  bool all_ok = true;
+  for (const SQ& q : queries) {
+    for (uint32_t k : {10u, 100u}) {
+      snii::io::IoMetrics me, mw, ms;
+      std::vector<Hit> ex, wa, ws;
+      try {
+        idx.score_query(q.terms, k, SP::kExhaustive, &ex, &me);
+        idx.score_query(q.terms, k, SP::kWand, &wa, &mw);
+        idx.score_query(q.terms, k, SP::kWandSelective, &ws, &ms);
+      } catch (const std::exception& e) {
+        std::fprintf(stderr, "FATAL: score_query %s: %s\n", q.id.c_str(), e.what());
+        return 1;
+      }
+      const bool identical = eq(ex, wa) && eq(ex, ws);
+      if (!identical) all_ok = false;
+      std::printf("\n[%s k=%u] topK=%zu path-equiv(exh==wand==sel)=%s\n",
+                  q.id.c_str(), k, ex.size(), identical ? "YES" : "NO");
+      row("exhaustive", me);
+      row("wand", mw);
+      row("wand_sel", ms);
+      std::printf("  selective prune vs exhaustive: bytes=%.2fx rounds=%.2fx\n",
+                  ratio(me.total_request_bytes, ms.total_request_bytes),
+                  ratio(me.serial_rounds, ms.serial_rounds));
+    }
+  }
+  std::printf("\nresult: %s (SNII scoring path-equivalence)\n",
+              all_ok ? "ALL PATHS IDENTICAL (exhaustive == wand == wand_selective)"
+                     : "PATH MISMATCH");
+  return all_ok ? 0 : 1;
+}
+
 // SNII multi-index WRITE test: one container holds multiple logical indexes
 // (tokenized Body + keyword ServiceName). Verifies each field, queried from the
 // multi-container, returns EXACTLY the same docids as a single-field index built
@@ -1670,6 +1769,11 @@ int main(int argc, char** argv) {
   mallopt(M_TRIM_THRESHOLD, 128 * 1024);
 
   const Args args = parse_args(argc, argv);
+
+  // SNII BM25 scoring path-equivalence (exhaustive == wand == wand_selective).
+  if (args.scoring) {
+    return run_scoring_mode(args);
+  }
 
   // SNII multi-logical-index write self-consistency (tokenized + keyword mix).
   if (args.multi_index) {
