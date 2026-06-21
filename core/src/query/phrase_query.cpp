@@ -4,7 +4,6 @@
 #include <cstdint>
 #include <iterator>
 #include <memory>
-#include <unordered_map>
 #include <utility>
 #include <vector>
 
@@ -61,17 +60,6 @@ struct TermPlan {
   FrqPreludeReader prelude;  // valid for windowed terms after round 1
 };
 
-// Decoded postings for one term, candidate-aligned, in CSR layout: docids[i]'s
-// positions are pos_flat[pos_off[i] .. pos_off[i+1]). The flat layout replaces a
-// per-doc std::vector<uint32_t> (which dominated phrase CPU via per-doc malloc);
-// pos_flat/pos_off are flat uint32 buffers whose capacity is retained across decode
-// calls (clear()), so the survivor positions are gathered with ~no allocation.
-struct TermPostings {
-  std::vector<uint32_t> docids;    // ascending
-  std::vector<uint32_t> pos_flat;  // all docs' positions concatenated
-  std::vector<uint32_t> pos_off;   // size docids.size()+1; pos_off[0]==0
-};
-
 // Intersects two ascending docid sets.
 std::vector<uint32_t> IntersectSorted(const std::vector<uint32_t>& a,
                                       const std::vector<uint32_t>& b) {
@@ -80,34 +68,6 @@ std::vector<uint32_t> IntersectSorted(const std::vector<uint32_t>& a,
   std::set_intersection(a.begin(), a.end(), b.begin(), b.end(),
                         std::back_inserter(out));
   return out;
-}
-
-// [begin,end) of the doc's positions in the CSR (docid must exist in post.docids).
-std::pair<const uint32_t*, const uint32_t*> PositionsSpan(const TermPostings& post,
-                                                          uint32_t docid) {
-  const auto it = std::lower_bound(post.docids.begin(), post.docids.end(), docid);
-  const size_t i = static_cast<size_t>(it - post.docids.begin());
-  return {post.pos_flat.data() + post.pos_off[i],
-          post.pos_flat.data() + post.pos_off[i + 1]};
-}
-
-// Checks term[0]@p, term[1]@p+1, ... consecutively in docid across ordered posts.
-bool PhraseInDoc(const std::vector<const TermPostings*>& posts, uint32_t docid) {
-  const auto first = PositionsSpan(*posts[0], docid);
-  for (const uint32_t* pp = first.first; pp != first.second; ++pp) {
-    const uint32_t start = *pp;
-    bool ok = true;
-    for (size_t t = 1; t < posts.size(); ++t) {
-      const auto ps = PositionsSpan(*posts[t], docid);
-      const uint32_t want = start + static_cast<uint32_t>(t);
-      if (!std::binary_search(ps.first, ps.second, want)) {
-        ok = false;
-        break;
-      }
-    }
-    if (ok) return true;
-  }
-  return false;
 }
 
 // Resolves the dd-region (docs-only) fetch length for a slim pod_ref: frq_docs_len
@@ -208,21 +168,22 @@ Status SelectCoveringWindows(const FrqPreludeReader& prelude,
   return Status::OK();
 }
 
-// Retained position source for a NON-driver term after Phase A (docid narrowing):
-// the FETCHED covering-window slices (windowed) or the flat dd/prx slices
-// (slim/inline), so Phase B can decode positions ONLY for the final surviving
-// candidates instead of for every doc the term touches. The referenced byte slices
-// live in `round1` / the per-term fetchers kept alive in NarrowCandidates::owners.
+// One decoded chunk of a term's posting: a windowed term's covering window, or a
+// slim/inline term's single posting. `docids` is decoded in the conjunction phase
+// (and reused by the streaming cursor -- the dd region is decoded exactly once);
+// `prx` is the on-disk positions bytes, decoded lazily by the cursor (once per
+// chunk) during phrase verification.
+struct PosChunk {
+  std::vector<uint32_t> docids;  // ascending, absolute
+  Slice prx;                      // .prx window bytes (reference fetcher/round1/entry)
+};
+
+// A term's retained posting as an ordered list of chunks (windowed: covering
+// windows in docid order; slim/inline: one). The referenced prx bytes live in
+// `round1` / the per-term fetchers kept alive in phrase_query::owners for the
+// whole query, so the cursor can decode positions during verification.
 struct PosSource {
-  bool windowed = false;
-  const DictEntry* entry = nullptr;  // points into the plan (alive for the query)
-  // windowed: one entry per fetched covering window (slices reference a fetcher).
-  std::vector<WindowMeta> metas;
-  std::vector<Slice> dd_slices;
-  std::vector<Slice> prx_slices;
-  // slim/inline:
-  Slice flat_dd;
-  Slice flat_prx;
+  std::vector<PosChunk> chunks;
 };
 
 // Phase A (windowed term): fetch the given `windows` (dd + prx in one batch),
@@ -258,17 +219,16 @@ Status DecodeWindowedDocids(
   }
   if (fetcher->pending() > 0) SNII_RETURN_IF_ERROR(fetcher->fetch());
 
-  src->windowed = true;
   for (size_t k = 0; k < metas.size(); ++k) {
-    std::vector<uint32_t> docids, freqs;
+    PosChunk chunk;
+    std::vector<uint32_t> freqs;
     std::vector<std::vector<uint32_t>> pos;  // stays empty (want_positions=false)
     SNII_RETURN_IF_ERROR(snii::reader::decode_window_slices(
         metas[k], fetcher->get(handles[k].first), Slice(), Slice(),
-        /*want_positions=*/false, /*want_freq=*/false, &docids, &freqs, &pos));
-    for (uint32_t d : docids) term_docids->push_back(d);
-    src->metas.push_back(metas[k]);
-    src->dd_slices.push_back(fetcher->get(handles[k].first));
-    src->prx_slices.push_back(fetcher->get(handles[k].second));
+        /*want_positions=*/false, /*want_freq=*/false, &chunk.docids, &freqs, &pos));
+    for (uint32_t d : chunk.docids) term_docids->push_back(d);
+    chunk.prx = fetcher->get(handles[k].second);
+    src->chunks.push_back(std::move(chunk));
   }
   owners->push_back(std::move(fetcher));  // unique_ptr move keeps the buffer fixed
   return Status::OK();
@@ -278,17 +238,19 @@ Status DecodeWindowedDocids(
 // *term_docids, and retain the dd/prx slices in *src for Phase B.
 Status DecodeFlatDocids(const snii::io::BatchRangeFetcher& round1, const TermPlan& p,
                         PosSource* src, std::vector<uint32_t>* term_docids) {
-  src->windowed = false;
-  src->entry = &p.entry;
+  PosChunk chunk;
+  Slice dd;
   if (p.pod_ref) {
-    src->flat_dd = round1.get(p.frq_handle);
-    src->flat_prx = round1.get(p.prx_handle);
+    dd = round1.get(p.frq_handle);
+    chunk.prx = round1.get(p.prx_handle);
   } else {
-    SNII_RETURN_IF_ERROR(InlineDdRegion(p.entry, &src->flat_dd));
-    src->flat_prx = Slice(p.entry.prx_bytes);
+    SNII_RETURN_IF_ERROR(InlineDdRegion(p.entry, &dd));
+    chunk.prx = Slice(p.entry.prx_bytes);
   }
   SNII_RETURN_IF_ERROR(snii::format::decode_dd_region(
-      src->flat_dd, p.entry.dd_meta, /*win_base=*/0, term_docids));
+      dd, p.entry.dd_meta, /*win_base=*/0, &chunk.docids));
+  *term_docids = chunk.docids;
+  src->chunks.push_back(std::move(chunk));
   return Status::OK();
 }
 
@@ -300,95 +262,65 @@ std::vector<uint32_t> AllWindows(const FrqPreludeReader& prelude) {
   return ws;
 }
 
-// Appends doc-source-index `si`'s positions (CSR span [soff[si],soff[si+1]) of
-// sflat) as candidate `ci`'s positions in the output CSR.
-inline void AppendSpan(const std::vector<uint32_t>& sflat,
-                       const std::vector<uint32_t>& soff, size_t si, size_t ci,
-                       TermPostings* out) {
-  out->pos_off[ci] = static_cast<uint32_t>(out->pos_flat.size());
-  for (uint32_t j = soff[si]; j < soff[si + 1]; ++j) out->pos_flat.push_back(sflat[j]);
-  out->pos_off[ci + 1] = static_cast<uint32_t>(out->pos_flat.size());
-}
+// Streaming position cursor over one term's retained chunks. It advances ONLY
+// forward (callers seek ascending candidate docids), decodes each chunk's docids
+// once (reused from the conjunction phase) and each chunk's positions at most once
+// (lazily, into a flat CSR whose capacity is retained across chunks). No per-doc
+// allocation, no per-candidate docid binary search: positions are addressed by the
+// doc's local index within its chunk. This is the read-side dual of the windowed
+// posting layout -- the S3-native batch fetch already pulled every needed chunk
+// into memory; the cursor is pure in-memory column iteration.
+class PostingCursor {
+ public:
+  void init(const PosSource* src) {
+    src_ = src;
+    ci_ = 0;
+    li_ = 0;
+    decoded_pos_chunk_ = kNoChunk;
+  }
 
-// Phase B (windowed): decode positions for the FINAL candidates only, from the
-// retained covering windows, into the output CSR. Each window's positions are
-// decoded into a FLAT buffer (read_prx_window_csr -- no per-doc allocation) and
-// only the surviving candidates' spans are copied out. Windows with no surviving
-// candidate are skipped entirely (the dominant decode saving for the lazily-read
-// driver). Windows + candidates are ascending, so one forward merge suffices.
-Status MaterializeCandidatePositionsWindowed(const PosSource& src,
-                                             const std::vector<uint32_t>& candidates,
-                                             TermPostings* out) {
-  out->docids = candidates;
-  out->pos_flat.clear();
-  out->pos_off.assign(candidates.size() + 1, 0);
-  size_t ci = 0;
-  for (size_t k = 0; k < src.metas.size() && ci < candidates.size(); ++k) {
-    if (candidates[ci] > src.metas[k].last_docid) continue;  // no survivor here
-    std::vector<uint32_t> wdocids, wfreqs;
-    std::vector<std::vector<uint32_t>> wpos_unused;  // stays empty
-    SNII_RETURN_IF_ERROR(snii::reader::decode_window_slices(
-        src.metas[k], src.dd_slices[k], Slice(), Slice(),
-        /*want_positions=*/false, /*want_freq=*/false, &wdocids, &wfreqs,
-        &wpos_unused));
-    std::vector<uint32_t> wflat, woff;
-    ByteSource psrc(src.prx_slices[k]);
-    SNII_RETURN_IF_ERROR(snii::format::read_prx_window_csr(&psrc, &wflat, &woff));
-    if (woff.size() != wdocids.size() + 1) {
-      return Status::Corruption("phrase_query: window prx/dd doc-count mismatch");
+  // Positions the cursor at `target` (guaranteed present: candidates are the
+  // intersection of exactly these chunks' docids). Monotonic forward advance.
+  void seek(uint32_t target) {
+    while (ci_ < src_->chunks.size() &&
+           (src_->chunks[ci_].docids.empty() ||
+            src_->chunks[ci_].docids.back() < target)) {
+      ++ci_;
+      li_ = 0;
     }
-    size_t di = 0;
-    while (di < wdocids.size() && ci < candidates.size()) {
-      if (wdocids[di] < candidates[ci]) {
-        ++di;
-      } else if (wdocids[di] == candidates[ci]) {
-        AppendSpan(wflat, woff, di, ci, out);
-        ++di;
-        ++ci;
-      } else {
-        out->pos_off[ci + 1] = out->pos_off[ci];  // unreachable for valid input
-        ++ci;
+    if (ci_ >= src_->chunks.size()) return;  // exhausted (not expected for a candidate)
+    const std::vector<uint32_t>& d = src_->chunks[ci_].docids;
+    while (li_ < d.size() && d[li_] < target) ++li_;
+  }
+
+  // [begin,end) of the current doc's positions, decoding the current chunk's .prx
+  // exactly once (cached). Must follow a seek that landed on a real doc.
+  Status positions(std::pair<const uint32_t*, const uint32_t*>* out) {
+    if (ci_ >= src_->chunks.size() || li_ >= src_->chunks[ci_].docids.size()) {
+      return Status::Corruption("phrase_query: cursor positions out of range");
+    }
+    if (decoded_pos_chunk_ != ci_) {
+      ByteSource ps(src_->chunks[ci_].prx);
+      SNII_RETURN_IF_ERROR(
+          snii::format::read_prx_window_csr(&ps, &pflat_, &poff_));
+      if (poff_.size() != src_->chunks[ci_].docids.size() + 1) {
+        return Status::Corruption("phrase_query: prx/dd doc-count mismatch");
       }
+      decoded_pos_chunk_ = ci_;
     }
+    *out = {pflat_.data() + poff_[li_], pflat_.data() + poff_[li_ + 1]};
+    return Status::OK();
   }
-  for (; ci < candidates.size(); ++ci) out->pos_off[ci + 1] = out->pos_off[ci];
-  return Status::OK();
-}
 
-// Phase B (slim/inline): decode the full posting's docids + positions (positions
-// into a FLAT CSR -- no per-doc allocation), then copy only the final candidates'
-// spans into the output CSR.
-Status MaterializeCandidatePositionsFlat(const PosSource& src,
-                                         const std::vector<uint32_t>& candidates,
-                                         TermPostings* out) {
-  std::vector<uint32_t> fdocids;
-  SNII_RETURN_IF_ERROR(snii::format::decode_dd_region(
-      src.flat_dd, src.entry->dd_meta, /*win_base=*/0, &fdocids));
-  std::vector<uint32_t> fflat, foff;
-  ByteSource psrc(src.flat_prx);
-  SNII_RETURN_IF_ERROR(snii::format::read_prx_window_csr(&psrc, &fflat, &foff));
-  if (foff.size() != fdocids.size() + 1) {
-    return Status::Corruption("phrase_query: slim prx/dd doc-count mismatch");
-  }
-  out->docids = candidates;
-  out->pos_flat.clear();
-  out->pos_off.assign(candidates.size() + 1, 0);
-  size_t di = 0, ci = 0;
-  while (di < fdocids.size() && ci < candidates.size()) {
-    if (fdocids[di] < candidates[ci]) {
-      ++di;
-    } else if (fdocids[di] == candidates[ci]) {
-      AppendSpan(fflat, foff, di, ci, out);
-      ++di;
-      ++ci;
-    } else {
-      out->pos_off[ci + 1] = out->pos_off[ci];  // unreachable for valid input
-      ++ci;
-    }
-  }
-  for (; ci < candidates.size(); ++ci) out->pos_off[ci + 1] = out->pos_off[ci];
-  return Status::OK();
-}
+ private:
+  static constexpr size_t kNoChunk = static_cast<size_t>(-1);
+  const PosSource* src_ = nullptr;
+  size_t ci_ = 0;                       // current chunk
+  size_t li_ = 0;                       // current local doc index within the chunk
+  size_t decoded_pos_chunk_ = kNoChunk;  // which chunk pflat_/poff_ currently hold
+  std::vector<uint32_t> pflat_;         // current chunk's flat positions (reused)
+  std::vector<uint32_t> poff_;          // current chunk's per-doc offsets (reused)
+};
 
 // Returns plan indices ordered by ascending df (the driver -- smallest df -- is
 // first; remaining terms shrink the candidate set fastest in this order).
@@ -400,23 +332,19 @@ std::vector<size_t> AscendingDfOrder(const std::vector<TermPlan>& plans) {
   return order;
 }
 
-// Lead-term-driven narrowing in TWO phases. EVERY term (the driver included) is
-// read DOCID-ONLY in Phase A; positions are decoded in Phase B ONLY for the final
-// surviving candidates -- so no term, not even the driver, allocates a position
-// vector for a doc that the phrase conjunction rejects. The fetch pattern matches
-// the previous one-pass path (dd + prx batched per term), so the I/O metrics are
-// unchanged; only position-decode CPU + allocation move to the survivor set.
-Status NarrowCandidates(const LogicalIndexReader& idx,
-                        const snii::io::BatchRangeFetcher& round1,
-                        const std::vector<TermPlan>& plans,
-                        std::vector<TermPostings>* posts,
-                        std::vector<uint32_t>* candidates) {
+// Lead-term-driven DOCID-ONLY conjunction (S3-native fetch unchanged): the driver
+// (smallest df) reads its full docid set; each later term reads only the windows /
+// posting covering the running candidate set, decoding ONLY docids. Fills `srcs`
+// (each term's retained chunks, for the streaming position cursor) and `candidates`
+// (the docs containing every term). The per-term fetchers are moved into `owners`,
+// which the caller keeps alive through phrase verification (the chunks' prx slices
+// reference them). No positions are decoded here.
+Status BuildConjunction(
+    const LogicalIndexReader& idx, const snii::io::BatchRangeFetcher& round1,
+    const std::vector<TermPlan>& plans,
+    std::vector<std::unique_ptr<snii::io::BatchRangeFetcher>>* owners,
+    std::vector<PosSource>* srcs, std::vector<uint32_t>* candidates) {
   const std::vector<size_t> order = AscendingDfOrder(plans);
-  std::vector<PosSource> srcs(plans.size());
-  std::vector<std::unique_ptr<snii::io::BatchRangeFetcher>> owners;
-
-  // Phase A: docid-only. Driver (k==0) reads its full docid set; each later term
-  // reads only the windows / posting covering the running candidate set.
   for (size_t k = 0; k < order.size(); ++k) {
     const size_t ti = order[k];
     const TermPlan& p = plans[ti];
@@ -429,45 +357,64 @@ Status NarrowCandidates(const LogicalIndexReader& idx,
         SNII_RETURN_IF_ERROR(
             SelectCoveringWindows(p.prelude, *candidates, &windows));
       }
-      SNII_RETURN_IF_ERROR(
-          DecodeWindowedDocids(idx, p, windows, &owners, &srcs[ti], &term_docids));
+      SNII_RETURN_IF_ERROR(DecodeWindowedDocids(idx, p, windows, owners,
+                                                &(*srcs)[ti], &term_docids));
     } else {
-      SNII_RETURN_IF_ERROR(DecodeFlatDocids(round1, p, &srcs[ti], &term_docids));
+      SNII_RETURN_IF_ERROR(DecodeFlatDocids(round1, p, &(*srcs)[ti], &term_docids));
     }
     if (k == 0) {
       *candidates = std::move(term_docids);
     } else {
       *candidates = IntersectSorted(*candidates, term_docids);
     }
-    if (candidates->empty()) return Status::OK();  // no survivors -> no positions
-  }
-
-  // Phase B: positions for the final candidates of EVERY term.
-  for (size_t k = 0; k < order.size(); ++k) {
-    const size_t ti = order[k];
-    if (srcs[ti].windowed) {
-      SNII_RETURN_IF_ERROR(
-          MaterializeCandidatePositionsWindowed(srcs[ti], *candidates, &(*posts)[ti]));
-    } else {
-      SNII_RETURN_IF_ERROR(
-          MaterializeCandidatePositionsFlat(srcs[ti], *candidates, &(*posts)[ti]));
-    }
+    if (candidates->empty()) return Status::OK();  // empty conjunction
   }
   return Status::OK();
 }
 
-// Emits the candidates whose positions satisfy the consecutive-phrase predicate,
-// using each term's postings ordered by its ORIGINAL phrase position.
-void EmitPhraseMatches(const std::vector<TermPlan>& plans,
-                       const std::vector<TermPostings>& posts,
-                       const std::vector<uint32_t>& candidates,
-                       std::vector<uint32_t>* docids) {
-  std::vector<const TermPostings*> ordered(plans.size());
-  for (size_t i = 0; i < plans.size(); ++i) ordered[plans[i].order] = &posts[i];
+// Single streaming pass over the candidates: for each (ascending) candidate,
+// advance every term's cursor to it, gather each term's positions IN PHRASE ORDER,
+// and test the consecutive-phrase predicate (term[0]@p, term[1]@p+1, ...) with
+// term-level short-circuit. Cursors decode each chunk's docids/positions exactly
+// once and address positions by local index -- no per-candidate docid binary
+// search, no full-candidate position materialization. Candidates are ascending so
+// the emitted docids are already sorted.
+Status EmitPhraseStreaming(const std::vector<TermPlan>& plans,
+                           std::vector<PosSource>& srcs,
+                           const std::vector<uint32_t>& candidates,
+                           std::vector<uint32_t>* docids) {
+  const size_t n = plans.size();
+  std::vector<PostingCursor> cur(n);
+  for (size_t i = 0; i < n; ++i) cur[i].init(&srcs[i]);
+  // ordered[phrase_pos] = the cursor of the term at that phrase position.
+  std::vector<PostingCursor*> ordered(n);
+  for (size_t i = 0; i < n; ++i) ordered[plans[i].order] = &cur[i];
+
+  std::vector<std::pair<const uint32_t*, const uint32_t*>> span(n);
   for (uint32_t d : candidates) {
-    if (PhraseInDoc(ordered, d)) docids->push_back(d);
+    for (size_t i = 0; i < n; ++i) cur[i].seek(d);
+    for (size_t pp = 0; pp < n; ++pp) {
+      SNII_RETURN_IF_ERROR(ordered[pp]->positions(&span[pp]));
+    }
+    bool match = false;
+    for (const uint32_t* p = span[0].first; p != span[0].second; ++p) {
+      const uint32_t start = *p;
+      bool ok = true;
+      for (size_t t = 1; t < n; ++t) {
+        const uint32_t want = start + static_cast<uint32_t>(t);
+        if (!std::binary_search(span[t].first, span[t].second, want)) {
+          ok = false;
+          break;
+        }
+      }
+      if (ok) {
+        match = true;
+        break;
+      }
+    }
+    if (match) docids->push_back(d);
   }
-  std::sort(docids->begin(), docids->end());
+  return Status::OK();
 }
 
 }  // namespace
@@ -491,12 +438,18 @@ Status phrase_query(const LogicalIndexReader& idx,
   if (round1.pending() > 0) SNII_RETURN_IF_ERROR(round1.fetch());
   SNII_RETURN_IF_ERROR(OpenPreludes(round1, &plans));
 
-  // Lead-term-driven window skipping: driver fully read, others narrow it.
-  std::vector<TermPostings> posts(plans.size());
+  // Phase 1: DOCID-ONLY conjunction (S3-native batch fetch). `owners` holds the
+  // per-term fetchers; it MUST outlive the verification pass below because the
+  // chunks' prx slices reference its buffers.
+  std::vector<PosSource> srcs(plans.size());
+  std::vector<std::unique_ptr<snii::io::BatchRangeFetcher>> owners;
   std::vector<uint32_t> candidates;
-  SNII_RETURN_IF_ERROR(NarrowCandidates(idx, round1, plans, &posts, &candidates));
+  SNII_RETURN_IF_ERROR(
+      BuildConjunction(idx, round1, plans, &owners, &srcs, &candidates));
+  if (candidates.empty()) return Status::OK();
 
-  EmitPhraseMatches(plans, posts, candidates, docids);
+  // Phase 2: single streaming pass -- positional verify via per-term cursors.
+  SNII_RETURN_IF_ERROR(EmitPhraseStreaming(plans, srcs, candidates, docids));
   return Status::OK();
 }
 
