@@ -1372,6 +1372,22 @@ std::vector<Scenario> resolve_scenarios(const bench::Corpus& c) {
     out.push_back({"AND-HIGH-LOW", SKind::kAnd, "",
                    {c.vocab[pr.first], c.vocab[pr.second]}});
   }
+  // AND-DENSE (honest envelope): two HIGH-df co-occurring terms -- SNII's worst AND
+  // (no rare driver, both near-full postings read; bytes converge to/below CLucene).
+  const auto dn = bench::cooccurring_pair(c, 0.5, 1.0, 0.2, 1.0);
+  if (dn.first != dn.second) {
+    out.push_back({"AND-DENSE", SKind::kAnd, "",
+                   {c.vocab[dn.first], c.vocab[dn.second]}});
+  }
+  // PHRASE-REVERSED (honest envelope): reverse a real 3-gram -> usually empty.
+  // Stresses the empty-result short-circuit; gate stays SNII == CLucene either way.
+  {
+    std::vector<std::string> ph = bench::extract_phrase(c, 3);
+    if (ph.size() == 3) {
+      std::reverse(ph.begin(), ph.end());
+      out.push_back({"PHRASE-REVERSED", SKind::kPhrase, "", ph});
+    }
+  }
   // OR-MIXED-DF: union over a high + mid + low term (distinct).
   {
     std::vector<uint32_t> ids = {bench::term_in_df_bucket(c, 0.1, 0.5),
