@@ -7,7 +7,9 @@
 #include <algorithm>
 #include <cerrno>
 #include <cstring>
+#include <memory>
 #include <queue>
+#include <stdexcept>
 #include <utility>
 
 #include "snii/encoding/varint.h"
@@ -521,7 +523,21 @@ Status MergeRuns(const std::vector<std::string>& run_paths,
       Status pump_status = Status::OK();
       std::vector<std::unique_ptr<RunReader>>* rd = &readers;
       const std::vector<size_t>* match = &matching;
-      merged.pos_pump = [rd, match, &cursor, &pump_status](uint32_t* dst, size_t n) {
+      // Self-contained liveness guard. The pump captures references into THIS stack
+      // frame (&cursor, &pump_status) and the parked run readers (rd/match), valid
+      // ONLY while fn() runs synchronously -- after fn() the readers advance past the
+      // drained blocks. `pump_alive` is heap-owned and captured BY VALUE, so a
+      // stored/deferred pos_pump fails loudly (throws) instead of dereferencing
+      // dangling state. See the contract on TermPostings::pos_pump.
+      auto pump_alive = std::make_shared<bool>(true);
+      merged.pos_pump = [rd, match, &cursor, &pump_status, pump_alive](uint32_t* dst,
+                                                                       size_t n) {
+        if (!*pump_alive) {
+          throw std::logic_error(
+              "TermPostings::pos_pump invoked after its producing merge scope ended; "
+              "the streamed TermPostings must be consumed synchronously inside fn() "
+              "and never stored for later use");
+        }
         size_t off = 0;
         while (off < n) {
           // Advance to the next run that still has positions to yield.
@@ -554,6 +570,7 @@ Status MergeRuns(const std::vector<std::string>& run_paths,
         if (off < n) std::memset(dst + off, 0, (n - off) * sizeof(uint32_t));
       };
       fn(std::move(merged));
+      *pump_alive = false;  // any later pos_pump call now throws instead of UAF
       SNII_RETURN_IF_ERROR(pump_status);  // surface a streamed-read I/O error
     } else {
       fn(std::move(merged));
