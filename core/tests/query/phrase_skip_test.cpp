@@ -358,6 +358,8 @@ TEST(PrefixTerms, OrderedEnumerationMatchesFilterAndLookup) {
   std::vector<LogicalIndexReader::PrefixHit> none;
   ASSERT_TRUE(idx.prefix_terms("zzzznope", &none).ok());
   EXPECT_TRUE(none.empty());
+  // Null output is rejected, not dereferenced.
+  EXPECT_FALSE(idx.prefix_terms("", nullptr).ok());
   std::remove(path.c_str());
 }
 

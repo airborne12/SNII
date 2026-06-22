@@ -221,6 +221,7 @@ bool DictBlockReader::locate_anchor(std::string_view target,
 }
 
 Status DictBlockReader::decode_all(std::vector<DictEntry>* out) const {
+  if (out == nullptr) return Status::InvalidArgument("dict_block: out is null");
   out->clear();
   out->reserve(n_entries_);
   for (size_t a = 0; a < anchor_offsets_.size(); ++a) {
@@ -241,6 +242,9 @@ Status DictBlockReader::decode_all(std::vector<DictEntry>* out) const {
       prev = e.term;
       out->push_back(std::move(e));
     }
+  }
+  if (out->size() != n_entries_) {
+    return Status::Corruption("dict_block: decoded entry count mismatch");
   }
   return Status::OK();
 }

@@ -129,6 +129,30 @@ TEST(DictBlock, MultiEntryRoundTrip) {
   }
 }
 
+TEST(DictBlock, DecodeAll) {
+  std::vector<DictEntry> entries = {
+      MakePodRef("alpha", 3, 0), MakePodRef("beta", 5, 100),
+      MakePodRef("delta", 9, 300), MakePodRef("epsilon", 11, 500),
+      MakeInline("gamma", 2)};
+  std::vector<uint8_t> bytes =
+      BuildBlock(entries, IndexTier::kT2, true, 8192, 16384, 16);
+  DictBlockReader reader;
+  ASSERT_TRUE(
+      DictBlockReader::open(Slice(bytes), IndexTier::kT2, true, &reader).ok());
+
+  // Null output is rejected, not dereferenced.
+  EXPECT_FALSE(reader.decode_all(nullptr).ok());
+
+  // decode_all returns every entry, in ascending order, matching n_entries.
+  std::vector<DictEntry> all;
+  ASSERT_TRUE(reader.decode_all(&all).ok());
+  ASSERT_EQ(all.size(), entries.size());
+  for (size_t i = 0; i < entries.size(); ++i) {
+    EXPECT_EQ(all[i].term, entries[i].term) << i;
+    ExpectCommon(entries[i], all[i]);
+  }
+}
+
 // Front-coding across anchors: with a small anchor_interval, terms spanning anchor boundaries are decoded correctly.
 TEST(DictBlock, PrefixCompressionAcrossAnchors) {
   std::vector<DictEntry> entries;

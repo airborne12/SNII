@@ -283,9 +283,14 @@ Status decode_payload_csr(Slice plain, std::vector<uint32_t>* pos_flat,
   pos_off->clear();
   pos_off->reserve(static_cast<size_t>(doc_count) + 1);
   pos_off->push_back(0);
+  uint64_t total_pos = 0;
   for (uint32_t d = 0; d < doc_count; ++d) {
     uint32_t pos_count = 0;
     SNII_RETURN_IF_ERROR(src.get_varint32(&pos_count));
+    total_pos += pos_count;
+    if (total_pos > kMaxWindowPositions) {
+      return Status::Corruption("prx: position count exceeds sane cap");
+    }
     uint32_t prev = 0;
     for (uint32_t i = 0; i < pos_count; ++i) {
       uint32_t delta = 0;

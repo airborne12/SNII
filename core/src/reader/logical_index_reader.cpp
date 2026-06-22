@@ -154,6 +154,7 @@ Status LogicalIndexReader::lookup(std::string_view term, bool* found,
 
 Status LogicalIndexReader::prefix_terms(std::string_view prefix,
                                         std::vector<PrefixHit>* out) const {
+  if (out == nullptr) return Status::InvalidArgument("logical_index: null out");
   out->clear();
   if (reader_ == nullptr) return Status::InvalidArgument("logical_index: not opened");
 
