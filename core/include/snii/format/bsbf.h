@@ -33,6 +33,11 @@ constexpr uint32_t kBsbfBitsSetPerBlock = 8;            // 8 uint32 words / bloc
 constexpr uint32_t kBsbfMinBytes = 32;
 constexpr uint32_t kBsbfMaxBytes = 128u * 1024 * 1024;  // Parquet kMaximumBloomFilterBytes
 constexpr uint32_t kBsbfHeaderSize = 28;                // FIXED (constant bitset offset)
+// L0/L1 tiering threshold (design "不存在的term快速过滤"): a bsbf section whose total
+// size is <= this is loaded WHOLE into the resident reader at open (L0 -> free
+// in-memory probe, no per-lookup round); larger filters stay L1 (header-only, probed
+// one 32-byte block on demand). 256 KiB fits in a single cloud FileCache block.
+constexpr uint32_t kBsbfResidentMaxBytes = 256u * 1024;
 
 // Canonical Parquet/Doris split-block SALT (8 odd 32-bit constants).
 extern const uint32_t kBsbfSalt[kBsbfBitsSetPerBlock];

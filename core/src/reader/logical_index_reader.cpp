@@ -54,6 +54,15 @@ Status LogicalIndexReader::open(snii::io::FileReader* file_reader,
     out->bsbf_header_.num_blocks = static_cast<uint32_t>(num_bytes / kBsbfBytesPerBlock);
     out->bsbf_header_.bitset_base = bsbf.offset + kBsbfHeaderSize;
     out->has_bsbf_ = true;
+    // L0: a small filter is loaded WHOLE at open -> free in-memory probes (no
+    // per-lookup round). Larger filters stay L1 (header-only, on-demand block read).
+    if (bsbf.length <= snii::format::kBsbfResidentMaxBytes) {
+      SNII_RETURN_IF_ERROR(file_reader->read_at(
+          out->bsbf_header_.bitset_base, num_bytes, &out->bsbf_resident_bitset_));
+      if (out->bsbf_resident_bitset_.size() < num_bytes)
+        return Status::Corruption("logical_index: short bsbf resident read");
+      out->bsbf_resident_ = true;
+    }
   } else if (out->meta_.has_xfilter()) {
     // TEMP (A/B): legacy fuse-8 resident filter, loaded whole from the meta block.
     SNII_RETURN_IF_ERROR(snii::format::XFilterReader::open(
@@ -72,8 +81,18 @@ Status LogicalIndexReader::lookup(std::string_view term, bool* found,
   //    BSBF: on-demand probe of ONE 32-byte block (no whole-filter load).
   //    fuse-8 (TEMP A/B): in-memory probe of the resident filter (loaded at open).
   if (has_bsbf_) {
+    const uint64_t h = bsbf_hash(term);
     bool maybe = false;
-    SNII_RETURN_IF_ERROR(bsbf_probe(reader_, bsbf_header_, bsbf_hash(term), &maybe));
+    if (bsbf_resident_) {
+      // L0: in-memory probe of the resident bitset (no round).
+      const uint32_t blk = snii::format::bsbf_block_index(h, bsbf_header_.num_blocks);
+      maybe = snii::format::bsbf_block_contains(
+          h, bsbf_resident_bitset_.data() +
+                 static_cast<size_t>(blk) * kBsbfBytesPerBlock);
+    } else {
+      // L1: on-demand single-block probe.
+      SNII_RETURN_IF_ERROR(bsbf_probe(reader_, bsbf_header_, h, &maybe));
+    }
     if (!maybe) return Status::OK();
   } else if (meta_.has_xfilter() && !xfilter_.maybe_contains(term)) {
     return Status::OK();

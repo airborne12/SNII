@@ -93,6 +93,11 @@ class LogicalIndexReader {
   snii::format::DictBlockDirectoryReader dbd_;
   snii::format::BsbfHeader bsbf_header_;  // resident header (from section ref)
   bool has_bsbf_ = false;
+  // L0 tiering: when the bsbf section is small (<= kBsbfResidentMaxBytes) its whole
+  // bitset is loaded here at open -> in-memory probe, no per-lookup round. Empty =>
+  // L1 (on-demand single-block probe via bsbf_probe).
+  bool bsbf_resident_ = false;
+  std::vector<uint8_t> bsbf_resident_bitset_;
   snii::format::XFilterReader xfilter_;  // TEMP: fuse-8 resident filter (A/B)
 };
 

@@ -399,6 +399,26 @@ TEST(SniiCompoundWriter, MultiSuperBlockReadBack) {
   EXPECT_EQ(hot.enc, DictEntryEnc::kWindowed);
   EXPECT_TRUE(hot.has_sb);
 
+  // L0 tiering: this index's bsbf filter is tiny (<= kBsbfResidentMaxBytes), so it is
+  // loaded resident at open and an absent-term lookup is rejected IN MEMORY with zero
+  // reads (no per-lookup round). Loop a few absents to skip the rare false positive.
+  bool saw_resident_reject = false;
+  for (int i = 0; i < 8 && !saw_resident_reject; ++i) {
+    metered.reset_metrics();
+    bool af = true;
+    DictEntry ad;
+    uint64_t afb = 0, apb = 0;
+    ASSERT_TRUE(
+        idx.lookup("absent-zzz-" + std::to_string(i), &af, &ad, &afb, &apb).ok());
+    if (!af) {
+      EXPECT_EQ(metered.metrics().read_at_calls, 0u);
+      EXPECT_EQ(metered.metrics().serial_rounds, 0u);
+      saw_resident_reject = true;
+    }
+  }
+  EXPECT_TRUE(saw_resident_reject);
+  metered.reset_metrics();
+
   // Fetch + parse the two-level prelude.
   const uint64_t prelude_abs =
       idx.section_refs().frq_pod.offset + frq_base + hot.frq_off_delta;
