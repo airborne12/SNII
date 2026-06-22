@@ -1,5 +1,6 @@
 #include "snii/reader/logical_index_reader.h"
 
+#include <cstdlib>
 #include <vector>
 
 #include "snii/encoding/zstd_codec.h"
@@ -7,6 +8,21 @@
 #include "snii/format/dict_block_directory.h"
 
 namespace snii::reader {
+
+namespace {
+// TEMP (bench/test): the L0/L1 threshold, overridable via SNII_BSBF_RESIDENT_MAX
+// (bytes) so the on-demand L1 path can be exercised without a 250K-term corpus.
+// Read fresh each open so a test can toggle tiers between opens.
+uint64_t bsbf_resident_max_bytes() {
+  const char* s = std::getenv("SNII_BSBF_RESIDENT_MAX");
+  if (s != nullptr) {
+    char* end = nullptr;
+    const unsigned long long v = std::strtoull(s, &end, 10);
+    if (end != s) return v;
+  }
+  return snii::format::kBsbfResidentMaxBytes;
+}
+}  // namespace
 
 using snii::format::BlockRef;
 using snii::format::DictBlockDirectoryReader;
@@ -56,7 +72,7 @@ Status LogicalIndexReader::open(snii::io::FileReader* file_reader,
     out->has_bsbf_ = true;
     // L0: a small filter is loaded WHOLE at open -> free in-memory probes (no
     // per-lookup round). Larger filters stay L1 (header-only, on-demand block read).
-    if (bsbf.length <= snii::format::kBsbfResidentMaxBytes) {
+    if (bsbf.length <= bsbf_resident_max_bytes()) {
       SNII_RETURN_IF_ERROR(file_reader->read_at(
           out->bsbf_header_.bitset_base, num_bytes, &out->bsbf_resident_bitset_));
       if (out->bsbf_resident_bitset_.size() < num_bytes)

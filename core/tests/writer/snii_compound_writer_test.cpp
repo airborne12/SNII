@@ -4,6 +4,7 @@
 
 #include <cstdint>
 #include <cstdio>
+#include <cstdlib>
 #include <string>
 #include <vector>
 
@@ -417,6 +418,37 @@ TEST(SniiCompoundWriter, MultiSuperBlockReadBack) {
     }
   }
   EXPECT_TRUE(saw_resident_reject);
+  metered.reset_metrics();
+
+  // L1 tiering: force on-demand by lowering the resident threshold to 0, then re-open
+  // the SAME index. It now keeps only the header, so an absent-term lookup must do a
+  // real on-demand block READ (>= 1 read_at) -- unlike L0's in-memory zero-read
+  // reject above -- and a present term is still found via the on-demand probe + dict.
+  ::setenv("SNII_BSBF_RESIDENT_MAX", "0", /*overwrite=*/1);
+  {
+    reader::LogicalIndexReader idx_l1;
+    ASSERT_TRUE(seg.open_index(1, "body", &idx_l1).ok());
+    bool pf = false;
+    DictEntry pe;
+    uint64_t pfb = 0, ppb = 0;
+    ASSERT_TRUE(idx_l1.lookup("hot", &pf, &pe, &pfb, &ppb).ok());
+    EXPECT_TRUE(pf);  // present term found via L1 probe + dict
+    bool saw_l1_read = false;
+    for (int i = 0; i < 8 && !saw_l1_read; ++i) {
+      metered.reset_metrics();
+      bool af = true;
+      DictEntry ad;
+      uint64_t afb = 0, apb = 0;
+      ASSERT_TRUE(
+          idx_l1.lookup("absent-zzz-" + std::to_string(i), &af, &ad, &afb, &apb).ok());
+      if (!af) {
+        EXPECT_GE(metered.metrics().read_at_calls, 1u);  // on-demand block read
+        saw_l1_read = true;
+      }
+    }
+    EXPECT_TRUE(saw_l1_read);
+  }
+  ::unsetenv("SNII_BSBF_RESIDENT_MAX");
   metered.reset_metrics();
 
   // Fetch + parse the two-level prelude.

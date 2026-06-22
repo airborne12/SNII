@@ -360,6 +360,16 @@ int run_oss_mode(const Args& args, const bench::Corpus& corpus,
     snii_idx.build_upload_and_open(corpus, cfg);
     std::printf("  SNII uploaded in %.0f ms (key=%s)\n", ms_since(t0),
                 snii_idx.uploaded_key().c_str());
+    {
+      const uint64_t bsbf_bytes = snii_idx.bsbf_section_bytes();
+      const char* tenv = std::getenv("SNII_BSBF_RESIDENT_MAX");
+      const uint64_t thr = (tenv != nullptr) ? std::strtoull(tenv, nullptr, 10)
+                                             : 256ull * 1024;
+      std::printf("  SNII bsbf filter = %llu bytes -> tier %s (threshold=%llu)\n",
+                  static_cast<unsigned long long>(bsbf_bytes),
+                  bsbf_bytes != 0 && bsbf_bytes <= thr ? "L0(resident)" : "L1(on-demand)",
+                  static_cast<unsigned long long>(thr));
+    }
     all_keys.push_back(snii_idx.uploaded_key());
 
     std::printf("building + uploading CLucene index to OSS...\n");

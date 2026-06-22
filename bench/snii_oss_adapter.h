@@ -45,6 +45,12 @@ class SniiOssAdapter {
   // The OSS object key (prefix + "/" + key) that was uploaded, for cleanup.
   const std::string& uploaded_key() const { return uploaded_key_; }
 
+  // Bytes of the block-split bloom XFilter section (0 if none) -- lets the bench
+  // report the L0/L1 tier (resident iff <= kBsbfResidentMaxBytes).
+  uint64_t bsbf_section_bytes() const {
+    return index_ ? index_->section_refs().bsbf.length : 0;
+  }
+
   // The raw OSS object key (no prefix) passed to S3FileReader::open -- pass it to
   // open_uploaded on a fresh adapter to open the SAME uploaded index per thread.
   const std::string& object_key() const { return object_key_; }
