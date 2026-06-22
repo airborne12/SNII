@@ -125,6 +125,10 @@ Status SniiCompoundWriter::write_tail(const std::vector<Placement>& placements) 
   tp.meta_region_length = region_len;
   tp.hot_off = 0;
   tp.meta_region_checksum = snii::crc32c(region_sink.view());
+  // Reserved: the bootstrap header carries (and decode_bootstrap_header verifies) its
+  // OWN internal crc32c, so a tail-pointer copy is redundant. Left 0 until a cross-
+  // region check needs it; the tail pointer's own tail_checksum still covers this
+  // field's bytes.
   tp.bootstrap_header_checksum = 0;
   ByteSink tail_sink;
   SNII_RETURN_IF_ERROR(snii::format::encode_tail_pointer(tp, &tail_sink));

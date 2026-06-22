@@ -196,6 +196,7 @@ Status BsbfHeader::parse(Slice h, uint64_t section_base, BsbfHeader* out) {
     return Status::Corruption("bsbf: num_blocks mismatch");
   out->num_bytes = nb;
   out->num_blocks = nblk;
+  out->bitset_crc = load_le32(p + 24);
   out->bitset_base = section_base + kBsbfHeaderSize;
   return Status::OK();
 }

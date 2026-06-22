@@ -95,6 +95,7 @@ class BsbfBuilder {
 struct BsbfHeader {
   uint32_t num_bytes = 0;
   uint32_t num_blocks = 0;
+  uint32_t bitset_crc = 0;   // stored crc32c of the bitset body (for L0 verification)
   uint64_t bitset_base = 0;  // absolute file offset of block 0 = section_base + 28
 
   // Parse a 28-byte header located at `section_base` in the file. The bitset_base

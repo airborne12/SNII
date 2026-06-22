@@ -429,7 +429,8 @@ exact term 的不存在快速过滤（XFilter，简称 XF）位于 per-index met
 **实现现状（已落地）。** BSBF + 按需单块探测已贯通 writer/reader，取代 binary-fuse-8（模块 `core/.../format/bsbf.{h,cpp}`，commit `b5c887a`）：
 - **writer**：每词收 XXH64（seed 0）key → `BsbfBuilder`（fpp=1%，Parquet `OptimalNumOfBytes` 定尺）→ 序列化 `[28B 头][连续未压缩小端 bitset]`。
 - **物理 section**：compound writer 把该 blob 作为独立 section 写入容器（norms 之后），绝对 offset/len 记入 `SectionRefs.bsbf`（第 6 个 RegionRef）；**不再嵌入常驻 meta block**。
-- **reader（L0/L1 分级，commit `f33502d`）**：open 时由 section ref 推导头；**小 filter（≤256KB）整块载入常驻（L0）→ `lookup()` 内存探测、无 round**；**大 filter（>256KB）仅头常驻（L1）→ `bsbf_probe()` 按需读 1 个 32B 块**（`base+28+block*32`）。两者 DEFINITELY-ABSENT 都不读 dict 直接返回空。
+- **reader（L0/L1 分级，commit `f33502d`）**：open 时**读并校验 28B 头**（`BsbfHeader::parse` 验 magic/version/strategy + header crc + 几何，并与 section ref 长度交叉核对）；**小 filter（≤256KB）整块载入常驻（L0）→ 同时校验 bitset crc → `lookup()` 内存探测、无 round**；**大 filter（>256KB）仅头常驻（L1）→ `bsbf_probe()` 按需读 1 个 32B 块**（`base+28+block*32`）。两者 DEFINITELY-ABSENT 都不读 dict 直接返回空。
+- **完整性校验**：bsbf 头 crc 两档都校验；**L0 额外校验整 bitset crc**（commit 见下）。**L1 的按需单块读本质上无法校验整-bitset crc**——大 filter 的 bitset body 依赖存储层（S3/磁盘）自身完整性，这是 on-demand 的设计权衡。其余持久化块（dict / frq / prx / norms / per-index-meta / meta-region）均在解析前校验各自 crc。
 - **SIMD**：单块校验用 AVX2（256-bit 块 = 一个 YMM，`testc`/`or`），逐函数 `target("avx2")` + 运行时门控 + 标量回退；build ~2.8×、热查最高 ~4×（三个参考实现 Parquet/Doris 均无 SIMD）。
 - **现状边界（真实 OSS 实测，300K docs）**：L0 下词查询 **1 round**（high-df `CL/SNII=1.67` 反超 CLucene）；L1 下词查询 **2 rounds**（探测那 1 round），小 posting 词 `CL/SNII=0.50–0.75` 输、大 posting 词仍赢（high-df 1.36）。即「小 filter 走 L0」是对的。净价值在本地/热最大、云冷因 1MiB 块地板封顶。
 - **fuse-8 已彻底移除**：旧 binary-fuse-8 模块（`xfilter.{h,cpp}` + 测试）及临时 A/B 开关均已删除；BSBF L0/L1 是唯一过滤器。L0 阈值由 `kBsbfResidentMaxBytes`（默认 256KB，env `SNII_BSBF_RESIDENT_MAX` 可调）控制。

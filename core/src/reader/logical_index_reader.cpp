@@ -3,6 +3,7 @@
 #include <cstdlib>
 #include <vector>
 
+#include "snii/encoding/crc32c.h"
 #include "snii/encoding/zstd_codec.h"
 #include "snii/format/dict_block.h"
 #include "snii/format/dict_block_directory.h"
@@ -63,20 +64,31 @@ Status LogicalIndexReader::open(snii::io::FileReader* file_reader,
     if (bsbf.length <= kBsbfHeaderSize)
       return Status::Corruption("logical_index: bsbf section too small");
     const uint64_t num_bytes = bsbf.length - kBsbfHeaderSize;
-    if (num_bytes < kBsbfBytesPerBlock || (num_bytes % kBsbfBytesPerBlock) != 0 ||
-        (num_bytes & (num_bytes - 1)) != 0)
-      return Status::Corruption("logical_index: bsbf bitset size invalid");
-    out->bsbf_header_.num_bytes = static_cast<uint32_t>(num_bytes);
-    out->bsbf_header_.num_blocks = static_cast<uint32_t>(num_bytes / kBsbfBytesPerBlock);
-    out->bsbf_header_.bitset_base = bsbf.offset + kBsbfHeaderSize;
+    const bool resident = bsbf.length <= bsbf_resident_max_bytes();
+    // L0: read the WHOLE section (header + bitset) so probes are in-memory AND the
+    // bitset crc can be verified once. L1: read only the 28-byte header so open stays
+    // near-zero I/O; the on-demand single-block probe cannot verify a whole-bitset
+    // crc, so L1 relies on the storage layer's own integrity for the bitset body.
+    // Either way the header (magic/version/strategy/geometry + header crc) is parsed
+    // and verified -- BsbfHeader::parse rejects a corrupt header.
+    std::vector<uint8_t> head;
+    SNII_RETURN_IF_ERROR(file_reader->read_at(
+        bsbf.offset, resident ? bsbf.length : kBsbfHeaderSize, &head));
+    if (head.size() < kBsbfHeaderSize)
+      return Status::Corruption("logical_index: short bsbf header read");
+    SNII_RETURN_IF_ERROR(snii::format::BsbfHeader::parse(
+        Slice(head.data(), kBsbfHeaderSize), bsbf.offset, &out->bsbf_header_));
+    // Cross-check the header geometry against the section ref.
+    if (out->bsbf_header_.num_bytes != num_bytes)
+      return Status::Corruption("logical_index: bsbf header/section size mismatch");
     out->has_bsbf_ = true;
-    // L0: a small filter is loaded WHOLE at open -> free in-memory probes (no
-    // per-lookup round). Larger filters stay L1 (header-only, on-demand block read).
-    if (bsbf.length <= bsbf_resident_max_bytes()) {
-      SNII_RETURN_IF_ERROR(file_reader->read_at(
-          out->bsbf_header_.bitset_base, num_bytes, &out->bsbf_resident_bitset_));
-      if (out->bsbf_resident_bitset_.size() < num_bytes)
+    if (resident) {
+      if (head.size() < bsbf.length)
         return Status::Corruption("logical_index: short bsbf resident read");
+      const Slice bitset(head.data() + kBsbfHeaderSize, out->bsbf_header_.num_bytes);
+      if (snii::crc32c(bitset) != out->bsbf_header_.bitset_crc)
+        return Status::Corruption("logical_index: bsbf bitset crc mismatch");
+      out->bsbf_resident_bitset_.assign(bitset.data(), bitset.data() + bitset.size());
       out->bsbf_resident_ = true;
     }
   }

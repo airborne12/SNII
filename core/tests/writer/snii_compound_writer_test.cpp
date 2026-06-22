@@ -54,6 +54,16 @@ std::vector<uint8_t> ReadAll(const std::string& path) {
   return out;
 }
 
+// Writes bytes to a fresh temp file and returns its path.
+std::string WriteTemp(const std::vector<uint8_t>& bytes) {
+  const std::string p = TempPath();
+  io::LocalFileWriter w;
+  EXPECT_TRUE(w.open(p).ok());
+  EXPECT_TRUE(w.append(Slice(bytes)).ok());
+  EXPECT_TRUE(w.finalize().ok());
+  return p;
+}
+
 // Builds a TermPostings with constant freq per doc and (optionally) positions.
 TermPostings MakeTerm(const std::string& term, const std::vector<uint32_t>& docids,
                       bool with_positions) {
@@ -586,4 +596,76 @@ TEST(SniiCompoundWriter, StreamedMultiIndexDeterministic) {
   EXPECT_EQ(ReadAll(p1), ReadAll(p2));
   std::remove(p1.c_str());
   std::remove(p2.c_str());
+}
+
+// A flipped on-disk byte in the bsbf filter (header or bitset) or in the meta region
+// must be detected on the read path, not silently propagated as a wrong probe result.
+TEST(SniiCompoundWriter, ChecksumCorruptionDetectedOnRead) {
+  const std::string good = TempPath();
+  {
+    io::LocalFileWriter w;
+    ASSERT_TRUE(w.open(good).ok());
+    SniiCompoundWriter cw(&w);
+    ASSERT_TRUE(cw.add_logical_index(MakeIndex(7, "body", 30)).ok());
+    ASSERT_TRUE(cw.finish().ok());
+  }
+  const std::vector<uint8_t> file = ReadAll(good);
+  std::remove(good.c_str());
+
+  // Locate the bsbf section + meta region from the tail.
+  TailPointer tp;
+  ASSERT_TRUE(decode_tail_pointer(
+                  Slice(file.data() + file.size() - tail_pointer_size(),
+                        tail_pointer_size()),
+                  &tp)
+                  .ok());
+  TailMetaRegionReader tmr;
+  ASSERT_TRUE(TailMetaRegionReader::open(
+                  Slice(file.data() + tp.meta_region_offset, tp.meta_region_length),
+                  &tmr)
+                  .ok());
+  bool found = false;
+  Slice meta_bytes;
+  ASSERT_TRUE(tmr.find(7, "body", &found, &meta_bytes).ok());
+  ASSERT_TRUE(found);
+  PerIndexMetaReader meta;
+  ASSERT_TRUE(PerIndexMetaReader::open(meta_bytes, &meta).ok());
+  const auto bsbf = meta.section_refs().bsbf;
+  ASSERT_GT(bsbf.length, snii::format::kBsbfHeaderSize);  // small filter -> L0
+
+  // The clean file opens fine.
+  auto opens_ok = [](const std::vector<uint8_t>& bytes) {
+    const std::string p = WriteTemp(bytes);
+    io::LocalFileReader r;
+    EXPECT_TRUE(r.open(p).ok());
+    reader::SniiSegmentReader seg;
+    Status sopen = reader::SniiSegmentReader::open(&r, &seg);
+    bool ok = sopen.ok();
+    if (ok) {
+      reader::LogicalIndexReader idx;
+      ok = seg.open_index(7, "body", &idx).ok();
+    }
+    std::remove(p.c_str());
+    return ok;
+  };
+  EXPECT_TRUE(opens_ok(file));
+
+  // (1) bsbf BITSET byte flip -> L0 open verifies the bitset crc -> rejected.
+  {
+    std::vector<uint8_t> bad = file;
+    bad[bsbf.offset + snii::format::kBsbfHeaderSize] ^= 0xFF;
+    EXPECT_FALSE(opens_ok(bad));
+  }
+  // (2) bsbf HEADER byte flip (num_bytes field, covered by header crc) -> rejected.
+  {
+    std::vector<uint8_t> bad = file;
+    bad[bsbf.offset + 8] ^= 0xFF;
+    EXPECT_FALSE(opens_ok(bad));
+  }
+  // (3) META REGION byte flip -> segment open verifies meta_region_checksum -> rejected.
+  {
+    std::vector<uint8_t> bad = file;
+    bad[tp.meta_region_offset] ^= 0xFF;
+    EXPECT_FALSE(opens_ok(bad));
+  }
 }
