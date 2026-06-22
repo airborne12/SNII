@@ -11,10 +11,10 @@
 #include "snii/format/dict_block.h"
 #include "snii/format/dict_block_directory.h"
 #include "snii/format/frq_prelude.h"
+#include "snii/format/bsbf.h"
 #include "snii/format/frq_pod.h"
 #include "snii/format/norms_pod.h"
 #include "snii/format/prx_pod.h"
-#include "snii/format/xfilter.h"
 
 namespace snii::writer {
 
@@ -32,6 +32,10 @@ using snii::format::WindowMeta;
 
 namespace {
 
+// Target false-positive probability for the block-split bloom XFilter. Sizes the
+// filter via Parquet OptimalNumOfBytes; comparable to the fuse-8 filter's FPR while
+// the on-demand single-block probe keeps per-query cost constant.
+constexpr double kBsbfFpp = 0.01;
 // Zstd "auto" sentinel for window builders (raw for tiny payloads).
 constexpr int kAutoZstd = -1;
 // Force-raw level for .frq dd/freq regions. Their plaintext is PFOR-bit-packed
@@ -491,7 +495,8 @@ struct LogicalIndexWriter::BlockState {
 Status LogicalIndexWriter::process_term(TermPostings& tp, BlockState* st) {
   SNII_RETURN_IF_ERROR(validate_term(tp));
   // Collect only the 8-byte filter key per term (no whole-vocabulary string copy).
-  term_hashes_.push_back(snii::format::hash_term(tp.term));
+  // BSBF key = XXH64 seed 0 (Parquet-canonical), NOT the fuse-8 XXH3.
+  term_hashes_.push_back(snii::format::bsbf_hash(tp.term));
   ++term_count_;
   stats_.sum_total_term_freq += SumOf(tp.freqs);
 
@@ -573,12 +578,21 @@ Status LogicalIndexWriter::build() {
     norms_section_ = nsink.buffer();
   }
 
-  // Build the absent-term filter from the per-term hashes (no retained strings);
-  // term_hashes_ is moved in and consumed.
-  ByteSink xsink;
-  SNII_RETURN_IF_ERROR(
-      snii::format::build_xfilter_hashed(std::move(term_hashes_), &xsink));
-  xfilter_bytes_ = xsink.buffer();
+  // Build the absent-term filter (block-split bloom, Parquet-canonical) from the
+  // per-term keys (XXH64 seed 0; no retained strings). Serialized as a self-
+  // describing [28B header][bitset] blob; the compound writer places it as a
+  // PHYSICAL section so the reader can probe one 32B block on demand at open.
+  bsbf_bytes_.clear();
+  if (!term_hashes_.empty()) {
+    snii::format::BsbfBuilder bf;
+    SNII_RETURN_IF_ERROR(snii::format::BsbfBuilder::create(
+        static_cast<uint32_t>(term_hashes_.size()), kBsbfFpp, &bf));
+    for (uint64_t k : term_hashes_) bf.insert(k);
+    ByteSink bsink;
+    SNII_RETURN_IF_ERROR(bf.serialize(&bsink));
+    bsbf_bytes_ = bsink.buffer();
+  }
+  std::vector<uint64_t>().swap(term_hashes_);  // release
   return Status::OK();
 }
 
@@ -606,12 +620,13 @@ Status LogicalIndexWriter::finish_meta(const SectionRefs& abs_refs,
   ByteSink dir_sink;
   dir.finish(&dir_sink);
 
-  PerIndexMetaBuilder builder(index_id_, index_suffix_,
-                              PerIndexMetaBuilder::kHasXFilter);
+  const uint32_t flags =
+      bsbf_bytes_.empty() ? 0u : PerIndexMetaBuilder::kHasBsbf;
+  PerIndexMetaBuilder builder(index_id_, index_suffix_, flags);
   builder.set_stats(stats_);
   builder.set_sampled_term_index(sti_sink.view());
   builder.set_dict_block_directory(dir_sink.view());
-  builder.set_xfilter(Slice(xfilter_bytes_));
+  // The BSBF is a physical section (abs_refs.bsbf), not embedded here.
   builder.set_section_refs(abs_refs);
   return builder.finish(out);
 }

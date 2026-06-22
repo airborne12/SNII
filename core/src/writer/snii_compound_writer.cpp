@@ -82,6 +82,16 @@ Status SniiCompoundWriter::write_norms(std::vector<Placement>* placements) {
     SNII_RETURN_IF_ERROR(append(w.norms_bytes()));
     p.norms_len = cursor_ - p.norms_off;
   }
+  // Block-split bloom XFilter sections (one physical section per index, after the
+  // norms), so the reader can probe a single 32-byte block on demand at open.
+  for (size_t i = 0; i < indexes_.size(); ++i) {
+    const LogicalIndexWriter& w = *indexes_[i];
+    if (!w.has_bsbf()) continue;
+    Placement& p = (*placements)[i];
+    p.bsbf_off = cursor_;
+    SNII_RETURN_IF_ERROR(append(w.bsbf_bytes()));
+    p.bsbf_len = cursor_ - p.bsbf_off;
+  }
   return Status::OK();
 }
 
@@ -97,6 +107,7 @@ Status SniiCompoundWriter::write_tail(const std::vector<Placement>& placements) 
     refs.prx_pod = {p.prx_off, p.prx_len};
     refs.norms = {p.norms_off, p.norms_len};
     refs.null_bitmap = {0, 0};
+    refs.bsbf = {p.bsbf_off, p.bsbf_len};
 
     ByteSink meta;
     SNII_RETURN_IF_ERROR(w.finish_meta(refs, p.dict_off, &meta));

@@ -63,6 +63,8 @@ class SniiCompoundWriter {
     uint64_t prx_len = 0;
     uint64_t norms_off = 0;
     uint64_t norms_len = 0;
+    uint64_t bsbf_off = 0;
+    uint64_t bsbf_len = 0;
   };
 
   Status write_bootstrap();

@@ -12,7 +12,7 @@
 #include "snii/format/per_index_meta.h"
 #include "snii/format/sampled_term_index.h"
 #include "snii/format/stats_block.h"
-#include "snii/format/xfilter.h"
+#include "snii/format/bsbf.h"
 #include "snii/io/file_reader.h"
 
 // LogicalIndexReader -- read-side counterpart of LogicalIndexWriter for one
@@ -90,7 +90,8 @@ class LogicalIndexReader {
   snii::format::PerIndexMetaReader meta_;
   snii::format::SampledTermIndexReader sti_;
   snii::format::DictBlockDirectoryReader dbd_;
-  snii::format::XFilterReader xfilter_;
+  snii::format::BsbfHeader bsbf_header_;  // resident header (from section ref)
+  bool has_bsbf_ = false;
 };
 
 }  // namespace snii::reader

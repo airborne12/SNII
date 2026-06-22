@@ -24,7 +24,7 @@ Status decode_region(ByteSource* ps, RegionRef* r) {
   return Status::OK();
 }
 
-// SectionRefs payload: five RegionRefs in fixed order, each as varint64 pair.
+// SectionRefs payload: six RegionRefs in fixed order, each as varint64 pair.
 void encode_section_refs(const SectionRefs& refs, ByteSink* sink) {
   ByteSink payload;
   encode_region(refs.dict_region, &payload);
@@ -32,6 +32,7 @@ void encode_section_refs(const SectionRefs& refs, ByteSink* sink) {
   encode_region(refs.prx_pod, &payload);
   encode_region(refs.norms, &payload);
   encode_region(refs.null_bitmap, &payload);
+  encode_region(refs.bsbf, &payload);
   SectionFramer::write(*sink, static_cast<uint8_t>(SectionType::kSectionRefs),
                        payload.view());
 }
@@ -43,6 +44,7 @@ Status decode_section_refs(Slice payload, SectionRefs* out) {
   SNII_RETURN_IF_ERROR(decode_region(&ps, &out->prx_pod));
   SNII_RETURN_IF_ERROR(decode_region(&ps, &out->norms));
   SNII_RETURN_IF_ERROR(decode_region(&ps, &out->null_bitmap));
+  SNII_RETURN_IF_ERROR(decode_region(&ps, &out->bsbf));
   if (!ps.eof()) {
     return Status::Corruption("per_index_meta: trailing bytes in section_refs");
   }

@@ -22,7 +22,7 @@
 #include "snii/format/sampled_term_index.h"
 #include "snii/format/tail_meta_region.h"
 #include "snii/format/tail_pointer.h"
-#include "snii/format/xfilter.h"
+#include "snii/format/bsbf.h"
 #include "snii/io/local_file.h"
 #include "snii/io/metered_file_reader.h"
 #include "snii/query/phrase_query.h"
@@ -206,13 +206,26 @@ TEST(SniiCompoundWriter, ReadBackSelfValidation) {
     EXPECT_EQ(refs.null_bitmap.offset, 0u);
     EXPECT_EQ(refs.null_bitmap.length, 0u);
 
-    // --- XFilter: present term true, absent term false ---
-    ASSERT_TRUE(meta.has_xfilter());
-    XFilterReader xf;
-    ASSERT_TRUE(XFilterReader::open(meta.xfilter_bytes(), &xf).ok());
-    EXPECT_TRUE(xf.maybe_contains("apple"));
-    EXPECT_TRUE(xf.maybe_contains("common"));
-    EXPECT_FALSE(xf.maybe_contains("nonexistent-term-xyzzy-12345"));
+    // --- XFilter (block-split bloom, physical section): present true, absent false ---
+    // Probe the on-disk filter directly: one 32-byte block at a self-computed offset.
+    EXPECT_TRUE(meta.has_bsbf());
+    ASSERT_GT(refs.bsbf.length, snii::format::kBsbfHeaderSize);
+    ASSERT_LE(refs.bsbf.offset + refs.bsbf.length, file.size());
+    const uint64_t bsbf_bitset = refs.bsbf.offset + snii::format::kBsbfHeaderSize;
+    const uint32_t bsbf_nblocks = static_cast<uint32_t>(
+        (refs.bsbf.length - snii::format::kBsbfHeaderSize) /
+        snii::format::kBsbfBytesPerBlock);
+    auto bsbf_present = [&](std::string_view term) {
+      const uint64_t h = snii::format::bsbf_hash(term);
+      const uint64_t off =
+          bsbf_bitset + static_cast<uint64_t>(
+                            snii::format::bsbf_block_index(h, bsbf_nblocks)) *
+                            snii::format::kBsbfBytesPerBlock;
+      return snii::format::bsbf_block_contains(h, file.data() + off);
+    };
+    EXPECT_TRUE(bsbf_present("apple"));
+    EXPECT_TRUE(bsbf_present("common"));
+    EXPECT_FALSE(bsbf_present("nonexistent-term-xyzzy-12345"));
 
     // --- windowed high-df term "common": read its .frq window ---
     bool found_common = false;

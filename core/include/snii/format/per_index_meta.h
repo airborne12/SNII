@@ -54,13 +54,18 @@ struct SectionRefs {
   RegionRef prx_pod;
   RegionRef norms;
   RegionRef null_bitmap;
+  // Block-split bloom XFilter section ([28B header][bitset]); {0,0} when absent.
+  // A PHYSICAL section (not embedded in the resident meta) so a single 32-byte block
+  // can be probed on demand without loading the whole filter at open.
+  RegionRef bsbf;
 };
 
 // Builds a per-index meta block by composing already-built sub-sections.
 class PerIndexMetaBuilder {
  public:
   // Header flags / feature bits.
-  static constexpr uint32_t kHasXFilter = 1u << 0;
+  static constexpr uint32_t kHasXFilter = 1u << 0;  // legacy fuse-8 (embedded)
+  static constexpr uint32_t kHasBsbf = 1u << 1;     // block-split bloom (section ref)
 
   PerIndexMetaBuilder(uint64_t index_id, std::string index_suffix,
                       uint32_t flags);
@@ -126,6 +131,9 @@ class PerIndexMetaReader {
   bool has_xfilter() const { return (flags_ & PerIndexMetaBuilder::kHasXFilter) != 0; }
   // Full kXFilter frame Slice (empty when no XFilter is present).
   Slice xfilter_bytes() const { return xfilter_; }
+
+  // Block-split bloom XFilter: present iff a non-empty bsbf section ref exists.
+  bool has_bsbf() const { return section_refs_.bsbf.length > 0; }
 
  private:
   uint64_t index_id_ = 0;

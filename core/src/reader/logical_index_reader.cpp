@@ -15,7 +15,11 @@ using snii::format::DictEntry;
 using snii::format::IndexTier;
 using snii::format::PerIndexMetaReader;
 using snii::format::SampledTermIndexReader;
-using snii::format::XFilterReader;
+using snii::format::bsbf_hash;
+using snii::format::bsbf_probe;
+using snii::format::kBsbfBytesPerBlock;
+using snii::format::kBsbfHeaderSize;
+using snii::format::RegionRef;
 
 Status LogicalIndexReader::open(snii::io::FileReader* file_reader,
                                 IndexTier tier, bool has_positions,
@@ -34,9 +38,22 @@ Status LogicalIndexReader::open(snii::io::FileReader* file_reader,
       out->meta_.sampled_term_index_bytes(), &out->sti_));
   SNII_RETURN_IF_ERROR(DictBlockDirectoryReader::open(
       out->meta_.dict_block_directory_bytes(), &out->dbd_));
-  if (out->meta_.has_xfilter()) {
-    SNII_RETURN_IF_ERROR(
-        XFilterReader::open(out->meta_.xfilter_bytes(), &out->xfilter_));
+  // Block-split bloom XFilter: derive the resident header from the section ref
+  // (offset+length) -- ZERO open-time I/O, the whole point of the on-demand design.
+  // The bitset starts at the constant offset section.offset + 28; one 32-byte block
+  // is read on demand per probe in lookup().
+  const RegionRef& bsbf = out->meta_.section_refs().bsbf;
+  if (bsbf.length > 0) {
+    if (bsbf.length <= kBsbfHeaderSize)
+      return Status::Corruption("logical_index: bsbf section too small");
+    const uint64_t num_bytes = bsbf.length - kBsbfHeaderSize;
+    if (num_bytes < kBsbfBytesPerBlock || (num_bytes % kBsbfBytesPerBlock) != 0 ||
+        (num_bytes & (num_bytes - 1)) != 0)
+      return Status::Corruption("logical_index: bsbf bitset size invalid");
+    out->bsbf_header_.num_bytes = static_cast<uint32_t>(num_bytes);
+    out->bsbf_header_.num_blocks = static_cast<uint32_t>(num_bytes / kBsbfBytesPerBlock);
+    out->bsbf_header_.bitset_base = bsbf.offset + kBsbfHeaderSize;
+    out->has_bsbf_ = true;
   }
   return Status::OK();
 }
@@ -47,9 +64,12 @@ Status LogicalIndexReader::lookup(std::string_view term, bool* found,
   *found = false;
   if (reader_ == nullptr) return Status::InvalidArgument("logical_index: not opened");
 
-  // 1. XFilter fast rejection.
-  if (meta_.has_xfilter() && !xfilter_.maybe_contains(term)) {
-    return Status::OK();
+  // 1. XFilter fast rejection: on-demand probe of ONE 32-byte block (no whole-filter
+  // load). DEFINITELY-ABSENT -> return empty without the dict-block read.
+  if (has_bsbf_) {
+    bool maybe = false;
+    SNII_RETURN_IF_ERROR(bsbf_probe(reader_, bsbf_header_, bsbf_hash(term), &maybe));
+    if (!maybe) return Status::OK();
   }
 
   // 2. SampledTermIndex -> candidate block ordinal.
