@@ -417,17 +417,21 @@ exact term 的不存在快速过滤（XFilter，简称 XF）位于 per-index met
 - **本地/热缓存(细粒度)**：探测 ~32B（一次 refill）≈ 免费；absent 词直接省掉一次 dict block 读（实测胜「无过滤器」16×）。XF 的价值在此区间最大。
 - **云冷读(1MiB FileCache 块地板)**：单块探测被 1MiB 块对齐顶成一个 cache block = 与它要省的 dict block 同量级 → absent 与「无过滤器」**持平**、present 多一个块。此区间过滤器净收益趋零，但 BSBF 按需读**至少不像 fuse-8 整表载入那样把成本放大到数 MB**。
 
-**布放与 gate。**
-- 任意词表规模均可用 BSBF + 按需读（探测成本恒定，**不再因 open 整读而需要按 256KB/32M 省略**）。
+**布放与 gate（L0/L1 分级，已实现）。**
+- **L0（小 filter，`bsbf section <= 256KB`）→ open 时整块载入常驻**：`lookup()` 走内存探测，**无 per-lookup round**（等价 fuse-8 常驻的免费探测，但用 BSBF）。open 仅一次廉价整读（云端 ≤1 个 1MiB cache block）。
+- **L1（大 filter，`> 256KB`）→ 仅头常驻**：`bitset_base`/`num_blocks` 由 section ref 推导，**零 open-time I/O**；`lookup()` 按需读 1 个 32B 块。大词表的 open 整读放大被消除。
+- 阈值 `kBsbfResidentMaxBytes`（默认 256KB）可调；实测依据见下「为何按 256KB 分级」。
 - 仅在「云冷 + present-heavy + 低复用」角落，可按构建期开关**直接省略 XF**（不写 `kHasBsbf` / `bsbf` section 长度为 0，reader 优雅降级走有界 dict 读）；reader 对无 XF 已支持。
 - XF 只用于 **exact term**。range、regexp、prefix、phrase_prefix 必须通过有序 term enum 展开，不能用 XF 裁剪。
+
+**为何按 256KB 分级（真实 OSS 实测）。** 无分级地一律按需探测时，S3 上**每个 present 词查询多 1 个 serial round**（探测块 + dict 块），低/中-df 词延迟翻倍、输给 CLucene（CL/SNII=0.50–0.54）；且云冷 1MiB 块地板下 absent 也省不下 dict 读。改 L0/L1 后小 filter 走常驻，词查询**回到 1 round、反超 CLucene（CL/SNII=1.21–1.38）**，大 filter 仍享零 open 载入。即：小 filter「open 一次整读 + 查询期免费」优于「查询期每查 +1 round」；大 filter 反之。
 
 **实现现状（已落地）。** BSBF + 按需单块探测已贯通 writer/reader，取代 binary-fuse-8（模块 `core/.../format/bsbf.{h,cpp}`，commit `b5c887a`）：
 - **writer**：每词收 XXH64（seed 0）key → `BsbfBuilder`（fpp=1%，Parquet `OptimalNumOfBytes` 定尺）→ 序列化 `[28B 头][连续未压缩小端 bitset]`。
 - **物理 section**：compound writer 把该 blob 作为独立 section 写入容器（norms 之后），绝对 offset/len 记入 `SectionRefs.bsbf`（第 6 个 RegionRef）；**不再嵌入常驻 meta block**。
-- **reader**：open 时**仅由 section ref 推导**常驻头（`bitset_base = bsbf.offset+28`、`num_blocks = (len-28)/32`），**零 open-time I/O**；`lookup()` 在读 dict 前 `bsbf_probe()` **按需读 1 个 32B 块**（`base+28+block*32`），DEFINITELY-ABSENT 直接返回空。
+- **reader（L0/L1 分级，commit `f33502d`）**：open 时由 section ref 推导头；**小 filter（≤256KB）整块载入常驻（L0）→ `lookup()` 内存探测、无 round**；**大 filter（>256KB）仅头常驻（L1）→ `bsbf_probe()` 按需读 1 个 32B 块**（`base+28+block*32`）。两者 DEFINITELY-ABSENT 都不读 dict 直接返回空。
 - **SIMD**：单块校验用 AVX2（256-bit 块 = 一个 YMM，`testc`/`or`），逐函数 `target("avx2")` + 运行时门控 + 标量回退；build ~2.8×、热查最高 ~4×（三个参考实现 Parquet/Doris 均无 SIMD）。
-- **现状边界**：present 词单段查询比无过滤器多一个块读（探测）；净价值在本地/热最大，云冷因 1MiB 块地板封顶。fuse-8 `xfilter.{h,cpp}` 保留（休眠，仍有单测），索引不再使用。**多段 fan-out 的批量单块拒绝（一轮 GET 多段 bsbf 块、批量裁绝对缺失段）为后续优化**，见下「多词算子的批量取窗」TODO。
+- **现状边界**：L0 下词查询 1 round（反超 CLucene）；L1 大 filter 的 present 词单段查询比无过滤器多 1 个块读（探测），净价值在本地/热最大、云冷因 1MiB 块地板封顶。fuse-8 `xfilter.{h,cpp}` 保留（休眠，仍有单测，并由临时 env `SNII_XF_STRATEGY=fuse8` 可切换做 A/B），索引默认走 BSBF。**大词表 L1 的多段 fan-out 批量单块拒绝（一轮 GET 多段 bsbf 块、批量裁绝对缺失段）为后续优化**，见下「多词算子的批量取窗」TODO。
 ### 词典采样索引
 SampledTermIndex 位于 per-index meta block 中，用于将查询 term 定位到候选 DICT block。它是 DICT block 读取前使用的常驻元数据，随 SniiLogicalIndexReader 进入 searcher cache。
 SampledTermIndex 的采样粒度是 DICT block，而不是固定 term 数。writer 每生成一个 DICT block，就把该 block 的 first_term 写入 SampledTermIndex。这样索引规模与 DICT block 数量成正比，而不是与 term 总数成正比。
