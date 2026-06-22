@@ -228,7 +228,7 @@ void LayoutWindowRegions(const FrqRegionMeta& dd_meta, const std::vector<uint8_t
 // byte-identical to the single-pass build (regions/prelude/prx are independent).
 Status BuildWindowedPosting(TermPostings& tp, bool has_freq, bool has_prx,
                             const std::vector<uint8_t>& norms,
-                            TempSectionFile* post_file, WindowedPosting* out) {
+                            snii::io::FileWriter* posting_out, WindowedPosting* out) {
   const uint32_t unit = AdaptiveWindowDocs(static_cast<uint32_t>(tp.docids.size()));
   const size_t n = tp.docids.size();
   const std::span<const uint32_t> all_docs(tp.docids);
@@ -277,7 +277,7 @@ Status BuildWindowedPosting(TermPostings& tp, bool has_freq, bool has_prx,
             snii::format::build_prx_window_flat(pos_span, freqs, kAutoZstd, &sc.prx_sink));
         m.prx_off = out->prx_total_len;
         m.prx_len = static_cast<uint64_t>(sc.prx_sink.size());
-        SNII_RETURN_IF_ERROR(post_file->append(sc.prx_sink.buffer()));
+        SNII_RETURN_IF_ERROR(posting_out->append(sc.prx_sink.view()));
         out->prx_total_len += m.prx_len;
       }
       pos_off += win_pos;
@@ -355,12 +355,12 @@ Status LogicalIndexWriter::validate_term(const TermPostings& tp) const {
 Status LogicalIndexWriter::build_windowed_entry(TermPostings& tp, uint64_t frq_base,
                                                 uint64_t prx_base, DictEntry* e) {
   // The prx span starts here: pass 1 streams each .prx window straight into
-  // post_file_, so prx_off_delta is measured against the live posting-sink size.
-  const uint64_t prx_off = post_file_.size();
+  // the posting sink, so prx_off_delta is measured against the live posting-sink size.
+  const uint64_t prx_off = posting_size();
   WindowedPosting wp;
   SNII_RETURN_IF_ERROR(
-      BuildWindowedPosting(tp, has_freq_, has_prx_, encoded_norms_, &post_file_, &wp));
-  // wp.prx_total_len bytes were just appended to post_file_ (0 when !has_prx).
+      BuildWindowedPosting(tp, has_freq_, has_prx_, encoded_norms_, posting_out_, &wp));
+  // wp.prx_total_len bytes were just streamed straight to the posting sink (0 when !has_prx).
   // docids/freqs are now fully encoded into wp; release the source arrays before
   // the (potentially large) wp blocks are appended to disk.
   std::vector<uint32_t>().swap(tp.docids);
@@ -377,14 +377,14 @@ Status LogicalIndexWriter::build_windowed_entry(TermPostings& tp, uint64_t frq_b
 
   // The frq span starts immediately AFTER the prx span, in the SAME sink. The
   // writer-side property frq_off == prx_off + wp.prx_total_len holds because
-  // nothing is appended to post_file_ between the prx pass and here -- but the
+  // nothing is appended to the posting sink between the prx pass and here -- but the
   // delta is measured from the live size, not assumed.
-  const uint64_t frq_off = post_file_.size();
-  SNII_RETURN_IF_ERROR(post_file_.append(prelude));
-  SNII_RETURN_IF_ERROR(post_file_.append(wp.dd_block));
-  SNII_RETURN_IF_ERROR(post_file_.append(wp.freq_block));
+  const uint64_t frq_off = posting_size();
+  SNII_RETURN_IF_ERROR(posting_out_->append(Slice(prelude)));
+  SNII_RETURN_IF_ERROR(posting_out_->append(Slice(wp.dd_block)));
+  SNII_RETURN_IF_ERROR(posting_out_->append(Slice(wp.freq_block)));
   e->frq_off_delta = frq_off - frq_base;
-  e->frq_len = post_file_.size() - frq_off;
+  e->frq_len = posting_size() - frq_off;
   if (has_prx_) {
     e->prx_off_delta = prx_off - prx_base;
     e->prx_len = wp.prx_total_len;  // == frq_off - prx_off
@@ -428,15 +428,15 @@ Status LogicalIndexWriter::build_slim_entry(TermPostings& tp, uint64_t frq_base,
   e->kind = DictEntryKind::kPodRef;
   e->frq_docs_len = dd_meta.disk_len;  // docs-only prefix = the single dd region
   if (has_prx_) {
-    const uint64_t prx_off = post_file_.size();
-    SNII_RETURN_IF_ERROR(post_file_.append(prx_win));
+    const uint64_t prx_off = posting_size();
+    SNII_RETURN_IF_ERROR(posting_out_->append(Slice(prx_win)));
     e->prx_off_delta = prx_off - prx_base;
-    e->prx_len = post_file_.size() - prx_off;
+    e->prx_len = posting_size() - prx_off;
   }
-  const uint64_t frq_off = post_file_.size();  // immediately after the prx span
-  SNII_RETURN_IF_ERROR(post_file_.append(frq_win));
+  const uint64_t frq_off = posting_size();  // immediately after the prx span
+  SNII_RETURN_IF_ERROR(posting_out_->append(Slice(frq_win)));
   e->frq_off_delta = frq_off - frq_base;
-  e->frq_len = post_file_.size() - frq_off;
+  e->frq_len = posting_size() - frq_off;
   return Status::OK();
 }
 
@@ -513,7 +513,7 @@ Status LogicalIndexWriter::process_term(TermPostings& tp, BlockState* st) {
 
   if (!st->block) {
     // Both bases come from the SAME posting sink, snapshotted at block open.
-    const uint64_t base = post_file_.size();
+    const uint64_t base = posting_size();
     st->frq_base = base;
     st->prx_base = base;
     st->block =
@@ -560,22 +560,28 @@ Status LogicalIndexWriter::build_blocks() {
   return Status::OK();
 }
 
-Status LogicalIndexWriter::build() {
+Status LogicalIndexWriter::build(snii::io::FileWriter* posting_out) {
+  if (posting_out == nullptr) {
+    return Status::InvalidArgument("logical_index: null posting sink");
+  }
   if (has_norms_ && encoded_norms_.size() != doc_count_) {
     return Status::InvalidArgument("logical_index: norms length must equal doc_count");
   }
-  // Open the scratch files BEFORE any term is processed: the DICT region and the
-  // interleaved posting region stream to disk instead of accumulating in RAM. The
-  // posting temp is ALWAYS opened, even when !has_prx (it then holds frq spans
-  // only) -- down from the prior three temps (dict + frq + prx).
+  // The interleaved posting region streams STRAIGHT into the container output (no
+  // temp round-trip): posting_size() is the region-relative byte count, derived from
+  // the output offset advanced since this index's region began. The DICT region is
+  // the only section that still buffers to a temp (it is produced interleaved with
+  // the posting region but must land contiguously after it).
+  posting_out_ = posting_out;
+  posting_off0_ = posting_out->bytes_written();
   SNII_RETURN_IF_ERROR(dict_file_.open("dict"));
-  SNII_RETURN_IF_ERROR(post_file_.open("post"));
 
   SNII_RETURN_IF_ERROR(build_blocks());
 
-  // Seal the scratch files so the orchestrator can stream them into the container.
+  // Seal the DICT scratch so the orchestrator can stream it into the container after
+  // the posting region (already written). The posting bytes need no seal -- they are
+  // already in the output.
   SNII_RETURN_IF_ERROR(dict_file_.seal());
-  SNII_RETURN_IF_ERROR(post_file_.seal());
 
   stats_.doc_count = doc_count_;
   stats_.indexed_doc_count = doc_count_;

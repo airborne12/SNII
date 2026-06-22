@@ -70,15 +70,19 @@ class SniiCompoundWriter {
     uint64_t bsbf_len = 0;
   };
 
+  Status ensure_bootstrap();
   Status write_bootstrap();
-  Status write_index_sections(std::vector<Placement>* placements);
-  Status write_norms(std::vector<Placement>* placements);
-  Status write_tail(const std::vector<Placement>& placements);
+  Status write_norms();
+  Status write_tail();
   Status append(const std::vector<uint8_t>& bytes);
 
   snii::io::FileWriter* out_;
   std::vector<std::unique_ptr<LogicalIndexWriter>> indexes_;
-  uint64_t cursor_ = 0;  // running absolute write offset
+  // Per-index placement; post_off/post_len are filled as each index's posting region
+  // streams in during add_logical_index, the rest during finish(). The absolute write
+  // offset is out_->bytes_written() (the single source of truth -- no separate cursor).
+  std::vector<Placement> placements_;
+  bool bootstrap_written_ = false;
   bool finished_ = false;
 };
 

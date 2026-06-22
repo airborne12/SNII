@@ -92,32 +92,30 @@ class LogicalIndexWriter {
  public:
   explicit LogicalIndexWriter(const SniiIndexInput& in);
 
-  // Builds DICT blocks, interleaved posting region, sampled-term index, dict
-  // directory, stats and xfilter. Must be called once before the accessors below.
-  // Returns InvalidArgument on inconsistent input (e.g. norms/doc_count
+  // Builds DICT blocks, the interleaved posting region, sampled-term index, dict
+  // directory, stats and bsbf. The posting region is written STRAIGHT into
+  // `posting_out` as terms are produced (no temp round-trip for the bulk); the
+  // orchestrator captures its absolute offset/length from posting_out->bytes_written()
+  // around this call. Must be called once before the accessors below. Returns
+  // InvalidArgument on a null sink or inconsistent input (e.g. norms/doc_count
   // mismatch when scoring is enabled, or non-ascending docids).
-  Status build();
+  Status build(snii::io::FileWriter* posting_out);
 
-  // Section byte lengths (relative; orchestrator decides their absolute offsets).
-  // The DICT region and the interleaved posting region are streamed to scratch
-  // temp files during build() rather than buffered in RAM, so only their lengths
-  // are exposed here; their bytes are emitted via stream_*_into below. norms stays
-  // in RAM (1 byte/doc, small) and is returned directly.
+  // DICT region byte length (relative; orchestrator decides its absolute offset). The
+  // DICT is the only big section still buffered to a temp during build(); its bytes
+  // are emitted via stream_dict_region_into below. The posting region went straight
+  // to the output during build(), so it has no length accessor here -- the
+  // orchestrator measures it directly. norms stays in RAM (1 byte/doc) and is
+  // returned directly.
   uint64_t dict_region_size() const { return dict_file_.size(); }
-  uint64_t posting_region_size() const { return post_file_.size(); }
   const std::vector<uint8_t>& norms_bytes() const { return norms_section_; }
   // Block-split bloom XFilter blob ([28B header][bitset]); empty when no terms.
   const std::vector<uint8_t>& bsbf_bytes() const { return bsbf_bytes_; }
   bool has_bsbf() const { return !bsbf_bytes_.empty(); }
 
-  // Streams each section's bytes into the append-only container writer using a
-  // fixed copy buffer (no whole-section reload). Append order/content is
-  // unchanged, so the produced container is byte-identical to the in-RAM path.
+  // Streams the DICT region into the append-only container after its posting region.
   Status stream_dict_region_into(snii::io::FileWriter* out) const {
     return dict_file_.stream_into(out);
-  }
-  Status stream_posting_region_into(snii::io::FileWriter* out) const {
-    return post_file_.stream_into(out);
   }
 
   bool has_prx() const { return has_prx_; }
@@ -161,6 +159,13 @@ class LogicalIndexWriter {
   // arrays (docids/freqs/positions_flat) as soon as they are consumed, so the
   // widest term's source does not co-exist with its encoded output at peak RSS.
   Status process_term(TermPostings& tp, BlockState* st);
+  // Region-relative byte count of the posting bytes written so far (the offset basis
+  // for frq_base/prx_base + frq_off_delta/prx_off_delta). During build() the only
+  // writes to posting_out_ are this index's posting region, so the count is the
+  // output offset advanced since the region began.
+  uint64_t posting_size() const {
+    return posting_out_->bytes_written() - posting_off0_;
+  }
   // Builds one DictEntry (inline or pod_ref), growing the posting region as needed.
   Status build_entry(TermPostings& tp, uint64_t frq_base, uint64_t prx_base,
                      snii::format::DictEntry* e);
@@ -190,12 +195,15 @@ class LogicalIndexWriter {
 
   uint32_t target_dict_block_bytes_;
   // Large per-term-accumulated sections streamed to scratch temp files instead of
-  // being buffered in RAM until finish(). build() seals them; the orchestrator
-  // streams them into the container. RAII-cleaned on every path. post_file_ holds
-  // the interleaved [prx][frq] posting region (was two separate frq/prx temps);
-  // it is ALWAYS opened, even when !has_prx (it then holds frq spans only).
+  // being buffered in RAM until finish(). build() seals it; the orchestrator streams
+  // it into the container after the posting region. RAII-cleaned on every path.
   TempSectionFile dict_file_;
-  TempSectionFile post_file_;
+  // The interleaved [prx][frq] posting region streams STRAIGHT into the container
+  // output during build() -- no temp. posting_out_ is the container writer (borrowed
+  // for the duration of build); posting_off0_ is its absolute offset when this index's
+  // region began, so posting_size() = bytes_written() - posting_off0_.
+  snii::io::FileWriter* posting_out_ = nullptr;
+  uint64_t posting_off0_ = 0;
   std::vector<uint8_t> norms_section_;
 
   std::vector<BlockRecord> blocks_;
