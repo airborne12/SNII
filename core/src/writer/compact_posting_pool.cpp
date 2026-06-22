@@ -1,9 +1,8 @@
 #include "snii/writer/compact_posting_pool.h"
 
 #include <cstdint>
-#include <cstdio>
-#include <cstdlib>
 #include <cstring>
+#include <stdexcept>
 
 namespace snii::writer {
 
@@ -43,15 +42,16 @@ uint32_t CompactPostingPool::alloc_run(uint32_t bytes) {
   // Hard invariant (see arena_bytes()): the uint32 offset must never wrap. The spimi
   // accumulator force-spills below 4 GiB, but enforce it here too -- in release as
   // well as debug -- so any direct user of the pool fails loudly instead of silently
-  // aliasing block 0. The run starts either in the current tail or at a new block's
-  // base; compute that start in 64 bits before the uint32 arithmetic can wrap.
+  // aliasing block 0. We are a library: throw and let the caller decide how to
+  // handle it, rather than aborting the process. The run starts either in the
+  // current tail or at a new block's base; compute that start in 64 bits before the
+  // uint32 arithmetic can wrap.
   const uint64_t run_start =
       need_block ? static_cast<uint64_t>(blocks_.size()) * kBlockSize : next_offset_;
   if (run_start + bytes > UINT32_MAX) {
-    std::fprintf(stderr,
-                 "snii: CompactPostingPool arena exceeded the 4 GiB uint32 offset "
-                 "limit; the caller must spill before this point\n");
-    std::abort();
+    throw std::overflow_error(
+        "snii: CompactPostingPool arena exceeded the 4 GiB uint32 offset limit; "
+        "the caller must spill before this point");
   }
   if (need_block) {
     blocks_.emplace_back(kBlockSize, 0);
