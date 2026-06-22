@@ -51,6 +51,11 @@
 //   Inline entries carry no off_delta (bytes live in the entry).
 namespace snii::writer {
 
+// TEMP (A/B bench): which absent-term filter the writer builds.
+enum class XfStrategy { kBsbf, kFuse8 };
+// Reads env SNII_XF_STRATEGY ("fuse8" -> kFuse8, anything else / unset -> kBsbf).
+XfStrategy xf_strategy_from_env();
+
 // Inputs describing one logical index to be written.
 struct SniiIndexInput {
   uint64_t index_id = 0;
@@ -193,12 +198,17 @@ class LogicalIndexWriter {
 
   std::vector<BlockRecord> blocks_;
   std::vector<std::string> sample_first_terms_;
-  // One 8-byte XXH64 (seed 0) key per term -- the only input the block-split bloom
-  // XFilter needs -- collected during the build pass so the whole-vocabulary string
-  // copy is never retained.
+  // One 8-byte filter key per term (XXH64-seed-0 for BSBF, XXH3 for fuse-8),
+  // collected during the build pass so the whole-vocabulary string copy is never
+  // retained.
   std::vector<uint64_t> term_hashes_;
   snii::format::StatsBlock stats_;
   std::vector<uint8_t> bsbf_bytes_;  // serialized block-split bloom XFilter section
+  // TEMP (A/B bench): selectable XFilter strategy. kBsbf = block-split bloom as a
+  // physical section probed on demand; kFuse8 = legacy binary-fuse-8 embedded in the
+  // resident meta block. Chosen by env SNII_XF_STRATEGY (default bsbf).
+  XfStrategy xf_strategy_ = XfStrategy::kBsbf;
+  std::vector<uint8_t> xfilter_bytes_;  // fuse-8 frame (only when kFuse8)
 };
 
 }  // namespace snii::writer

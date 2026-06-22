@@ -1,6 +1,8 @@
 #include "snii/writer/logical_index_writer.h"
 
 #include <algorithm>
+#include <cstdlib>
+#include <cstring>
 #include <memory>
 #include <span>
 #include <utility>
@@ -15,6 +17,7 @@
 #include "snii/format/frq_pod.h"
 #include "snii/format/norms_pod.h"
 #include "snii/format/prx_pod.h"
+#include "snii/format/xfilter.h"  // TEMP: fuse-8 strategy for A/B bench
 
 namespace snii::writer {
 
@@ -308,6 +311,12 @@ Status BuildWindowedPosting(TermPostings& tp, bool has_freq, bool has_prx,
 
 }  // namespace
 
+XfStrategy xf_strategy_from_env() {
+  const char* s = std::getenv("SNII_XF_STRATEGY");
+  if (s != nullptr && std::strcmp(s, "fuse8") == 0) return XfStrategy::kFuse8;
+  return XfStrategy::kBsbf;
+}
+
 LogicalIndexWriter::LogicalIndexWriter(const SniiIndexInput& in)
     : index_id_(in.index_id),
       index_suffix_(in.index_suffix),
@@ -321,7 +330,8 @@ LogicalIndexWriter::LogicalIndexWriter(const SniiIndexInput& in)
       encoded_norms_(in.encoded_norms),
       target_dict_block_bytes_(in.target_dict_block_bytes != 0
                                    ? in.target_dict_block_bytes
-                                   : snii::format::kDefaultTargetDictBlockBytes) {}
+                                   : snii::format::kDefaultTargetDictBlockBytes),
+      xf_strategy_(xf_strategy_from_env()) {}
 
 Status LogicalIndexWriter::validate_term(const TermPostings& tp) const {
   if (tp.freqs.size() != tp.docids.size()) {
@@ -495,8 +505,10 @@ struct LogicalIndexWriter::BlockState {
 Status LogicalIndexWriter::process_term(TermPostings& tp, BlockState* st) {
   SNII_RETURN_IF_ERROR(validate_term(tp));
   // Collect only the 8-byte filter key per term (no whole-vocabulary string copy).
-  // BSBF key = XXH64 seed 0 (Parquet-canonical), NOT the fuse-8 XXH3.
-  term_hashes_.push_back(snii::format::bsbf_hash(tp.term));
+  // BSBF key = XXH64 seed 0 (Parquet-canonical); fuse-8 key = XXH3 (legacy).
+  term_hashes_.push_back(xf_strategy_ == XfStrategy::kFuse8
+                             ? snii::format::hash_term(tp.term)
+                             : snii::format::bsbf_hash(tp.term));
   ++term_count_;
   stats_.sum_total_term_freq += SumOf(tp.freqs);
 
@@ -578,19 +590,28 @@ Status LogicalIndexWriter::build() {
     norms_section_ = nsink.buffer();
   }
 
-  // Build the absent-term filter (block-split bloom, Parquet-canonical) from the
-  // per-term keys (XXH64 seed 0; no retained strings). Serialized as a self-
-  // describing [28B header][bitset] blob; the compound writer places it as a
-  // PHYSICAL section so the reader can probe one 32B block on demand at open.
+  // Build the absent-term filter from the per-term keys (no retained strings).
   bsbf_bytes_.clear();
+  xfilter_bytes_.clear();
   if (!term_hashes_.empty()) {
-    snii::format::BsbfBuilder bf;
-    SNII_RETURN_IF_ERROR(snii::format::BsbfBuilder::create(
-        static_cast<uint32_t>(term_hashes_.size()), kBsbfFpp, &bf));
-    for (uint64_t k : term_hashes_) bf.insert(k);
-    ByteSink bsink;
-    SNII_RETURN_IF_ERROR(bf.serialize(&bsink));
-    bsbf_bytes_ = bsink.buffer();
+    if (xf_strategy_ == XfStrategy::kFuse8) {
+      // Legacy binary-fuse-8, embedded in the resident meta block (loaded whole
+      // at open; per-lookup probe is in-memory).
+      ByteSink xsink;
+      SNII_RETURN_IF_ERROR(
+          snii::format::build_xfilter_hashed(std::move(term_hashes_), &xsink));
+      xfilter_bytes_ = xsink.buffer();
+    } else {
+      // Block-split bloom (Parquet-canonical) as a [28B header][bitset] blob; the
+      // compound writer places it as a PHYSICAL section probed one block on demand.
+      snii::format::BsbfBuilder bf;
+      SNII_RETURN_IF_ERROR(snii::format::BsbfBuilder::create(
+          static_cast<uint32_t>(term_hashes_.size()), kBsbfFpp, &bf));
+      for (uint64_t k : term_hashes_) bf.insert(k);
+      ByteSink bsink;
+      SNII_RETURN_IF_ERROR(bf.serialize(&bsink));
+      bsbf_bytes_ = bsink.buffer();
+    }
   }
   std::vector<uint64_t>().swap(term_hashes_);  // release
   return Status::OK();
@@ -620,13 +641,15 @@ Status LogicalIndexWriter::finish_meta(const SectionRefs& abs_refs,
   ByteSink dir_sink;
   dir.finish(&dir_sink);
 
-  const uint32_t flags =
-      bsbf_bytes_.empty() ? 0u : PerIndexMetaBuilder::kHasBsbf;
+  uint32_t flags = 0;
+  if (!bsbf_bytes_.empty()) flags |= PerIndexMetaBuilder::kHasBsbf;
+  if (!xfilter_bytes_.empty()) flags |= PerIndexMetaBuilder::kHasXFilter;
   PerIndexMetaBuilder builder(index_id_, index_suffix_, flags);
   builder.set_stats(stats_);
   builder.set_sampled_term_index(sti_sink.view());
   builder.set_dict_block_directory(dir_sink.view());
-  // The BSBF is a physical section (abs_refs.bsbf), not embedded here.
+  // BSBF is a physical section (abs_refs.bsbf); fuse-8 is embedded here.
+  if (!xfilter_bytes_.empty()) builder.set_xfilter(Slice(xfilter_bytes_));
   builder.set_section_refs(abs_refs);
   return builder.finish(out);
 }

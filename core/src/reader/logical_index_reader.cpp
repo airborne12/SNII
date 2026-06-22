@@ -54,6 +54,10 @@ Status LogicalIndexReader::open(snii::io::FileReader* file_reader,
     out->bsbf_header_.num_blocks = static_cast<uint32_t>(num_bytes / kBsbfBytesPerBlock);
     out->bsbf_header_.bitset_base = bsbf.offset + kBsbfHeaderSize;
     out->has_bsbf_ = true;
+  } else if (out->meta_.has_xfilter()) {
+    // TEMP (A/B): legacy fuse-8 resident filter, loaded whole from the meta block.
+    SNII_RETURN_IF_ERROR(snii::format::XFilterReader::open(
+        out->meta_.xfilter_bytes(), &out->xfilter_));
   }
   return Status::OK();
 }
@@ -64,12 +68,15 @@ Status LogicalIndexReader::lookup(std::string_view term, bool* found,
   *found = false;
   if (reader_ == nullptr) return Status::InvalidArgument("logical_index: not opened");
 
-  // 1. XFilter fast rejection: on-demand probe of ONE 32-byte block (no whole-filter
-  // load). DEFINITELY-ABSENT -> return empty without the dict-block read.
+  // 1. XFilter fast rejection. DEFINITELY-ABSENT -> return empty without the dict read.
+  //    BSBF: on-demand probe of ONE 32-byte block (no whole-filter load).
+  //    fuse-8 (TEMP A/B): in-memory probe of the resident filter (loaded at open).
   if (has_bsbf_) {
     bool maybe = false;
     SNII_RETURN_IF_ERROR(bsbf_probe(reader_, bsbf_header_, bsbf_hash(term), &maybe));
     if (!maybe) return Status::OK();
+  } else if (meta_.has_xfilter() && !xfilter_.maybe_contains(term)) {
+    return Status::OK();
   }
 
   // 2. SampledTermIndex -> candidate block ordinal.

@@ -13,6 +13,7 @@
 #include "snii/format/sampled_term_index.h"
 #include "snii/format/stats_block.h"
 #include "snii/format/bsbf.h"
+#include "snii/format/xfilter.h"  // TEMP: fuse-8 strategy for A/B bench
 #include "snii/io/file_reader.h"
 
 // LogicalIndexReader -- read-side counterpart of LogicalIndexWriter for one
@@ -92,6 +93,7 @@ class LogicalIndexReader {
   snii::format::DictBlockDirectoryReader dbd_;
   snii::format::BsbfHeader bsbf_header_;  // resident header (from section ref)
   bool has_bsbf_ = false;
+  snii::format::XFilterReader xfilter_;  // TEMP: fuse-8 resident filter (A/B)
 };
 
 }  // namespace snii::reader

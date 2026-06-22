@@ -344,8 +344,12 @@ int run_oss_mode(const Args& args, const bench::Corpus& corpus,
   snii::io::AwsApiGuard aws_guard;
 
   std::printf("\n=== REAL-OSS mode ===\n");
-  std::printf("oss endpoint=%s bucket=%s prefix=%s\n", cfg.endpoint.c_str(),
-              cfg.bucket.c_str(), cfg.prefix.c_str());
+  const char* xf_env = std::getenv("SNII_XF_STRATEGY");
+  std::printf("oss endpoint=%s bucket=%s prefix=%s  [SNII XFilter=%s]\n",
+              cfg.endpoint.c_str(), cfg.bucket.c_str(), cfg.prefix.c_str(),
+              (xf_env != nullptr && std::strcmp(xf_env, "fuse8") == 0)
+                  ? "fuse8-resident"
+                  : "bsbf-ondemand");
 
   bench::SniiOssAdapter snii_idx;
   bench::CluceneOssAdapter cl_idx;
