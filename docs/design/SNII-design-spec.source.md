@@ -419,10 +419,15 @@ exact term 的不存在快速过滤（XFilter，简称 XF）位于 per-index met
 
 **布放与 gate。**
 - 任意词表规模均可用 BSBF + 按需读（探测成本恒定，**不再因 open 整读而需要按 256KB/32M 省略**）。
-- 仅在「云冷 + present-heavy + 低复用」角落，可按构建期开关**直接省略 XF**（`kHasXFilter=0`，reader 优雅降级走有界 dict 读）；reader 对无 XF 已支持。
+- 仅在「云冷 + present-heavy + 低复用」角落，可按构建期开关**直接省略 XF**（不写 `kHasBsbf` / `bsbf` section 长度为 0，reader 优雅降级走有界 dict 读）；reader 对无 XF 已支持。
 - XF 只用于 **exact term**。range、regexp、prefix、phrase_prefix 必须通过有序 term enum 展开，不能用 XF 裁剪。
 
-**实现现状（待迁移）。** 当前实现仍是 binary-fuse-8 + 嵌入 meta block + open 整表载入；上面的 BSBF + 按需单块探测为**定稿目标设计**，结合 Doris+SNII 落地时迁移。
+**实现现状（已落地）。** BSBF + 按需单块探测已贯通 writer/reader，取代 binary-fuse-8（模块 `core/.../format/bsbf.{h,cpp}`，commit `b5c887a`）：
+- **writer**：每词收 XXH64（seed 0）key → `BsbfBuilder`（fpp=1%，Parquet `OptimalNumOfBytes` 定尺）→ 序列化 `[28B 头][连续未压缩小端 bitset]`。
+- **物理 section**：compound writer 把该 blob 作为独立 section 写入容器（norms 之后），绝对 offset/len 记入 `SectionRefs.bsbf`（第 6 个 RegionRef）；**不再嵌入常驻 meta block**。
+- **reader**：open 时**仅由 section ref 推导**常驻头（`bitset_base = bsbf.offset+28`、`num_blocks = (len-28)/32`），**零 open-time I/O**；`lookup()` 在读 dict 前 `bsbf_probe()` **按需读 1 个 32B 块**（`base+28+block*32`），DEFINITELY-ABSENT 直接返回空。
+- **SIMD**：单块校验用 AVX2（256-bit 块 = 一个 YMM，`testc`/`or`），逐函数 `target("avx2")` + 运行时门控 + 标量回退；build ~2.8×、热查最高 ~4×（三个参考实现 Parquet/Doris 均无 SIMD）。
+- **现状边界**：present 词单段查询比无过滤器多一个块读（探测）；净价值在本地/热最大，云冷因 1MiB 块地板封顶。fuse-8 `xfilter.{h,cpp}` 保留（休眠，仍有单测），索引不再使用。**多段 fan-out 的批量单块拒绝（一轮 GET 多段 bsbf 块、批量裁绝对缺失段）为后续优化**，见下「多词算子的批量取窗」TODO。
 ### 词典采样索引
 SampledTermIndex 位于 per-index meta block 中，用于将查询 term 定位到候选 DICT block。它是 DICT block 读取前使用的常驻元数据，随 SniiLogicalIndexReader 进入 searcher cache。
 SampledTermIndex 的采样粒度是 DICT block，而不是固定 term 数。writer 每生成一个 DICT block，就把该 block 的 first_term 写入 SampledTermIndex。这样索引规模与 DICT block 数量成正比，而不是与 term 总数成正比。
