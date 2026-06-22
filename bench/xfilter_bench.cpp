@@ -35,8 +35,9 @@ using snii::format::build_xfilter_hashed;
 using snii::format::hash_term;
 
 // --- Block-split bloom filter (Parquet/Doris BSBF algorithm) ---
+// Canonical Parquet/Doris split-block bloom SALT (8 odd 32-bit constants).
 constexpr uint32_t kSalt[8] = {0x47b6137bU, 0x44974d91U, 0x8824ad5bU, 0xa2b7289dU,
-                               0x705495c7U, 0x2df1424cU, 0x9efc4947U, 0x5c6bfb31U};
+                               0x705495c7U, 0x2df1424bU, 0x9efc4947U, 0x5c6bfb31U};
 constexpr uint32_t kBytesPerBlock = 32;            // 256-bit block = 8 x uint32
 constexpr uint32_t kMaxBloomBytes = 128u * 1024 * 1024;
 constexpr uint32_t kMinBloomBytes = 32;
