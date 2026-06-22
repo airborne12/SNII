@@ -15,7 +15,6 @@
 #include "snii/format/stats_block.h"
 #include "snii/io/file_writer.h"
 #include "snii/writer/spimi_term_buffer.h"
-#include "snii/writer/temp_section_file.h"
 
 // LogicalIndexWriter -- builds the per-logical-index section bytes (interleaved
 // posting region + DICT block region) and the meta sub-sections (SampledTermIndex,
@@ -102,12 +101,14 @@ class LogicalIndexWriter {
   Status build(snii::io::FileWriter* posting_out);
 
   // DICT region byte length (relative; orchestrator decides its absolute offset). The
-  // DICT is the only big section still buffered to a temp during build(); its bytes
-  // are emitted via stream_dict_region_into below. The posting region went straight
-  // to the output during build(), so it has no length accessor here -- the
-  // orchestrator measures it directly. norms stays in RAM (1 byte/doc) and is
-  // returned directly.
-  uint64_t dict_region_size() const { return dict_file_.size(); }
+  // DICT region (zstd-compressed blocks) accumulates in RAM during build() -- it must
+  // be laid out contiguously after the posting region, which is being streamed
+  // concurrently, so it cannot stream directly; it is far smaller than the posting
+  // region (the bulk). Its bytes are emitted via stream_dict_region_into below. The
+  // posting region went straight to the output during build(), so it has no length
+  // accessor here -- the orchestrator measures it directly. norms stays in RAM
+  // (1 byte/doc) and is returned directly.
+  uint64_t dict_region_size() const { return dict_buf_.size(); }
   const std::vector<uint8_t>& norms_bytes() const { return norms_section_; }
   // Block-split bloom XFilter blob ([28B header][bitset]); empty when no terms.
   const std::vector<uint8_t>& bsbf_bytes() const { return bsbf_bytes_; }
@@ -115,7 +116,7 @@ class LogicalIndexWriter {
 
   // Streams the DICT region into the append-only container after its posting region.
   Status stream_dict_region_into(snii::io::FileWriter* out) const {
-    return dict_file_.stream_into(out);
+    return out->append(dict_buf_.view());
   }
 
   bool has_prx() const { return has_prx_; }
@@ -131,11 +132,11 @@ class LogicalIndexWriter {
                      uint64_t dict_region_offset, ByteSink* out) const;
 
  private:
-  // One DICT block's directory record. The block's serialized bytes are streamed
-  // to the dict scratch file as soon as the block is cut (not retained); only this
-  // compact summary (offset within the dict region + length + entry count +
-  // checksum) is kept to build the DICT block directory at finish_meta time. The
-  // absolute file offset is computed as dict_region_offset + rel_offset.
+  // One DICT block's directory record. The block's serialized bytes are appended to
+  // the in-RAM dict buffer as soon as the block is cut; only this compact summary
+  // (offset within the dict region + length + entry count + checksum) is kept to
+  // build the DICT block directory at finish_meta time. The absolute file offset is
+  // computed as dict_region_offset + rel_offset.
   struct BlockRecord {
     uint64_t rel_offset = 0;  // byte offset of this block within the dict region
     uint64_t length = 0;      // ON-DISK block length (compressed when flags&kZstd)
@@ -194,10 +195,13 @@ class LogicalIndexWriter {
   const std::vector<uint8_t>& encoded_norms_;
 
   uint32_t target_dict_block_bytes_;
-  // Large per-term-accumulated sections streamed to scratch temp files instead of
-  // being buffered in RAM until finish(). build() seals it; the orchestrator streams
-  // it into the container after the posting region. RAII-cleaned on every path.
-  TempSectionFile dict_file_;
+  // The DICT region (zstd-compressed blocks) accumulates in RAM as blocks flush. It
+  // must land contiguously AFTER the posting region (which streams concurrently to the
+  // output), so it cannot stream directly; it is far smaller than the posting region.
+  // The orchestrator streams it into the container right after the posting region.
+  // With the posting region now streamed directly, this is the writer's only section
+  // staging buffer -- no section temp files remain (only the SPIMI spill).
+  ByteSink dict_buf_;
   // The interleaved [prx][frq] posting region streams STRAIGHT into the container
   // output during build() -- no temp. posting_out_ is the container writer (borrowed
   // for the duration of build); posting_off0_ is its absolute offset when this index's

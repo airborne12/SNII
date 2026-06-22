@@ -179,7 +179,7 @@ void AppendBytes(std::vector<uint8_t>* dst, const std::vector<uint8_t>& src) {
 // One windowed term's grouped .frq layout (design 1.6): all dd regions form the
 // dd-block, all freq regions form the freq-block. The final frq span is
 // [prelude][dd-block][freq-block]. The .prx windows are STREAMED straight to the
-// posting scratch file during pass 1 (not buffered here) -- so the widest term's
+// posting sink (the container output) during pass 1 (not buffered here) -- so the widest term's
 // ~tens-of-MiB prx bytes never co-exist with the dd/freq blocks at peak RSS;
 // only prx_total_len (the entry's prx byte span) is tracked. Per-window metadata
 // (region offsets/lens/modes/crcs, prx_off within the entry) is recorded for the prelude.
@@ -236,8 +236,8 @@ Status BuildWindowedPosting(TermPostings& tp, bool has_freq, bool has_prx,
 
   WindowScratch sc;  // reused across all windows (no per-window allocation churn)
 
-  // ---- pass 1: prx (STREAMED to disk) + window skeleton ----
-  // Each window's .prx bytes are appended straight to the posting scratch file as
+  // ---- pass 1: prx (STREAMED to the output) + window skeleton ----
+  // Each window's .prx bytes are appended straight to the posting sink (container output) as
   // they are built, so the entry's full prx payload (tens of MiB for the widest
   // term) is never buffered in RAM alongside the dd/freq blocks that pass 2
   // grows. m.prx_off is the byte offset WITHIN this entry's prx span (running
@@ -472,7 +472,7 @@ Status LogicalIndexWriter::flush_block(DictBlockBuilder* block,
   block->finish(&bsink);
   const Slice plain = bsink.view();
   BlockRecord rec;
-  rec.rel_offset = dict_file_.size();
+  rec.rel_offset = dict_buf_.size();
   rec.n_entries = block->n_entries();
   rec.checksum = snii::crc32c(plain);  // crc over UNCOMPRESSED block bytes
   rec.first_term = first_term;
@@ -483,12 +483,12 @@ Status LogicalIndexWriter::flush_block(DictBlockBuilder* block,
     rec.flags = snii::format::block_ref_flags::kZstd;
     rec.uncomp_len = static_cast<uint64_t>(plain.size());
     rec.length = static_cast<uint64_t>(comp.size());
-    SNII_RETURN_IF_ERROR(dict_file_.append(comp));
+    dict_buf_.put_bytes(Slice(comp));
   } else {
     rec.flags = 0;
     rec.uncomp_len = 0;
     rec.length = static_cast<uint64_t>(plain.size());
-    SNII_RETURN_IF_ERROR(dict_file_.append(bsink.buffer()));
+    dict_buf_.put_bytes(bsink.view());
   }
   sample_first_terms_.push_back(std::move(first_term));
   blocks_.push_back(std::move(rec));
@@ -569,19 +569,14 @@ Status LogicalIndexWriter::build(snii::io::FileWriter* posting_out) {
   }
   // The interleaved posting region streams STRAIGHT into the container output (no
   // temp round-trip): posting_size() is the region-relative byte count, derived from
-  // the output offset advanced since this index's region began. The DICT region is
-  // the only section that still buffers to a temp (it is produced interleaved with
-  // the posting region but must land contiguously after it).
+  // the output offset advanced since this index's region began. The DICT region
+  // accumulates in RAM (dict_buf_) since it must land contiguously after the
+  // concurrently-streamed posting region; it is the only staging buffer left -- no
+  // section temp files remain (only the SPIMI spill).
   posting_out_ = posting_out;
   posting_off0_ = posting_out->bytes_written();
-  SNII_RETURN_IF_ERROR(dict_file_.open("dict"));
 
   SNII_RETURN_IF_ERROR(build_blocks());
-
-  // Seal the DICT scratch so the orchestrator can stream it into the container after
-  // the posting region (already written). The posting bytes need no seal -- they are
-  // already in the output.
-  SNII_RETURN_IF_ERROR(dict_file_.seal());
 
   stats_.doc_count = doc_count_;
   stats_.indexed_doc_count = doc_count_;
