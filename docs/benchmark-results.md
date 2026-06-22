@@ -410,3 +410,42 @@ keyword docs-only 索引体积(另测,SeverityText 2M):CLucene 2,828,496 B ｜ S
 | TERM 中/低频 wall ±0.1~0.9ms | 噪声 | 1 GET=1 轮,与 CLucene 同结构;SNII 固定 CPU ~3µs=wall 0.03%;request_bytes 还少 100–142×;OSS 抖动。 |
 
 **收尾结论**:真实 S3 上 SNII 唯一需修的是**宽 PREFIX/OR/phrase-prefix 的逐词串行往返**(设计文档已记 TODO,批量取一轮即可,且 Doris 同款串行、靠缓存兜,SNII 在算子层做才是差异化);其余「扫描更多」均为单 compound 文件的 1MiB 块占用 artifact,真实传输与延迟 SNII 全胜。
+
+---
+
+# XFilter(fuse-8)vs Block-Split Bloom(BSBF)实测
+
+根因:SNII 的 XF(binary-fuse-8)在 open 时**整表载入**才能探一个词,大词表下这次读放大成瓶颈。BSBF(Parquet/Doris block-split bloom:256-bit 块、8 SALT 掩码、`bucket=(hash>>32)&(nblocks-1)`、Parquet `OptimalNumOfBytes` 定尺)一个词只摸**1 个 32 字节块**,可**按需单块读**。
+
+`snii_xfilter_bench`:两者用**同一 XXH3 key**(隔离结构而非 hash),经真实 `MeteredFileReader` 成本模型,absent/present 分开,云(1MiB 块)/本地(4KiB)两种粒度。复现:`cmake --build build-bench --target snii_xfilter_bench && ./build-bench/bench/snii_xfilter_bench --ndv N --fpp 0.01`。
+
+## 体积 / FPR
+| 词表 | XF(fuse-8) | BSBF | XF FPR | BSBF FPR |
+|---|---|---|---|---|
+| 500K | 573KB(9.18 bit/key)| 1MB(16.78)| 0.38% | 0.06% |
+| 2M | 2.26MB(9.04)| 4MB(16.78)| 0.40% | 0.13% |
+| 5M | 5.6MB(9.02)| 8MB(13.42)| 0.36% | 0.32% |
+| 20M | 22.5MB(9.02)| 33.5MB(13.42)| 0.42% | 0.32% |
+
+fuse-8 省 ~1.5–1.8× 体积、FPR 稳定 ~0.4%;BSBF 块大小取 2 的幂,小词表过量配置(500K→16.78 bit/key,FPR 反低)。
+
+## 探测的 filter 读(核心)
+| 词表 | XF load-whole(req / wall)| BSBF on-demand(req / wall)| BSBF 快 |
+|---|---|---|---|
+| 500K | 573KB / 0.20ms | 32B / 0.0009ms | ~220× |
+| 2M | 2.26MB / 0.95ms | 32B / 0.0019ms | ~500× |
+| 5M | 5.6MB / 2.42ms | 32B / 0.0021ms | ~1150× |
+| 20M | 22.5MB / **12.9ms** | 32B / **0.0043ms** | **~3000×** |
+
+**XF 探测随词表线性涨(整表载入);BSBF 单块按需探测恒定 ~32B/~0.004ms** —— open 整读放大被彻底消除。
+
+## 完整查询(filter + 命中则读 dict 64KB),块对齐 remote 字节 — absent ｜ present
+**本地(4KiB)**:无过滤器 64KB｜64KB;XF 573KB–22.5MB（惨败）｜+64KB;**BSBF 4KB（胜无过滤 16×）｜68KB（+4KB 微亏)**。
+**云冷(1MiB 块地板)**:无过滤器 1MiB｜1MiB;XF 1–22.5MiB（惨败）｜+1MiB;**BSBF 1MiB（=无过滤,平)｜2MiB（+1 块,亏)**。
+
+## 结论
+1. **filter 读这一步 BSBF 绝对胜**:恒定 32B/~0.004ms vs XF 随词表线性涨到 22.5MB/12.9ms(20M 快 3000×)。
+2. **absent 词**:本地/热 BSBF 胜无过滤 **16×**(省 dict 读),XF 惨败;云冷 BSBF **平**无过滤(32B 被 1MiB 块地板顶上),XF 惨败。
+3. **present 词**:BSBF 只多 1 个块(探测),XF 多整表载入。
+4. **代价**:BSBF 磁盘 ~1.6× 大、小词表 FPR 过配——但按需读让**体积与每查成本脱钩**。
+5. **定论**:XF 改用 **block-split bloom + 按需单块探测**;过滤器净价值在本地/热最大(absent 16×),云冷因 1MiB 块地板封顶(此时 BSBF 至少不像 XF 整读那样更糟)。

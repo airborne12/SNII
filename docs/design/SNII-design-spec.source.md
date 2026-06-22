@@ -404,11 +404,25 @@ DictEntry
 - `frq_off_delta / frq_len`：命中后生成 `.frq` range。
 - `prx_off_delta / prx_len`：phrase/positions 查询时生成 `.prx` range。
 - `inline frq_bytes / prx_bytes`：低频 term 直接在词典块内完成读取，不再访问外部 payload。
-### 不存在的term快速过滤
-位于 per-index meta block，使用 binary-fuse-8 作为 exact term 的不存在查找过滤。该结构适合 immutable segment：finish 时 term 集合已知，可以一次性构建。布放策略：
-- `xf_bytes <= 256KB`：放入 L0 常驻。
-- 超过 256KB：放入 L1，首查整体读取，之后依赖 FileCache。
-- `term_count > 32M`：允许省略，L0 标记 `xf_absent`。XF 只用于 exact term。range、regexp、prefix、phrase_prefix 必须通过有序 term enum 展开，不能用XF裁剪。
+### 不存在的term快速过滤（block-split bloom + 按需单块探测）
+exact term 的不存在快速过滤（XFilter，简称 XF）位于 per-index meta block，构建于 immutable segment 的 finish 阶段（term 集合已知，一次性构建）。
+
+**结构：block-split bloom filter（BSBF，对齐 Parquet/Doris）。** 过滤器是 256-bit（32 字节）块的数组：一个 term 的 key（XXH3-64）映射到唯一块 `bucket = (hash>>32) & (nblocks-1)`，在该块内由 8 个 SALT 掩码置/验 8 位。`nblocks = num_bytes/32`，`num_bytes` 取 2 的幂（Parquet `OptimalNumOfBytes(ndv, fpp)`），记于 28 字节头。
+
+**探测：按需读单块，不整表载入。** open 时只把**头 + 轻量句柄/基址**进 searcher cache（不 deep-copy 整 blob）。探一个词：由 `hash` + 头里的 `nblocks` **当场算出 bucket（O(1)，零 I/O）** → `read_at(base + bucket*32, 32)` 读**恰好一个 32 字节块** → 比 8 个掩码。**不需要 offset 表、不需要 per-block 目录、不改其余磁盘结构**（bucket 自算）。
+
+**为什么不是 binary-fuse-8。** fuse-8 体积更省（~9 vs ~13–17 bit/key、FPR 稳定 ~0.4%），但其 3 探针落在 `3×segment_length` 的窗口、**窗宽随词表涨**（100M 词≈384KB），无法「只读 32 字节」——只能整表载入。大词表下整表载入是 open 时的读放大瓶颈（实测 20M 词整表 22.5MB / 12.9ms）。BSBF 牺牲 ~1.6× 体积，换来**单块按需探测恒定 ~32B / ~0.004ms（与词表规模脱钩）**。完整对比见 `docs/benchmark-results.md`「XFilter vs Block-Split Bloom 实测」。
+
+**净价值的诚实边界（成本模型）。**
+- **本地/热缓存(细粒度)**：探测 ~32B（一次 refill）≈ 免费；absent 词直接省掉一次 dict block 读（实测胜「无过滤器」16×）。XF 的价值在此区间最大。
+- **云冷读(1MiB FileCache 块地板)**：单块探测被 1MiB 块对齐顶成一个 cache block = 与它要省的 dict block 同量级 → absent 与「无过滤器」**持平**、present 多一个块。此区间过滤器净收益趋零，但 BSBF 按需读**至少不像 fuse-8 整表载入那样把成本放大到数 MB**。
+
+**布放与 gate。**
+- 任意词表规模均可用 BSBF + 按需读（探测成本恒定，**不再因 open 整读而需要按 256KB/32M 省略**）。
+- 仅在「云冷 + present-heavy + 低复用」角落，可按构建期开关**直接省略 XF**（`kHasXFilter=0`，reader 优雅降级走有界 dict 读）；reader 对无 XF 已支持。
+- XF 只用于 **exact term**。range、regexp、prefix、phrase_prefix 必须通过有序 term enum 展开，不能用 XF 裁剪。
+
+**实现现状（待迁移）。** 当前实现仍是 binary-fuse-8 + 嵌入 meta block + open 整表载入；上面的 BSBF + 按需单块探测为**定稿目标设计**，结合 Doris+SNII 落地时迁移。
 ### 词典采样索引
 SampledTermIndex 位于 per-index meta block 中，用于将查询 term 定位到候选 DICT block。它是 DICT block 读取前使用的常驻元数据，随 SniiLogicalIndexReader 进入 searcher cache。
 SampledTermIndex 的采样粒度是 DICT block，而不是固定 term 数。writer 每生成一个 DICT block，就把该 block 的 first_term 写入 SampledTermIndex。这样索引规模与 DICT block 数量成正比，而不是与 term 总数成正比。
