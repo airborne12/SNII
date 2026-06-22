@@ -14,6 +14,7 @@
 #include "snii/format/sampled_term_index.h"
 #include "snii/format/stats_block.h"
 #include "snii/io/file_writer.h"
+#include "snii/writer/spillable_byte_buffer.h"
 #include "snii/writer/spimi_term_buffer.h"
 
 // LogicalIndexWriter -- builds the per-logical-index section bytes (interleaved
@@ -101,22 +102,23 @@ class LogicalIndexWriter {
   Status build(snii::io::FileWriter* posting_out);
 
   // DICT region byte length (relative; orchestrator decides its absolute offset). The
-  // DICT region (zstd-compressed blocks) accumulates in RAM during build() -- it must
-  // be laid out contiguously after the posting region, which is being streamed
-  // concurrently, so it cannot stream directly; it is far smaller than the posting
-  // region (the bulk). Its bytes are emitted via stream_dict_region_into below. The
-  // posting region went straight to the output during build(), so it has no length
-  // accessor here -- the orchestrator measures it directly. norms stays in RAM
-  // (1 byte/doc) and is returned directly.
+  // DICT region (zstd-compressed blocks) is built into a tiered buffer during build()
+  // -- it must land contiguously AFTER the posting region (streamed concurrently), so
+  // it cannot stream directly. The buffer stays in RAM while small (spill-only build)
+  // and spills to a temp once it crosses the RAM cap (bounded peak RSS for a huge
+  // dict). Its bytes are emitted via stream_dict_region_into below. The posting region
+  // went straight to the output during build(), so it has no length accessor here --
+  // the orchestrator measures it directly. norms stays in RAM (1 byte/doc).
   uint64_t dict_region_size() const { return dict_buf_.size(); }
   const std::vector<uint8_t>& norms_bytes() const { return norms_section_; }
   // Block-split bloom XFilter blob ([28B header][bitset]); empty when no terms.
   const std::vector<uint8_t>& bsbf_bytes() const { return bsbf_bytes_; }
   bool has_bsbf() const { return !bsbf_bytes_.empty(); }
 
-  // Streams the DICT region into the append-only container after its posting region.
+  // Streams the DICT region (RAM or spilled temp) into the append-only container
+  // after its posting region.
   Status stream_dict_region_into(snii::io::FileWriter* out) const {
-    return out->append(dict_buf_.view());
+    return dict_buf_.stream_into(out);
   }
 
   bool has_prx() const { return has_prx_; }
@@ -195,13 +197,14 @@ class LogicalIndexWriter {
   const std::vector<uint8_t>& encoded_norms_;
 
   uint32_t target_dict_block_bytes_;
-  // The DICT region (zstd-compressed blocks) accumulates in RAM as blocks flush. It
-  // must land contiguously AFTER the posting region (which streams concurrently to the
-  // output), so it cannot stream directly; it is far smaller than the posting region.
-  // The orchestrator streams it into the container right after the posting region.
-  // With the posting region now streamed directly, this is the writer's only section
-  // staging buffer -- no section temp files remain (only the SPIMI spill).
-  ByteSink dict_buf_;
+  // The DICT region (zstd-compressed blocks) is staged here as blocks flush. It must
+  // land contiguously AFTER the posting region (which streams concurrently to the
+  // output), so it cannot stream directly. The buffer is TIERED (like the bsbf L0/L1):
+  // RAM while under the cap (small index = zero section temp files = spill-only build),
+  // spilling to a temp once it crosses the cap (huge dict = bounded peak RSS). The
+  // orchestrator streams it into the container right after the posting region. The cap
+  // is set from SNII_DICT_RAM_MAX at construction.
+  SpillableByteBuffer dict_buf_;
   // The interleaved [prx][frq] posting region streams STRAIGHT into the container
   // output during build() -- no temp. posting_out_ is the container writer (borrowed
   // for the duration of build); posting_off0_ is its absolute offset when this index's

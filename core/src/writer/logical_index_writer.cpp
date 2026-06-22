@@ -1,6 +1,7 @@
 #include "snii/writer/logical_index_writer.h"
 
 #include <algorithm>
+#include <cstdlib>
 #include <memory>
 #include <span>
 #include <utility>
@@ -52,6 +53,22 @@ constexpr uint32_t kPreludeGroupSize = 64;
 // cost, and a per-lookup decode (~0.1ms/64KiB) that is dominated by the S3 round
 // trip it shrinks. Higher levels gain <1% here for materially more CPU.
 constexpr int kDictBlockZstdLevel = 3;
+
+// DICT-region RAM cap (bytes) before it spills to a temp. Tiered like the bsbf
+// L0/L1: a dict under the cap stays fully in RAM, so the whole index builds with zero
+// section temp files (spill-only); a larger dict spills so peak build RSS stays
+// bounded at ~the cap. 64 MiB default keeps typical segment dictionaries resident.
+// Overridable via SNII_DICT_RAM_MAX (bytes, 0/invalid = default). Read per build.
+constexpr uint64_t kDefaultDictRamMaxBytes = 64ull * 1024 * 1024;
+uint64_t dict_ram_cap_bytes() {
+  const char* s = std::getenv("SNII_DICT_RAM_MAX");
+  if (s != nullptr) {
+    char* end = nullptr;
+    const unsigned long long v = std::strtoull(s, &end, 10);
+    if (end != s && v > 0) return static_cast<uint64_t>(v);
+  }
+  return kDefaultDictRamMaxBytes;
+}
 
 using snii::format::FrqRegionMeta;
 
@@ -321,7 +338,8 @@ LogicalIndexWriter::LogicalIndexWriter(const SniiIndexInput& in)
       encoded_norms_(in.encoded_norms),
       target_dict_block_bytes_(in.target_dict_block_bytes != 0
                                    ? in.target_dict_block_bytes
-                                   : snii::format::kDefaultTargetDictBlockBytes) {}
+                                   : snii::format::kDefaultTargetDictBlockBytes),
+      dict_buf_(dict_ram_cap_bytes(), "dict") {}
 
 Status LogicalIndexWriter::validate_term(const TermPostings& tp) const {
   if (tp.freqs.size() != tp.docids.size()) {
@@ -483,12 +501,12 @@ Status LogicalIndexWriter::flush_block(DictBlockBuilder* block,
     rec.flags = snii::format::block_ref_flags::kZstd;
     rec.uncomp_len = static_cast<uint64_t>(plain.size());
     rec.length = static_cast<uint64_t>(comp.size());
-    dict_buf_.put_bytes(Slice(comp));
+    SNII_RETURN_IF_ERROR(dict_buf_.append(Slice(comp)));
   } else {
     rec.flags = 0;
     rec.uncomp_len = 0;
     rec.length = static_cast<uint64_t>(plain.size());
-    dict_buf_.put_bytes(bsink.view());
+    SNII_RETURN_IF_ERROR(dict_buf_.append(bsink.view()));
   }
   sample_first_terms_.push_back(std::move(first_term));
   blocks_.push_back(std::move(rec));
@@ -569,14 +587,16 @@ Status LogicalIndexWriter::build(snii::io::FileWriter* posting_out) {
   }
   // The interleaved posting region streams STRAIGHT into the container output (no
   // temp round-trip): posting_size() is the region-relative byte count, derived from
-  // the output offset advanced since this index's region began. The DICT region
-  // accumulates in RAM (dict_buf_) since it must land contiguously after the
-  // concurrently-streamed posting region; it is the only staging buffer left -- no
-  // section temp files remain (only the SPIMI spill).
+  // the output offset advanced since this index's region began. The DICT region is
+  // staged in dict_buf_ (tiered: RAM under the cap = spill-only; spills above it) since
+  // it must land contiguously after the concurrently-streamed posting region.
   posting_out_ = posting_out;
   posting_off0_ = posting_out->bytes_written();
 
   SNII_RETURN_IF_ERROR(build_blocks());
+  // Seal the dict buffer so a spilled temp is flushed before stream_dict_region_into
+  // reads it back. A no-op for a RAM-resident dict.
+  SNII_RETURN_IF_ERROR(dict_buf_.seal());
 
   stats_.doc_count = doc_count_;
   stats_.indexed_doc_count = doc_count_;
