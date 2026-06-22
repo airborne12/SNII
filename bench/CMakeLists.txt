@@ -13,16 +13,10 @@ find_package(ArrowParquet REQUIRED)
 file(GLOB_RECURSE SNII_BENCH_ALL CONFIGURE_DEPENDS ${CMAKE_CURRENT_SOURCE_DIR}/*.cpp)
 set(SNII_BENCH_SOURCES ${SNII_BENCH_ALL})
 list(FILTER SNII_BENCH_SOURCES EXCLUDE REGEX "_test\\.cpp$")
-# Standalone micro-benchmarks with their own main() (separate targets below).
-list(FILTER SNII_BENCH_SOURCES EXCLUDE REGEX "xfilter_bench\\.cpp$")
 
 add_executable(snii_bench ${SNII_BENCH_SOURCES})
 target_include_directories(snii_bench PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
 target_link_libraries(snii_bench PRIVATE snii snii_clucene snii_arrow)
-
-# XFilter (fuse-8) vs BSBF (block-split bloom) micro-benchmark: core lib only.
-add_executable(snii_xfilter_bench ${CMAKE_CURRENT_SOURCE_DIR}/xfilter_bench.cpp)
-target_link_libraries(snii_xfilter_bench PRIVATE snii Threads::Threads)
 
 # Real-OSS mode (optional). When SNII_WITH_S3 is ON the bench also compiles the
 # OSS-backed CLucene directory + adapters (all guarded by SNII_WITH_S3) and needs

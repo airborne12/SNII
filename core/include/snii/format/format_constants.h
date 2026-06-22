@@ -20,7 +20,7 @@ enum class SectionType : uint8_t {
   kStatsBlock = 1,
   kSampledTermIndex = 2,
   kDictBlockDirectory = 3,
-  kXFilter = 4,
+  kXFilter = 4,  // reserved: legacy embedded XFilter; meta no longer emits/reads it
   kSectionRefs = 5,
   kPerIndexMetaHeader = 6,
   kLogicalIndexDirectory = 7,
@@ -85,7 +85,5 @@ inline constexpr uint32_t kDefaultInlineThreshold = 256;  // slim encoded bytes 
 inline constexpr uint32_t kAdaptiveWindowDfThreshold = 8192;  // df >= this -> larger windows
 inline constexpr uint32_t kAdaptiveWindowDocs = 1024;         // larger window size (4 * base unit)
 inline constexpr uint32_t kDefaultTargetDictBlockBytes = 64 * 1024;
-inline constexpr uint32_t kXFilterL0MaxBytes = 256 * 1024;       // ≤ this size is resident in L0
-inline constexpr uint32_t kXFilterMaxTermCount = 32u * 1024 * 1024;  // > this count may omit XF
 
 }  // namespace snii::format

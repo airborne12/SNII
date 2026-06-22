@@ -417,7 +417,7 @@ keyword docs-only 索引体积(另测,SeverityText 2M):CLucene 2,828,496 B ｜ S
 
 根因:SNII 的 XF(binary-fuse-8)在 open 时**整表载入**才能探一个词,大词表下这次读放大成瓶颈。BSBF(Parquet/Doris block-split bloom:256-bit 块、8 SALT 掩码、`bucket=(hash>>32)&(nblocks-1)`、Parquet `OptimalNumOfBytes` 定尺)一个词只摸**1 个 32 字节块**,可**按需单块读**。
 
-`snii_xfilter_bench`:两者用**同一 XXH3 key**(隔离结构而非 hash),经真实 `MeteredFileReader` 成本模型,absent/present 分开,云(1MiB 块)/本地(4KiB)两种粒度。复现:`cmake --build build-bench --target snii_xfilter_bench && ./build-bench/bench/snii_xfilter_bench --ndv N --fpp 0.01`。
+`snii_xfilter_bench`(决策完成后已随 fuse-8 一并移除):两者用**同一 XXH3 key**(隔离结构而非 hash),经真实 `MeteredFileReader` 成本模型,absent/present 分开,云(1MiB 块)/本地(4KiB)两种粒度。下方数据保留为采用 BSBF 的依据。
 
 ## 体积 / FPR
 | 词表 | XF(fuse-8) | BSBF | XF FPR | BSBF FPR |

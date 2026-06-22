@@ -115,14 +115,11 @@ Status read_frame(Slice block, ByteSource* src, uint8_t* type, Slice* frame) {
 // false (via *handled) for unrecognized types so the caller skips them.
 // Routes an optional sub-section frame to its slot. Unknown section types are
 // intentionally ignored (forward compatibility: skip unknown optional sections).
-void dispatch_frame(uint8_t type, Slice frame, Slice* sampled, Slice* dict,
-                    Slice* xfilter) {
+void dispatch_frame(uint8_t type, Slice frame, Slice* sampled, Slice* dict) {
   if (type == static_cast<uint8_t>(SectionType::kSampledTermIndex)) {
     *sampled = frame;
   } else if (type == static_cast<uint8_t>(SectionType::kDictBlockDirectory)) {
     *dict = frame;
-  } else if (type == static_cast<uint8_t>(SectionType::kXFilter)) {
-    *xfilter = frame;
   }
 }
 
@@ -147,12 +144,6 @@ void PerIndexMetaBuilder::set_dict_block_directory(Slice framed_bytes) {
                                framed_bytes.data() + framed_bytes.size());
 }
 
-void PerIndexMetaBuilder::set_xfilter(Slice framed_bytes) {
-  xfilter_.assign(framed_bytes.data(),
-                  framed_bytes.data() + framed_bytes.size());
-  flags_ |= kHasXFilter;
-}
-
 void PerIndexMetaBuilder::set_section_refs(const SectionRefs& refs) {
   section_refs_ = refs;
 }
@@ -170,9 +161,6 @@ Status PerIndexMetaBuilder::finish(ByteSink* sink) const {
   encode_stats_block(stats_, sink);
   sink->put_bytes(Slice(sampled_term_index_));
   sink->put_bytes(Slice(dict_block_directory_));
-  if ((flags_ & kHasXFilter) != 0) {
-    sink->put_bytes(Slice(xfilter_));
-  }
   encode_section_refs(section_refs_, sink);
   for (const auto& extra : extra_sections_) {
     sink->put_bytes(Slice(extra));
@@ -205,14 +193,11 @@ Status PerIndexMetaReader::open(Slice block, PerIndexMetaReader* out) {
       have_refs = true;
     } else {
       dispatch_frame(type, frame, &out->sampled_term_index_,
-                     &out->dict_block_directory_, &out->xfilter_);
+                     &out->dict_block_directory_);
     }
   }
   if (!have_stats || !have_refs) {
     return Status::Corruption("per_index_meta: missing required sub-section");
-  }
-  if (out->has_xfilter() && out->xfilter_.empty()) {
-    return Status::Corruption("per_index_meta: kHasXFilter set but no XFilter");
   }
   return Status::OK();
 }

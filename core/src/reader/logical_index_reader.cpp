@@ -10,9 +10,9 @@
 namespace snii::reader {
 
 namespace {
-// TEMP (bench/test): the L0/L1 threshold, overridable via SNII_BSBF_RESIDENT_MAX
-// (bytes) so the on-demand L1 path can be exercised without a 250K-term corpus.
-// Read fresh each open so a test can toggle tiers between opens.
+// L0/L1 tiering threshold (bytes). Defaults to kBsbfResidentMaxBytes; the env
+// SNII_BSBF_RESIDENT_MAX overrides it for tuning and for exercising the on-demand
+// L1 path in tests without a 250K-term corpus. Read fresh each open.
 uint64_t bsbf_resident_max_bytes() {
   const char* s = std::getenv("SNII_BSBF_RESIDENT_MAX");
   if (s != nullptr) {
@@ -79,10 +79,6 @@ Status LogicalIndexReader::open(snii::io::FileReader* file_reader,
         return Status::Corruption("logical_index: short bsbf resident read");
       out->bsbf_resident_ = true;
     }
-  } else if (out->meta_.has_xfilter()) {
-    // TEMP (A/B): legacy fuse-8 resident filter, loaded whole from the meta block.
-    SNII_RETURN_IF_ERROR(snii::format::XFilterReader::open(
-        out->meta_.xfilter_bytes(), &out->xfilter_));
   }
   return Status::OK();
 }
@@ -93,9 +89,8 @@ Status LogicalIndexReader::lookup(std::string_view term, bool* found,
   *found = false;
   if (reader_ == nullptr) return Status::InvalidArgument("logical_index: not opened");
 
-  // 1. XFilter fast rejection. DEFINITELY-ABSENT -> return empty without the dict read.
-  //    BSBF: on-demand probe of ONE 32-byte block (no whole-filter load).
-  //    fuse-8 (TEMP A/B): in-memory probe of the resident filter (loaded at open).
+  // 1. XFilter fast rejection. DEFINITELY-ABSENT -> return empty without the dict
+  //    read. L0: in-memory probe of the resident bitset; L1: on-demand 32-byte block.
   if (has_bsbf_) {
     const uint64_t h = bsbf_hash(term);
     bool maybe = false;
@@ -110,8 +105,6 @@ Status LogicalIndexReader::lookup(std::string_view term, bool* found,
       SNII_RETURN_IF_ERROR(bsbf_probe(reader_, bsbf_header_, h, &maybe));
     }
     if (!maybe) return Status::OK();
-  } else if (meta_.has_xfilter() && !xfilter_.maybe_contains(term)) {
-    return Status::OK();
   }
 
   // 2. SampledTermIndex -> candidate block ordinal.
