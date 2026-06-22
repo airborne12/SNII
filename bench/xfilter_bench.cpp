@@ -21,6 +21,11 @@
 #include <string>
 #include <vector>
 
+#if defined(__x86_64__) || defined(_M_X64)
+#include <immintrin.h>
+#define SNII_X86 1
+#endif
+
 #include "snii/encoding/byte_sink.h"
 #include "snii/format/xfilter.h"
 #include "snii/io/local_file.h"
@@ -88,6 +93,33 @@ struct Bsbf {
       if ((words[b * 8 + i] & m[i]) != m[i]) return false;
     return true;
   }
+
+#if defined(SNII_X86)
+  // AVX2: the 8 SALT masks + the whole-block AND test in one 256-bit register.
+  // present iff (block & mask) == mask, i.e. testc(block, mask) == 1.
+  __attribute__((target("avx2"))) static __m256i mask_avx2(uint32_t key) {
+    const __m256i salt = _mm256_setr_epi32(
+        0x47b6137b, 0x44974d91, static_cast<int>(0x8824ad5b),
+        static_cast<int>(0xa2b7289d), 0x705495c7, 0x2df1424b,
+        static_cast<int>(0x9efc4947), 0x5c6bfb31);
+    const __m256i prod = _mm256_mullo_epi32(_mm256_set1_epi32(static_cast<int>(key)), salt);
+    const __m256i shifts = _mm256_srli_epi32(prod, 27);  // top 5 bits -> 0..31
+    return _mm256_sllv_epi32(_mm256_set1_epi32(1), shifts);
+  }
+  __attribute__((target("avx2"))) void insert_avx2(uint64_t hash) {
+    const uint32_t b = static_cast<uint32_t>(hash >> 32) & (nblocks - 1);
+    __m256i* blk = reinterpret_cast<__m256i*>(words.data() + b * 8);
+    _mm256_storeu_si256(blk, _mm256_or_si256(_mm256_loadu_si256(blk),
+                                             mask_avx2(static_cast<uint32_t>(hash))));
+  }
+  __attribute__((target("avx2"))) bool find_avx2(uint64_t hash) const {
+    const uint32_t b = static_cast<uint32_t>(hash >> 32) & (nblocks - 1);
+    const __m256i m = mask_avx2(static_cast<uint32_t>(hash));
+    const __m256i blk =
+        _mm256_loadu_si256(reinterpret_cast<const __m256i*>(words.data() + b * 8));
+    return _mm256_testc_si256(blk, m) != 0;  // (~blk & m) == 0 -> blk contains m
+  }
+#endif
   const uint8_t* bytes() const {
     return reinterpret_cast<const uint8_t*>(words.data());
   }
@@ -242,6 +274,57 @@ int main(int argc, char** argv) {
     std::printf("    BSBF:       absent=%llu  present=%llu\n",
                 (unsigned long long)bsbf_remB, (unsigned long long)(bsbf_remB + dictB));
   }
+
+#if defined(SNII_X86)
+  // 6. SIMD (AVX2) block-check acceleration: helps BUILD (insert) and WARM/in-memory
+  //    batch probe throughput. (It does NOT help the cold S3 single probe, which is
+  //    I/O-bound -- one block read dominates the ~ns mask check either way.)
+  if (__builtin_cpu_supports("avx2")) {
+    std::printf("\n=== SIMD (AVX2) block check: 256-bit block = one register ===\n");
+    bool ok = true;
+    for (uint32_t i = 0; i < ndv && ok; ++i)
+      if (bsbf.find_mem(keys[i]) != bsbf.find_avx2(keys[i])) ok = false;
+    for (uint32_t i = 0; i < queries && ok; ++i) {
+      const uint64_t h = hash_term("absent_z_" + std::to_string(i));
+      if (bsbf.find_mem(h) != bsbf.find_avx2(h)) ok = false;
+    }
+    std::printf("  correctness AVX2==scalar: %s\n", ok ? "OK" : "MISMATCH");
+
+    {  // build (insert) throughput
+      Bsbf s, a;
+      s.init(ndv, fpp);
+      a.init(ndv, fpp);
+      double t0 = now_ms();
+      for (uint64_t k : keys) s.insert(k);
+      const double sc = now_ms() - t0;
+      t0 = now_ms();
+      for (uint64_t k : keys) a.insert_avx2(k);
+      const double av = now_ms() - t0;
+      std::printf("  build  (insert %u keys):  scalar %.2f ms (%.1f Mkeys/s)   AVX2 %.2f ms (%.1f Mkeys/s)   speedup %.2fx\n",
+                  ndv, sc, ndv / sc / 1000.0, av, ndv / av / 1000.0, sc / av);
+    }
+    {  // warm in-memory probe throughput (present+absent mix)
+      std::vector<uint64_t> q;
+      q.reserve(2ull * queries);
+      for (uint32_t i = 0; i < queries; ++i) {
+        q.push_back(keys[i % ndv]);
+        q.push_back(hash_term("absent_z_" + std::to_string(i)));
+      }
+      volatile uint64_t acc = 0;
+      double t0 = now_ms();
+      for (uint64_t h : q) acc = acc + (bsbf.find_mem(h) ? 1 : 0);
+      const double sc = now_ms() - t0;
+      t0 = now_ms();
+      for (uint64_t h : q) acc = acc + (bsbf.find_avx2(h) ? 1 : 0);
+      const double av = now_ms() - t0;
+      (void)acc;
+      std::printf("  probe  (%zu warm finds):  scalar %.2f ms (%.2f ns/probe)   AVX2 %.2f ms (%.2f ns/probe)   speedup %.2fx\n",
+                  q.size(), sc, sc * 1e6 / q.size(), av, av * 1e6 / q.size(), sc / av);
+    }
+  } else {
+    std::printf("\n(AVX2 not available on this CPU; SIMD section skipped)\n");
+  }
+#endif
 
   std::remove(xf_path.c_str());
   std::remove(bsbf_path.c_str());
