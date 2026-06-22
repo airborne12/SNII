@@ -98,8 +98,9 @@ class CompactPostingPool {
   // Bytes the arena currently occupies (block_count * kBlockSize). The pool
   // addresses bytes with a uint32 offset (next_offset_), so the arena MUST stay
   // below 4 GiB or alloc_run wraps and silently aliases block 0. The accumulator
-  // watches this to force a safety spill before the wrap. Hard invariant: a single
-  // CompactPostingPool never exceeds UINT32_MAX bytes.
+  // watches this to force a safety spill before the wrap; alloc_run also enforces it
+  // directly (aborts on a would-be wrap) so a direct user of the pool fails loudly.
+  // Hard invariant: a single CompactPostingPool never exceeds UINT32_MAX bytes.
   uint64_t arena_bytes() const {
     return static_cast<uint64_t>(blocks_.size()) << kBlockShift;
   }
