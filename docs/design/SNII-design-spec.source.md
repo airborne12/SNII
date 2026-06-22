@@ -98,9 +98,12 @@ SNII container: one Doris segment ({rowset_id}_{seg_id}.idx)
     tail_pointer_size / min_reader_version / header_checksum
 
   [streamed data sections]
-    logical index #1: DICT blocks, .frq POD, .prx POD
-    logical index #2: DICT blocks, .frq POD, .prx POD
+    logical index #1: posting region（交错 [prx][frq]）, DICT blocks
+    logical index #2: posting region（交错 [prx][frq]）, DICT blocks
     ...
+    # posting region 在前、DICT region 在后：postings 是大块 append-only
+    # 的 term-order 流，DICT 是紧凑压缩 trailer。每个 pod_ref term 在 posting
+    # region 内按 term 顺序写 [prx span][frq span]（!has_prx 时 prx span 为空）。
 
   [norms & null-bitmap PODs]
     logical index #1: encoded_norm POD, null bitmap POD (Roaring)
@@ -112,14 +115,14 @@ SNII container: one Doris segment ({rowset_id}_{seg_id}.idx)
       StatsBlock
       SampledTermIndex / DICT block directory
       optional XF
-      dict_section_ref / frq_ref / prx_ref / norms_ref / null_bitmap_ref
+      dict_section_ref / posting_region_ref / norms_ref / null_bitmap_ref / bsbf_ref
       feature bits / checksums
 
     per-index meta block #2:
       StatsBlock
       SampledTermIndex / DICT block directory
       optional XF
-      dict_section_ref / frq_ref / prx_ref / norms_ref / null_bitmap_ref
+      dict_section_ref / posting_region_ref / norms_ref / null_bitmap_ref / bsbf_ref
       feature bits / checksums
 
     ...
@@ -166,11 +169,15 @@ SNII container: one Doris segment ({rowset_id}_{seg_id}.idx)
    spill run 是私有临时格式（非 native，仅供回读合并）；只有最终 section 是 native。
    输出 byte-identical 于 spill 阈值（含无 spill 全内存路径）—— spill 只 bound 内存、不改产物。
 
-5. final k-way merge 后顺序写 data sections
-   写 DICT blocks。
-   写 .frq POD。
-   写 .prx POD。
-   同步在该 logical index 的内存 manifest 中记录 dict_ref、frq_ref、prx_ref、codec、checksum 和统计信息。
+5. final k-way merge 后顺序写 data sections（两个临时 sink，原为三个）
+   每个 pod_ref term 按 term 顺序，将其 [prx span][frq span] 连续 append 到单一
+     posting region（post_file_）：prx span 先、frq span 后；INLINE term 不写
+     posting region。!has_prx 时 prx span 为空，posting region 即等价于原 .frq POD。
+   写完整 posting region 后再写 DICT region（dict_file_）：posting 在前、DICT 在后。
+   frq_base / prx_base 在 block 打开时取同一 post_file_.size() 快照（两者相等）；
+     frq_off_delta / prx_off_delta 均相对该 base 度量，已编码交错布局，无需新字段。
+   同步在该 logical index 的内存 manifest 中记录 posting_ref、dict_ref、codec、
+     checksum 和统计信息。
 
 6. 写 side PODs
    按 logical index / field 写 encoded_norm POD。
@@ -342,12 +349,14 @@ DICT BLOCK
     n_entries          varint
     entry_format_ver   u8
     block_flags        u8
-    frq_base           varint64
-    prx_base           varint64   # 支持 positions 时存在
+    frq_base           varint64   # 交错布局下 frq_base == prx_base（同一 posting region 快照）
+    prx_base           varint64   # 支持 positions 时存在（block 头格式保持不变）
 
   entries[n_entries]
     variable-length DictEntry
     term text uses UTF-8 byte front-coding
+    # posting refs 的 offset / length 相对 frq_base / prx_base，二者均索引到单一
+    # posting region（frq_off_delta / prx_off_delta 已编码 [prx][frq] 交错布局）
     posting refs use offset / length relative to frq_base / prx_base
 
   anchor_offsets[]     u32 * n_anchors
@@ -494,13 +503,15 @@ exact term 查询流程：
 ## 倒排表设计
 ### 总体布局
 ```plaintext
-.frq POD:
-  per-term [optional columnar prelude][frq window 0..N-1]
-  保存 doc delta + freq
-
-.prx POD:
-  per-term [prx window 0..M-1]
-  保存 positions
+posting region（单一交错 sink，原 .frq POD + .prx POD 合并而来）:
+  按 term 顺序，对每个 pod_ref term 连续写 [prx span][frq span]：
+    prx span（仅 has_prx）: per-term [prx window 0..M-1]，保存 positions
+    frq span: per-term [optional columnar prelude][frq window 0..N-1]，
+              保存 doc delta + freq
+  INLINE term 不写入 posting region（其 [dd][freq] 与可选 [prx] 内联在 DictEntry）。
+  !has_prx（docs-only/keyword 档）时 prx span 为空，posting region 即等价原 .frq POD。
+  写侧性质（has_prx 时）：frq_off_delta == prx_off_delta + prx_len（因两段之间无其他
+    append）；reader 不依赖该等式，各 delta 独立解析。
 
 norms POD:
   per logical index / field 保存 1B/doc encoded doc length
@@ -683,10 +694,13 @@ per-index meta block:
   checksums
 
 PerIndexMetaHeader:
-  meta_format_version
+  meta_format_version   # 当前 = 2（交错 posting region 格式：SectionRefs 合并
+                        #   frq_pod+prx_pod 为单一 posting_region、per-index section
+                        #   顺序翻转为 [posting][dict]、header flags 可置 kHasPositions）
   index_id
   index_suffix
-  flags
+  flags                 # bit0 = kHasPositions（positions 能力，持久化标志，
+                        #   reader 不再从任何 region 长度推断）；bit1 = kHasBsbf
   meta_len
   crc32c
 
@@ -700,13 +714,13 @@ StatsBlock:
 
 SectionRefs:
   dict_region_ref
-  frq_pod_ref
-  prx_pod_ref
+  posting_region_ref   # 单一交错 [prx][frq] posting region（合并原 frq_pod + prx_pod）
   norms_ref
   null_bitmap_ref
+  bsbf_ref
 ```
 
-StatsBlock 只保存统计信息；SectionRefs 统一保存各 data section / side POD 的物理引用，避免 stats 与 section 定位信息混在一起。
+StatsBlock 只保存统计信息；SectionRefs 统一保存各 data section / side POD 的物理引用，避免 stats 与 section 定位信息混在一起。**positions 能力不再从 `posting_region.length` 推断**（任何含 pod_ref term 的 docs-only 索引其 posting_region 长度也 > 0），而是从 header `kHasPositions` 标志读取。
 ### footer元信息内存常驻与缓存
 - tail meta region 通过 hot_off 定位，打开时按连续 range 读取。
 - logical index directory 和 per-index meta block 属于查询规划元数据。

@@ -155,7 +155,7 @@ TEST(PhaseAReadBack, DocsPrefixTilesAndMaxNormTightAndQueriesAgree) {
   EXPECT_TRUE(hot.has_sb);
 
   const uint64_t prelude_abs =
-      idx.section_refs().frq_pod.offset + frq_base + hot.frq_off_delta;
+      idx.section_refs().posting_region.offset + frq_base + hot.frq_off_delta;
   std::vector<uint8_t> prelude_bytes;
   ASSERT_TRUE(local.read_at(prelude_abs, hot.prelude_len, &prelude_bytes).ok());
   FrqPreludeReader prelude;

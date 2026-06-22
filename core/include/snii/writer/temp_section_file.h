@@ -10,12 +10,13 @@
 #include "snii/io/local_file.h"
 
 // TempSectionFile -- an append-only on-disk scratch buffer for ONE index section
-// (.frq POD, .prx POD, or DICT region) that the writer would otherwise hold fully
-// in RAM until finish().
+// (the interleaved posting region or the DICT region) that the writer would
+// otherwise hold fully in RAM until finish().
 //
 // During the build pass, each term's already-small per-term bytes are appended
 // here instead of into a std::vector<uint8_t>; only a running byte cursor is kept
-// in memory (size() == frq_pod_.size() used to). At finish(), the orchestrator
+// in memory (size() mirrors what the in-RAM vector's size() used to). At finish(),
+// the orchestrator
 // streams the temp file's bytes into the container via stream_into(), using a
 // fixed copy buffer (no whole-section reload). Because the append order and byte
 // content are unchanged, the produced container is BYTE-IDENTICAL to the in-RAM

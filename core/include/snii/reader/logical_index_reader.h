@@ -26,9 +26,10 @@
 //
 // lookup() also returns the block's frq_base/prx_base (captured by the
 // DictBlockReader) so callers can resolve a pod_ref entry's absolute .frq/.prx
-// offsets via the writer's contract:
-//   abs_frq = section_refs().frq_pod.offset + frq_base + entry.frq_off_delta
-//   abs_prx = section_refs().prx_pod.offset + prx_base + entry.prx_off_delta
+// offsets via the writer's contract. Both deltas index into the SAME interleaved
+// posting region (prx_base == frq_base; the prx span precedes the frq span):
+//   abs_frq = section_refs().posting_region.offset + frq_base + entry.frq_off_delta
+//   abs_prx = section_refs().posting_region.offset + prx_base + entry.prx_off_delta
 //
 // The meta block bytes must outlive this reader (they are owned by the parent
 // SniiSegmentReader's resident meta region).
@@ -67,9 +68,10 @@ class LogicalIndexReader {
   Status prefix_terms(std::string_view prefix, std::vector<PrefixHit>* out) const;
 
   // Resolves a pod_ref entry's absolute .frq / .prx window byte range, validating
-  // the locator against the section length (defends against corrupt entries:
-  // prelude_len > frq_len underflow, or off_delta+len past the POD). *abs_off is
-  // the absolute file offset of the window (after prelude); *len its byte length.
+  // the locator against the posting_region length (defends against corrupt
+  // entries: prelude_len > frq_len underflow, or off_delta+len past the region).
+  // Both windows resolve against the single posting_region. *abs_off is the
+  // absolute file offset of the window (after prelude); *len its byte length.
   Status resolve_frq_window(const snii::format::DictEntry& entry, uint64_t frq_base,
                             uint64_t* abs_off, uint64_t* len) const;
   Status resolve_prx_window(const snii::format::DictEntry& entry, uint64_t prx_base,

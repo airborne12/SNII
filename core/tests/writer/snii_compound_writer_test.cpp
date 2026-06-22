@@ -204,13 +204,16 @@ TEST(SniiCompoundWriter, ReadBackSelfValidation) {
     EXPECT_EQ(meta.stats().term_count, 4u);
 
     const SectionRefs& refs = meta.section_refs();
-    // dict_region / frq_pod / prx_pod must be within file bounds.
+    // posting_region / dict_region must be within file bounds. With the order flip
+    // (posting region first, then DICT trailer), the posting region precedes the
+    // DICT region: posting_off < dict_off and posting_off + posting_len == dict_off.
+    ASSERT_GT(refs.posting_region.length, 0u);
+    ASSERT_LE(refs.posting_region.offset + refs.posting_region.length, file.size());
     ASSERT_GT(refs.dict_region.length, 0u);
     ASSERT_LE(refs.dict_region.offset + refs.dict_region.length, file.size());
-    ASSERT_GT(refs.frq_pod.length, 0u);
-    ASSERT_LE(refs.frq_pod.offset + refs.frq_pod.length, file.size());
-    ASSERT_GT(refs.prx_pod.length, 0u);
-    ASSERT_LE(refs.prx_pod.offset + refs.prx_pod.length, file.size());
+    EXPECT_LT(refs.posting_region.offset, refs.dict_region.offset);
+    EXPECT_EQ(refs.posting_region.offset + refs.posting_region.length,
+              refs.dict_region.offset);
     // norms absent for docs-positions (no scoring).
     EXPECT_EQ(refs.norms.offset, 0u);
     EXPECT_EQ(refs.norms.length, 0u);
@@ -264,11 +267,12 @@ TEST(SniiCompoundWriter, ReadBackSelfValidation) {
     DictBlockReader br;
     ASSERT_TRUE(DictBlockReader::open(block, IndexTier::kT2, true, &br).ok());
 
-    // Absolute .frq offset = frq_pod.offset + frq_base + frq_off_delta. The
+    // Absolute .frq offset = posting_region.offset + frq_base + frq_off_delta. The
     // windowed payload is [prelude][dd-block][freq-block]; parse the two-level
     // prelude, then decode every window's dd region from the dd-block (each with
     // its prelude win_base) to reconstruct the full posting (docs-only path).
-    uint64_t frq_abs = refs.frq_pod.offset + br.frq_base() + common_entry.frq_off_delta;
+    uint64_t frq_abs =
+        refs.posting_region.offset + br.frq_base() + common_entry.frq_off_delta;
     Slice prelude_bytes(file.data() + frq_abs, common_entry.prelude_len);
     FrqPreludeReader prelude;
     ASSERT_TRUE(FrqPreludeReader::open(prelude_bytes, &prelude).ok());
@@ -463,7 +467,7 @@ TEST(SniiCompoundWriter, MultiSuperBlockReadBack) {
 
   // Fetch + parse the two-level prelude.
   const uint64_t prelude_abs =
-      idx.section_refs().frq_pod.offset + frq_base + hot.frq_off_delta;
+      idx.section_refs().posting_region.offset + frq_base + hot.frq_off_delta;
   std::vector<uint8_t> prelude_bytes;
   ASSERT_TRUE(local.read_at(prelude_abs, hot.prelude_len, &prelude_bytes).ok());
   FrqPreludeReader prelude;

@@ -43,31 +43,25 @@ Status SniiCompoundWriter::write_bootstrap() {
   return append(sink.buffer());
 }
 
-// Streams each index's dict_region, frq_pod, prx_pod (in add order) from its
+// Streams each index's posting region then dict_region (in add order) from its
 // scratch temp files into the container, capturing the absolute offset/length of
-// each into placements[i]. The bytes/order are identical to the prior in-RAM
-// path, so the produced container is byte-identical; only the peak RSS drops.
+// each into placements[i]. The posting region (the large append-only stream) is
+// emitted BEFORE the compact DICT trailer per index. Only the peak RSS drops; the
+// bytes within each region are byte-identical to the prior in-RAM path.
 Status SniiCompoundWriter::write_index_sections(std::vector<Placement>* placements) {
   for (size_t i = 0; i < indexes_.size(); ++i) {
     Placement& p = (*placements)[i];
     const LogicalIndexWriter& w = *indexes_[i];
 
+    p.post_off = cursor_;
+    SNII_RETURN_IF_ERROR(w.stream_posting_region_into(out_));
+    cursor_ += w.posting_region_size();
+    p.post_len = cursor_ - p.post_off;
+
     p.dict_off = cursor_;
     SNII_RETURN_IF_ERROR(w.stream_dict_region_into(out_));
     cursor_ += w.dict_region_size();
     p.dict_len = cursor_ - p.dict_off;
-
-    p.frq_off = cursor_;
-    SNII_RETURN_IF_ERROR(w.stream_frq_pod_into(out_));
-    cursor_ += w.frq_pod_size();
-    p.frq_len = cursor_ - p.frq_off;
-
-    if (w.has_prx()) {
-      p.prx_off = cursor_;
-      SNII_RETURN_IF_ERROR(w.stream_prx_pod_into(out_));
-      cursor_ += w.prx_pod_size();
-      p.prx_len = cursor_ - p.prx_off;
-    }
   }
   return Status::OK();
 }
@@ -103,8 +97,7 @@ Status SniiCompoundWriter::write_tail(const std::vector<Placement>& placements) 
 
     SectionRefs refs;
     refs.dict_region = {p.dict_off, p.dict_len};
-    refs.frq_pod = {p.frq_off, p.frq_len};
-    refs.prx_pod = {p.prx_off, p.prx_len};
+    refs.posting_region = {p.post_off, p.post_len};
     refs.norms = {p.norms_off, p.norms_len};
     refs.null_bitmap = {0, 0};
     refs.bsbf = {p.bsbf_off, p.bsbf_len};

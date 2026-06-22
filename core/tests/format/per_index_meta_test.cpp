@@ -55,8 +55,7 @@ StatsBlock SampleStats() {
 SectionRefs SampleRefs() {
   SectionRefs r;
   r.dict_region = {4096, 65536};
-  r.frq_pod = {70000, 8192};
-  r.prx_pod = {80000, 16384};
+  r.posting_region = {70000, 24576};  // single interleaved [prx][frq] region
   r.norms = {100000, 4096};
   r.null_bitmap = {0, 0};  // absent
   r.bsbf = {120000, 32768};
@@ -70,8 +69,7 @@ void ExpectRegionEq(const RegionRef& a, const RegionRef& b) {
 
 void ExpectRefsEq(const SectionRefs& a, const SectionRefs& b) {
   ExpectRegionEq(a.dict_region, b.dict_region);
-  ExpectRegionEq(a.frq_pod, b.frq_pod);
-  ExpectRegionEq(a.prx_pod, b.prx_pod);
+  ExpectRegionEq(a.posting_region, b.posting_region);
   ExpectRegionEq(a.norms, b.norms);
   ExpectRegionEq(a.null_bitmap, b.null_bitmap);
   ExpectRegionEq(a.bsbf, b.bsbf);
@@ -142,6 +140,39 @@ TEST(PerIndexMeta, RoundTrip) {
   ASSERT_TRUE(dbd.get(1, &got).ok());
   EXPECT_EQ(got.offset, 5120u);
   EXPECT_EQ(got.checksum, 0x22222222u);
+}
+
+TEST(PerIndexMeta, HasPositionsFlagRoundTrips) {
+  // The kHasPositions header bit must survive a build/open round-trip and be read
+  // back via the convenience accessor (capability lives in the flag, not a length).
+  PerIndexMetaBuilder builder(
+      9, "body", PerIndexMetaBuilder::kHasPositions | PerIndexMetaBuilder::kHasBsbf);
+  builder.set_stats(SampleStats());
+  builder.set_sampled_term_index(Slice(BuildSampled({"a"})));
+  builder.set_dict_block_directory(Slice(BuildDict({{0, 1, 1, 0, 0}})));
+  builder.set_section_refs(SampleRefs());
+  ByteSink sink;
+  ASSERT_TRUE(builder.finish(&sink).ok());
+
+  PerIndexMetaReader reader;
+  ASSERT_TRUE(PerIndexMetaReader::open(Slice(sink.buffer()), &reader).ok());
+  EXPECT_TRUE(reader.has_positions());
+  EXPECT_TRUE(reader.has_bsbf());
+  EXPECT_NE(reader.flags() & PerIndexMetaBuilder::kHasPositions, 0u);
+
+  // A docs-only meta (flag clear) reports has_positions() == false even though its
+  // posting_region length is non-zero -- capability never comes from a region length.
+  PerIndexMetaBuilder docs_only(10, "tag", 0u);
+  docs_only.set_stats(SampleStats());
+  docs_only.set_sampled_term_index(Slice(BuildSampled({"a"})));
+  docs_only.set_dict_block_directory(Slice(BuildDict({{0, 1, 1, 0, 0}})));
+  docs_only.set_section_refs(SampleRefs());  // posting_region.length > 0
+  ByteSink docs_sink;
+  ASSERT_TRUE(docs_only.finish(&docs_sink).ok());
+  PerIndexMetaReader docs_reader;
+  ASSERT_TRUE(PerIndexMetaReader::open(Slice(docs_sink.buffer()), &docs_reader).ok());
+  EXPECT_FALSE(docs_reader.has_positions());
+  EXPECT_GT(docs_reader.section_refs().posting_region.length, 0u);
 }
 
 TEST(PerIndexMeta, EmptySuffix) {

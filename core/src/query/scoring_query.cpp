@@ -79,8 +79,8 @@ Status FetchSlimWindowBytes(const LogicalIndexReader& idx, const DictEntry& entr
 // Reads a windowed entry's frq_prelude (block-max columns live here).
 Status FetchPrelude(const LogicalIndexReader& idx, const DictEntry& entry,
                     uint64_t frq_base, FrqPreludeReader* out) {
-  const auto& frq = idx.section_refs().frq_pod;
-  const uint64_t prelude_abs = frq.offset + frq_base + entry.frq_off_delta;
+  const auto& region = idx.section_refs().posting_region;
+  const uint64_t prelude_abs = region.offset + frq_base + entry.frq_off_delta;
   snii::io::BatchRangeFetcher fetcher(idx.reader());
   const size_t h =
       fetcher.add(prelude_abs, static_cast<size_t>(entry.prelude_len));

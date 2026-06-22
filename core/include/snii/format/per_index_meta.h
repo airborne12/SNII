@@ -38,7 +38,8 @@
 namespace snii::format {
 
 // Physical reference to a contiguous region within the container. (0, 0) means
-// the region is absent (e.g. no .prx POD for a docs-only index).
+// the region is absent (e.g. no norms POD for a non-scoring index). A present-
+// but-empty region (e.g. an all-INLINE index's posting_region) is (off, 0).
 struct RegionRef {
   uint64_t offset = 0;
   uint64_t length = 0;
@@ -47,10 +48,17 @@ struct RegionRef {
 // Physical references to the data sections / side PODs of one logical index.
 // Each RegionRef is encoded as varint64 offset followed by varint64 length, in
 // the field order below.
+//
+// posting_region is the single interleaved [prx][frq] posting region (it replaced
+// the former two separate frq_pod + prx_pod refs). Each pod_ref term writes its
+// prx span first then its frq span, contiguously, in term order; both
+// frq_off_delta and prx_off_delta now index into this one region. NO positions
+// capability is inferred from posting_region.length -- it is non-zero for any
+// docs-only index with a pod_ref term, and zero for an all-INLINE positional
+// index; capability lives in the header kHasPositions flag instead.
 struct SectionRefs {
   RegionRef dict_region;
-  RegionRef frq_pod;
-  RegionRef prx_pod;
+  RegionRef posting_region;  // interleaved [prx][frq] per term; was frq_pod + prx_pod
   RegionRef norms;
   RegionRef null_bitmap;
   // Block-split bloom XFilter section ([28B header][bitset]); {0,0} when absent.
@@ -63,6 +71,7 @@ struct SectionRefs {
 class PerIndexMetaBuilder {
  public:
   // Header flags / feature bits.
+  static constexpr uint32_t kHasPositions = 1u << 0;  // index is positions-capable (tier>=T2)
   static constexpr uint32_t kHasBsbf = 1u << 1;  // block-split bloom XFilter (section ref)
 
   PerIndexMetaBuilder(uint64_t index_id, std::string index_suffix,
@@ -124,6 +133,12 @@ class PerIndexMetaReader {
 
   // Block-split bloom XFilter: present iff a non-empty bsbf section ref exists.
   bool has_bsbf() const { return section_refs_.bsbf.length > 0; }
+
+  // Positions capability, read from the persisted header flag (NOT from any region
+  // length). True iff the index was built as docs-positions(+scoring) (tier>=T2).
+  bool has_positions() const {
+    return (flags_ & PerIndexMetaBuilder::kHasPositions) != 0;
+  }
 
  private:
   uint64_t index_id_ = 0;

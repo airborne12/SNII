@@ -408,7 +408,12 @@ TEST(ScoringWandSelective, FetchesFewerWindowsForSmallKHighDf) {
   const std::string path = TempPath();
   BuildAndOpen(corpus, path);
 
-  OpenedIndex oi(path, /*block_size=*/4096);
+  // Fine-grained cache block: the high-df frq span is only a few KiB, so a coarse
+  // 4096-byte block can round BOTH the selective and full reads up to the same
+  // aligned block set even though their raw request sizes differ. A 512-byte block
+  // keeps the block-aligned remote_bytes measure faithful to the genuine per-window
+  // savings (independent of where the interleaved posting region happens to land).
+  OpenedIndex oi(path, /*block_size=*/512);
   ASSERT_TRUE(SniiSegmentReader::open(&oi.metered, &oi.seg).ok());
   ASSERT_TRUE(oi.seg.open_index(1, "body", &oi.idx).ok());
   ASSERT_TRUE(SniiStatsProvider::open(&oi.idx, &oi.stats).ok());
