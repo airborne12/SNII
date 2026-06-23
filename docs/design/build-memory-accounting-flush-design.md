@@ -33,7 +33,8 @@ Scope: `core/include/snii/writer/spimi_term_buffer.{h,cpp}`、`compact_posting_p
    ├─[门控 2：本倒排 > 512M] SNII 自触发 → spill 小段到临时目录 + 继续    ← 可多次（内部分段）
    │
    └─[门控 1：Doris 全局/load 内存压力] MemTableMemoryLimiter 挑该 memtable flush
-         → SNII finalize() → 把内存残留 + 临时小段 k-way merge 成完整 .idx
+         → segment 写出 → 倒排 writer finish()（既有路径）→ SNII finalize
+         → 把内存残留 + 临时小段 k-way merge 成完整 .idx
 ```
 
 **SNII 要做的，是把内存统计准确报给 Doris（让门控 1 看得见），并保留/接好内部分段（门控 2）。**
@@ -125,14 +126,26 @@ class MemoryReporter {
 
 ## 3. 两门控的接入
 
-### 3.1 门控 1：Doris 内存压力 → 整段 finalize
+### 3.1 门控 1：Doris 内存压力 → memtable flush → 倒排 writer finish → SNII 落 .idx
 
-- Doris `MemTableMemoryLimiter::handle_memtable_flush`（软/硬限 + `_need_flush()`，
-  `memtable_memory_limiter.cpp:124`）在 load/进程内存紧张时挑某 memtable flush。
-- 该 memtable 封口后，其 segment 写出 → SNII `finalize()` → **一个完整 `.idx`**（含把内存残留 +
-  门控 2 落下的临时小段 `MergeRuns` 合并）。
-- **SNII 侧无新代码**——只要 §2 把内存报进 load tracker，让 Doris「看得见、能决策」。finalize 已存在。
-- 线程：finalize 跑在 flush 线程，memtable 已封口、**无并发 append**——无竞争。
+接线点是 **Doris 的倒排 writer 接口，不是内存限制器**。SNII 坐在 Doris
+`InvertedIndexColumnWriter`（`init` / `add_values` / `add_nulls` / `finish`，
+`inverted_index_writer.h:74-107`）背后：`add_values` 把 token 喂给 SNII 的 `SpimiTermBuffer`，
+`finish()` 调 SNII 落出完整 `.idx`。完整链路：
+
+```
+MemTableMemoryLimiter（软/硬限，memtable_memory_limiter.cpp:124）挑某 memtable flush
+  → memtable flush → segment 写出（Doris 既有流程）
+    → InvertedIndexColumnWriter::finish()（既有调用点）
+      → SNII finish/finalize → 完整 .idx（含把内存残留 + 门控 2 临时小段 MergeRuns 合并）
+```
+
+- **内存限制器只决定「何时 flush 这个 memtable」**（它经 §2 的 MemTracker 桥接看得见 SNII 倒排内存）；
+  **它不直接调 SNII**。真正落 `.idx` 是随 memtable flush **自然走到**倒排 writer 的 `finish()`——
+  这是 Doris 既有的 segment 写出路径，SNII 只是接在该接口背后。
+- 线程：`finish()` 跑在 flush 线程，此时该 memtable 已封口、**无并发 add_values**——无竞争。
+- **SNII 侧**：实现/对接 `InvertedIndexColumnWriter` 背后的 `add_values→SpimiTermBuffer 喂入` 与
+  `finish→finalize` 即可；finalize 内核已存在。
 
 ### 3.2 门控 2：倒排 buffer 上限（512M）→ 内部分段 spill
 
@@ -179,8 +192,10 @@ class MemoryReporter {
    统计准确性单测（对照真实测量）。
 2. **P2**：门控 2 改造——阈值经 `SniiIndexInput` 接配置（512M），触发判定改用 `arena_bytes` 口径
    （替掉 `live_bytes_`）；保留 4 GiB 兜底。
-3. **P3**：与 Doris 对接——`consume_release_` 桥接 load MemTracker（门控 1 可见性）；finalize 对接
-   memtable flush。**此阶段在合并侧。**
+3. **P3**：与 Doris 对接——① `consume_release_` 桥接 load MemTracker（门控 1 可见性）；
+   ② 让 SNII 坐在 `InvertedIndexColumnWriter`（`add_values`/`finish`）背后，使既有的
+   memtable flush → segment 写出 → `finish()` 自然落到 SNII finalize（**不**直接接 memory limiter）。
+   **此阶段在合并侧。**
 4. **P4（可选）**：内部分段升级为 native idx 段。
 
 ---
