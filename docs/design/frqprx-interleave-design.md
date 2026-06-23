@@ -16,7 +16,7 @@ below; the relevant sections were rewritten, not merely annotated.
 |---|----------|---------|------------|
 | R1 | **blocker** | `snii_segment_reader.cpp:95-96` infers `has_positions`/tier from `prx_pod.length > 0`. The merge makes `posting_region.length > 0` true for **every** pod_ref index — including a docs-only T1 index (a high-df / windowed term still appends its frq span). A naive repoint to `posting_region.length > 0` mis-classifies docs-only as T2/positional; `DictBlockReader::open`→`check_flags` (`dict_block.cpp:121-124`) then hard-fails with `InvalidArgument`, and `prx_base` is parsed from a header the writer never wrote → **index unreadable**. | **Accepted.** Positions-capability is now **persisted explicitly**: new meta header flag `PerIndexMetaBuilder::kHasPositions = 1u << 0` (bit 0 was free; only `kHasBsbf = 1u << 1` is used today), set from `has_prx_` at `finish_meta` time. `open_index` reads `has_positions` from the flag (`|| has_norms` kept as belt-and-suspenders), **never** from any region length. The `prx_pod.length`-based heuristic is **deleted**, not repointed. See §3.1, §7.4, §8.1. |
 | R2 | **major** | §7.3 claimed "most callers use `resolve_*_window` and need no change." False: the hot windowed/phrase/scoring read paths read `frq_pod`/`prx_pod` `.offset` **directly** at 5 sites. Also `stats/snii_stats_provider.cpp` was listed but has **zero** `frq_pod`/`prx_pod` reads (over-count), and `term_query.cpp` only `#include`s the header. | **Accepted.** §7.3 now enumerates the **exact** direct-offset sites (verified by grep) and splits the audit into (a) additive-offset repoints and (b) the one semantic predicate. `stats_provider`/`term_query` removed from the repoint list. |
-| R3 | **minor** | `kMetaFormatVersion` is one shared constant consumed by both `per_index_meta.cpp` (header) **and** `tail_meta_region.cpp:50,98` (region). §9 understated the blast radius and left container-version bump as "and/or". | **Accepted.** §9 now states bumping `kMetaFormatVersion` alone versions **both** layers and triggers fail-fast `Corruption` on old readers; `kFormatVersion`/`min_reader_version` are explicitly **not** bumped (no container-framing change). Do **not** add a second version field. |
+| R3 | **minor** | `kMetaFormatVersion` is one shared constant consumed by both `per_index_meta.cpp` (header) **and** `tail_meta_region.cpp:50,98` (region). §9 understated the blast radius. | **Accepted.** §9 now treats `kMetaFormatVersion` as the single shared sentinel for **both** layers, staying at **1** (from-scratch, pre-launch — no v1 index to coexist with, so no bump); a reader still fail-fasts with `Corruption` on a mismatch. `kFormatVersion`/`min_reader_version` are untouched (no container-framing change). Do **not** add a second version field. |
 | R4 | **minor** | `frq_off_delta == prx_off_delta + prx_len` is a **writer-side consequence** of "nothing is appended to `post_file_` between a term's prx span and frq span", not a reader invariant. For the docs-only tier (`!has_prx`) `prx_off_delta`/`prx_len` are unset, so the equality is undefined there; tests asserting it unconditionally would spuriously fail. | **Accepted.** §4 reframes the equality as a writer-side property; the reader resolves each delta independently. Test §10.2.1/§10.2.7 gate the equality on `has_prx`. |
 | R5 | **minor** | Test plan listed files but omitted concrete `refs.frq_pod`/`.prx_pod` member uses that won't compile after the struct change (`snii_compound_writer_test.cpp:210-213,271,466`; `per_index_meta_test.cpp:58-59,73-74`; `phase_a_readback_test.cpp:158`), and a tier-recovery round-trip for docs-only. | **Accepted.** §10.1 adds a per-file checklist of member references to rewrite (with the offset-order flip); §10.2 adds test #9 (docs-only-with-pod_ref tier recovery). |
 
@@ -61,9 +61,10 @@ into a **single sink** (`post_file_`), in term order. This:
 - Leaves the SPIMI spill temp as the **only** other on-disk scratch.
 
 This is a **breaking on-disk format change**. The project is pre-launch
-(no `lifecycle: launched` module), so a format bump without backward-compat is
-acceptable. The meta format version is bumped; readers of the old format are not
-supported and fail fast.
+(no `lifecycle: launched` module), so changing the layout without backward-compat is
+acceptable: no index with the old layout exists. The single meta format version stays
+**1** (the change folds into it); a reader rejects any version mismatch as a fail-fast
+sentinel — there is no old-format dual-read to support.
 
 ### Non-goals
 
@@ -186,7 +187,7 @@ struct SectionRefs {
   drop the second `encode_region`/`decode_region` call. The field order becomes
   `dict_region, posting_region, norms, null_bitmap, bsbf` (one varint64 pair fewer).
   This is the format-breaking byte change in the meta block; it (together with the
-  header flag in §3.1) forces the meta format version bump (§9).
+  header flag in §3.1) defines the single from-scratch meta layout (§9; version stays 1).
 
 > **Decision: one ref, not two aliases.** We considered keeping `frq_pod` and
 > `prx_pod` as two refs both pointing at the same `posting_region` (minimal reader
@@ -238,7 +239,7 @@ static constexpr uint32_t kHasBsbf      = 1u << 1;  // unchanged
 This is a **header flag bit only** — no new `SectionRefs` field, no new `DictEntry`
 field, no new varint, no struct growth (the `u32 flags` already exists on the wire).
 It is, however, a **wire-meaningful** change (a previously-zero bit may now be set),
-which the meta-version bump (§9) gates.
+folded into the single from-scratch meta layout (§9; version stays 1).
 
 ### 3.2 Reader math is unchanged "in spirit"
 
@@ -729,32 +730,26 @@ either direction (non-empty docs-only, or empty all-INLINE positional).
 
 ## 9. Migration & files to touch (breaking format change)
 
-> **Correction (post-implementation).** The plan below bumped `kMetaFormatVersion`
-> 1 -> 2. That was reverted: SNII is a **from-scratch, pre-launch** format, so no v2
-> index ever needs to coexist with a v1 one — bumping is migration ceremony with no
-> deployed reader to gate. The constant stays at **1** (the single, first meta layout);
-> the field remains a self-describing fail-fast sentinel. Bump only **after launch**.
-> The rest of §9 is kept for historical context but the bump is **not** performed.
-
 This changes the on-disk container (meta `SectionRefs` field set, the per-index
-section order, and one meta-header flag bit). Pre-launch: no backward-compat shim, no
-dual-read — the change folds into the single v1 meta layout.
+section order, and one meta-header flag bit). SNII is **from-scratch and pre-launch**:
+no index with an older layout exists, so there is no backward-compat shim, no dual-read
+— the change folds into the single, first meta layout.
 
-> **Version constant scope (R3).** `kMetaFormatVersion`
-> (`core/include/snii/format/format_constants.h:16`) is a **single shared constant**
-> consumed by **both** `per_index_meta.cpp` (header `u16`, lines 58-59/79) **and**
-> `tail_meta_region.cpp` (region `u32`, lines 50/98). Bumping it **once** versions
-> both layers; an old reader hits a version mismatch and returns `Corruption` at meta
-> decode — the desired fail-fast gate. **Do NOT** add a second/independent version
-> field. **Do NOT** bump the container `kFormatVersion` / bootstrap `min_reader_version`
-> — there is no change to container framing/bootstrap; the meta-version bump alone is
-> the gate.
+> **Version constant scope.** `kMetaFormatVersion`
+> (`core/include/snii/format/format_constants.h`) is a **single shared constant**
+> consumed by **both** `per_index_meta.cpp` (header `u16`) **and** `tail_meta_region.cpp`
+> (region `u32`); it stays at **1** — the single from-scratch meta layout. The field is
+> a self-describing fail-fast sentinel: a reader returns `Corruption` on any mismatch.
+> It is **not** bumped for this change (a pre-launch format has no v1 index to coexist
+> with — bumping would be migration ceremony with no deployed reader to gate); bump only
+> **after launch**. **Do NOT** add a second/independent version field. The container
+> `kFormatVersion` / bootstrap `min_reader_version` are unaffected (no framing change).
 
 **Files to touch:**
 
 | File | Change |
 |------|--------|
-| `core/include/snii/format/format_constants.h` | Bump `kMetaFormatVersion` (1 → 2). (Shared by per_index_meta + tail_meta_region; one bump gates both.) |
+| `core/include/snii/format/format_constants.h` | `kMetaFormatVersion` stays **1** (single from-scratch meta layout; shared by per_index_meta + tail_meta_region as a fail-fast sentinel). |
 | `core/include/snii/format/per_index_meta.h` | `SectionRefs`: replace `frq_pod`+`prx_pod` with `posting_region`. Add `PerIndexMetaBuilder::kHasPositions = 1u << 0`. Add `PerIndexMetaReader::has_positions()` accessor. |
 | `core/src/format/per_index_meta.cpp` | `encode_section_refs`/`decode_section_refs`: one region pair (`posting_region`) instead of two. (No header-write change needed beyond the existing `flags` u32, which now may carry bit 0.) |
 | `core/include/snii/writer/logical_index_writer.h` | Members: drop `frq_file_`/`prx_file_`, add `post_file_`; replace `frq_pod_size`/`prx_pod_size`/`stream_frq_pod_into`/`stream_prx_pod_into` with `posting_region_size`/`stream_posting_region_into`; update contract comment. |
