@@ -1,6 +1,6 @@
 # 设计：构建期内存统计 + 两门控下刷（segment flush + 内部分段 spill）+ k-way merge
 
-Status: draft（待评审）
+Status: P1/P2 已实现（SNII 侧）；P3 SNII 侧接缝就位，Doris 桥接待合并；P4 可选
 Owner: SNII writer
 Scope: `core/include/snii/writer/spimi_term_buffer.{h,cpp}`、`compact_posting_pool.h`、
 `spillable_byte_buffer.h`、`logical_index_writer.{h,cpp}`、`SniiIndexInput`，
@@ -104,14 +104,19 @@ class MemoryReporter {
 `spill_threshold_bytes_ != 0` 门控（`spimi_term_buffer.cpp:150`）。所以 `live_bytes_` 是个
 **仅在设了阈值时才更新的估计值**，且与 `arena_bytes()`（真实 arena）**口径不同**——若两者都报会重复计。
 
-**纪律**：
-- 倒排 posting 内存的**单一真值 = `CompactPostingPool::arena_bytes()`**（恒更新、含 block slack、
-  本就是 4 GiB 兜底检查用的真实量，`:158`）。**报它，不报 `live_bytes_`。**
-- 加上 `slot_of_.capacity() * 4`（vocab×4B 的 slot 索引，**跨 spill 驻留**、`spill_to_run` 不释放，
-  评审指出这块若漏报会让 Doris 低估真实 RSS）。
-- dict 区报 `SpillableByteBuffer::size()`（`ram_bytes_`）。
-- 每处增减**恰好报一次**（增正、减负）：arena 增长 / `pool_.reset()`（spill 归还）/ `merge_runs`
-  释放 `slot_of_` / dict spill 转盘——每一处都是必报点。
+**纪律（已实现，见 `MemoryReporter` 接入）**：
+- 倒排 posting 内存的**单一真值 = `CompactPostingPool::arena_bytes()` + `slot_of_.capacity()*4`**
+  （arena 含 block slack、slot 索引 vocab×4B 跨 spill 驻留——漏报会让 Doris 低估 RSS）。SPIMI 侧用一个
+  私有 `resident_bytes()` 助手对该真值做**单源 diff**，每变化处发一次有符号 delta，**天然不会双计/漏负**。
+  **报它，不报 `live_bytes_`**（`live_bytes_`/`account_token` 已删除，见 §3.2）。
+- dict 区（`SpillableByteBuffer`）报 `ram_bytes_` 增量。
+- **每处增减恰好报一次（增正、减负），且析构必平衡**：
+  - SPIMI：init 报 slot 索引正、每 token 报 arena 增量、spill/drain/merge 释放报负、**析构补报残留负**。
+  - dict：`append`/`append_move` 报正(**仅 RAM 路径**——spilled 后写盘的 append 不报，那不是常驻 RAM)、
+    `spill_to_disk` 报 `-ram_bytes_` 一次、**未-spill 路径析构补报 `-ram_bytes_`**（评审抓到的 dtor 泄漏
+    blocker，已修 + 回归测试 `DictDtorReleasesUnspilledRam`）。
+- 账目平衡不变量：`Σreport == 真实驻留`，构建结束/析构后回到 0——`memory_reporter_wiring_test` 用**对照
+  真实测量**（非自报之和）+ 各路径净零守恒验证。
 
 ### 2.3 与 Doris 的对接（门控 1 的可见性）
 
@@ -147,12 +152,15 @@ MemTableMemoryLimiter（软/硬限，memtable_memory_limiter.cpp:124）挑某 me
 - **SNII 侧**：实现/对接 `InvertedIndexColumnWriter` 背后的 `add_values→SpimiTermBuffer 喂入` 与
   `finish→finalize` 即可；finalize 内核已存在。
 
-### 3.2 门控 2：倒排 buffer 上限（512M）→ 内部分段 spill
+### 3.2 门控 2：倒排 buffer 上限（512M）→ 内部分段 spill（已实现 P2）
 
-- **保留**现有内部阈值自触发（`spimi_term_buffer.cpp:159`），这就是门控 2。两处改动：
-  1. **阈值接 Doris 配置**（如 512 MiB），不再是本地常量；经 `SniiIndexInput` 注入。
-  2. **判定改用真实字节**：`arena_bytes()(+ slot_of_ + dict ram) >= 阈值` 触发 spill，
-     而非 `live_bytes_` 估计（与 §2.2 同源）。
+- **保留**现有内部阈值自触发（`spimi_term_buffer.cpp`），这就是门控 2。已落地的两处改动：
+  1. **阈值即配置接缝**：复用现有的 `SpimiTermBuffer` 构造参数 `spill_threshold_bytes`（0=无限默认，
+     保持现状）——buffer 由调用方构造，合并侧把 Doris 配置（如 512 MiB）传进来即可，**无需新增
+     `SniiIndexInput` 字段**。
+  2. **判定改用真实字节**：触发条件改为 `resident_bytes()`（= `arena_bytes() + slot_of_.capacity()*4`）
+     `>= 阈值`，**不再用 `live_bytes_` 估计**；`live_bytes_` / `account_token` / 其系数常量已**删除**，
+     spill 前的空间预检也改用 `resident_bytes()`。
 - spill 一个小段到临时目录（`spill_to_run`，可重入），reset arena + 报负 delta（释放被 Doris 看见），
   继续累积。**自触发、在累积线程内**——沿用现有安全模型，无跨线程。
 - segment flush（门控 1 的 finalize）时 `MergeRuns` 把所有小段 + 残留合并成最终 `.idx`，**byte-identical**。
@@ -188,15 +196,21 @@ MemTableMemoryLimiter（软/硬限，memtable_memory_limiter.cpp:124）挑某 me
 
 ## 6. 实施阶段
 
-1. **P1**：`memory_reporter.h` + 各模块报**真实字节**（`arena_bytes` / `slot_of_` / dict ram）+
-   统计准确性单测（对照真实测量）。
-2. **P2**：门控 2 改造——阈值经 `SniiIndexInput` 接配置（512M），触发判定改用 `arena_bytes` 口径
-   （替掉 `live_bytes_`）；保留 4 GiB 兜底。
-3. **P3**：与 Doris 对接——① `consume_release_` 桥接 load MemTracker（门控 1 可见性）；
-   ② 让 SNII 坐在 `InvertedIndexColumnWriter`（`add_values`/`finish`）背后，使既有的
-   memtable flush → segment 写出 → `finish()` 自然落到 SNII finalize（**不**直接接 memory limiter）。
-   **此阶段在合并侧。**
+1. **P1 ✅ 已完成**：`core/include/snii/writer/memory_reporter.h` + 各模块报**真实字节**
+   （`arena_bytes` + `slot_of_.capacity()*4` / dict `ram_bytes_`，**不报 `live_bytes_`**），含析构平衡；
+   测试 `memory_reporter_test`、`memory_reporter_wiring_test`（对照真实测量 + 各路径净零 + dtor 泄漏守卫）。
+2. **P2 ✅ 已完成**：门控 2 触发改用 `resident_bytes()` 真实口径（替掉并删除 `live_bytes_`/`account_token`）；
+   阈值复用现有 `SpimiTermBuffer` 的 `spill_threshold_bytes` 构造参数（合并侧传 Doris 配置）；保留 4 GiB 兜底；
+   测试 `spimi_spill_writer_test::ArenaByteCapTriggersSpill`（真实字节触发 + byte-identical）。
+3. **P3（SNII 侧 ✅ / Doris 侧待合并）**：SNII 侧接缝已就位——`SniiIndexInput.mem_reporter` 透传到
+   `dict_buf_`、SPIMI reporter 由调用方在 term_source 构造时注入、`MemoryReporter` 带 `consume_release_`
+   桥接点。**合并侧待做**：① 把 `consume_release_` 接到 Doris load MemTracker（门控 1 可见性）；
+   ② 让 SNII 坐在 `InvertedIndexColumnWriter`（`add_values`/`finish`）背后，使既有 memtable flush →
+   segment 写出 → `finish()` 自然落到 SNII finalize（**不**直接接 memory limiter）。
 4. **P4（可选）**：内部分段升级为 native idx 段。
+
+> 落地提交：`feat(writer): build-RAM accounting (MemoryReporter) + gate-2 trigger on real arena bytes`。
+> core ctest 350/350；bench 编译通过。
 
 ---
 
