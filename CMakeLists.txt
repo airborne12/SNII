@@ -13,6 +13,7 @@ add_compile_options(-Wall -Wextra -Wpedantic -Werror=return-type)
 
 option(SNII_BUILD_TESTS "Build core unit tests" ON)
 option(SNII_BUILD_BENCH "Build benchmark (depends on clucene)" OFF)
+option(SNII_BUILD_EXAMPLES "Build examples (public-API demos, libsnii only)" OFF)
 option(SNII_WITH_S3 "Build S3 backend (depends on aws-sdk-cpp)" OFF)
 
 list(APPEND CMAKE_MODULE_PATH "${CMAKE_SOURCE_DIR}/cmake")
@@ -25,4 +26,8 @@ add_subdirectory(core)
 
 if(SNII_BUILD_BENCH)
   add_subdirectory(bench)
+endif()
+
+if(SNII_BUILD_EXAMPLES)
+  add_subdirectory(examples)
 endif()
