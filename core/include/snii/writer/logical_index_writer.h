@@ -14,6 +14,7 @@
 #include "snii/format/sampled_term_index.h"
 #include "snii/format/stats_block.h"
 #include "snii/io/file_writer.h"
+#include "snii/writer/memory_reporter.h"
 #include "snii/writer/spillable_byte_buffer.h"
 #include "snii/writer/spimi_term_buffer.h"
 
@@ -85,6 +86,14 @@ struct SniiIndexInput {
   // this. 0 uses kDefaultTargetDictBlockBytes. Smaller values yield more blocks
   // (and a finer-grained sampled-term index).
   uint32_t target_dict_block_bytes = 0;
+  // Optional writer-level build-RAM reporter (one per SniiCompoundWriter = one
+  // segment inverted index). When non-null, the dict buffer reports its REAL
+  // resident-byte deltas (positive on grow, negative on spill). The SPIMI side
+  // (arena + slot index) reports through the SAME reporter, injected directly at
+  // the term_source's construction by the caller. null in bench / unit tests -> no
+  // reporting. NEVER report live_bytes_ (a gated estimate); report
+  // arena_bytes()+slot_of_+dict ram_bytes_.
+  MemoryReporter* mem_reporter = nullptr;
 };
 
 // Builds and holds the section bytes + meta sub-sections for one logical index.
@@ -204,6 +213,10 @@ class LogicalIndexWriter {
   // spilling to a temp once it crosses the cap (huge dict = bounded peak RSS). The
   // orchestrator streams it into the container right after the posting region. The cap
   // is set from SNII_DICT_RAM_MAX at construction.
+  // The cap and the optional writer-level build-RAM reporter (null off-Doris) come from
+  // SniiIndexInput; the dict buffer self-reports its ram_bytes_ deltas. The SPIMI
+  // term_source self-reports its arena+slot deltas (the reporter is injected at the
+  // source's own construction by the caller, so this writer holds no reporter member).
   SpillableByteBuffer dict_buf_;
   // The interleaved [prx][frq] posting region streams STRAIGHT into the container
   // output during build() -- no temp. posting_out_ is the container writer (borrowed

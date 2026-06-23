@@ -348,7 +348,7 @@ LogicalIndexWriter::LogicalIndexWriter(const SniiIndexInput& in)
       target_dict_block_bytes_(in.target_dict_block_bytes != 0
                                    ? in.target_dict_block_bytes
                                    : snii::format::kDefaultTargetDictBlockBytes),
-      dict_buf_(dict_ram_cap_bytes(), "dict") {}
+      dict_buf_(dict_ram_cap_bytes(), "dict", in.mem_reporter) {}
 
 Status LogicalIndexWriter::validate_term(const TermPostings& tp) const {
   if (tp.freqs.size() != tp.docids.size()) {

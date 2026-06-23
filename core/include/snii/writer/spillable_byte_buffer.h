@@ -12,6 +12,7 @@
 #include "snii/common/slice.h"
 #include "snii/common/status.h"
 #include "snii/io/local_file.h"
+#include "snii/writer/memory_reporter.h"
 #include "snii/writer/temp_dir.h"
 
 namespace snii::writer {
@@ -28,9 +29,23 @@ namespace snii::writer {
 // temp. (cap_bytes == UINT64_MAX disables spilling -> always RAM.)
 class SpillableByteBuffer {
  public:
-  SpillableByteBuffer(uint64_t cap_bytes, std::string tag)
-      : cap_bytes_(cap_bytes), tag_(std::move(tag)) {}
+  // `reporter` is an OPTIONAL writer-level build-RAM reporter (null off-Doris /
+  // unit tests). When non-null, every change to ram_bytes_ (the RESIDENT tier) is
+  // mirrored to it as a signed delta: a positive delta per RAM append, and a single
+  // negative delta == prior ram_bytes_ when the buffer spills (the resident chunks
+  // are dropped and the bytes move to disk, so they must NOT be counted as RSS).
+  // Spilled bytes live on disk and are never reported.
+  SpillableByteBuffer(uint64_t cap_bytes, std::string tag,
+                      MemoryReporter* reporter = nullptr)
+      : cap_bytes_(cap_bytes), tag_(std::move(tag)), reporter_(reporter) {}
   ~SpillableByteBuffer() {
+    // Balance the reporter: on the common un-spilled path the resident ram_bytes_ was
+    // reported as positive on append but never released, so release it now (a missed
+    // negative would leak into Doris's MemTracker). After a spill, spill_to_disk()
+    // already reported the negative and ram_bytes_ no longer counts as resident.
+    if (reporter_ && !spilled_ && ram_bytes_ > 0) {
+      reporter_->report(-static_cast<int64_t>(ram_bytes_));
+    }
     if (!temp_path_.empty()) std::remove(temp_path_.c_str());
   }
   SpillableByteBuffer(const SpillableByteBuffer&) = delete;
@@ -49,6 +64,7 @@ class SpillableByteBuffer {
     if (!bytes.empty()) {
       chunks_.emplace_back(bytes.data(), bytes.data() + bytes.size());
       ram_bytes_ += bytes.size();
+      if (reporter_) reporter_->report(static_cast<int64_t>(bytes.size()));
     }
     if (ram_bytes_ >= cap_bytes_) return spill_to_disk();
     return Status::OK();
@@ -64,6 +80,7 @@ class SpillableByteBuffer {
     }
     if (!v.empty()) {
       ram_bytes_ += v.size();
+      if (reporter_) reporter_->report(static_cast<int64_t>(v.size()));
       chunks_.push_back(std::move(v));
     }
     if (ram_bytes_ >= cap_bytes_) return spill_to_disk();
@@ -112,6 +129,11 @@ class SpillableByteBuffer {
       if (!c.empty()) SNII_RETURN_IF_ERROR(temp_.append(Slice(c)));
     }
     spilled_bytes_ = ram_bytes_;
+    // The resident tier is freed: report the full negative delta == prior ram_bytes_
+    // so the writer-level RAM counter (and Doris's LOAD tracker) no longer counts
+    // these bytes as RSS -- they now live on disk. This single negative balances the
+    // sum of all prior positive append deltas (net-zero RAM after spill).
+    if (reporter_) reporter_->report(-static_cast<int64_t>(ram_bytes_));
     std::vector<std::vector<uint8_t>>().swap(chunks_);  // reclaim the RAM immediately
     spilled_ = true;
     return Status::OK();
@@ -119,6 +141,7 @@ class SpillableByteBuffer {
 
   uint64_t cap_bytes_;
   std::string tag_;
+  MemoryReporter* reporter_ = nullptr;  // optional build-RAM reporter (null off-Doris)
   std::vector<std::vector<uint8_t>> chunks_;  // resident tier: one chunk per append
   uint64_t ram_bytes_ = 0;
   bool spilled_ = false;

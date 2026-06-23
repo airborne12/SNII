@@ -10,6 +10,7 @@
 
 #include "snii/common/status.h"
 #include "snii/writer/compact_posting_pool.h"
+#include "snii/writer/memory_reporter.h"
 
 namespace snii::writer {
 
@@ -107,8 +108,10 @@ struct TermPostings {
 //     path. Existing callers that feed strings keep working unchanged.
 //
 // SPILL / K-WAY MERGE (out-of-core, bounds input RAM): when a non-zero
-// spill_threshold_bytes is set, the live in-memory size is tracked as tokens
-// arrive; once it exceeds the threshold the buffer SORTS its current terms,
+// spill_threshold_bytes is set, the REAL resident accumulator size (the posting
+// arena + the vocab-sized slot index, pool_.arena_bytes() + slot_of_.capacity()*4)
+// is compared against the threshold as tokens arrive; once it crosses the
+// threshold the buffer SORTS its current terms,
 // writes a self-describing sorted RUN to a temp file, and CLEARS memory. Each
 // run record is keyed by the TERM-ID (varint); the k-way merge orders runs by
 // the id's VOCAB STRING so the merged stream stays lexicographic. Because
@@ -144,14 +147,24 @@ class SpimiTermBuffer {
   // BORROWED-vocab constructor: `vocab` maps term-id -> term string and is
   // borrowed (NOT owned) -- the caller must keep it alive for the buffer's
   // lifetime. add_token(term_id, ...) accumulates by id with no string work.
-  // spill_threshold_bytes == 0 means unlimited (pure in-memory, default); a
-  // positive value caps the live buffer size, triggering a spill when crossed.
+  // spill_threshold_bytes is the gate-2 internal buffer cap (e.g. 512 MiB),
+  // sourced from config; == 0 means unlimited (pure in-memory, default). A
+  // positive value caps the REAL resident accumulator size (pool_.arena_bytes() +
+  // slot_of_.capacity()*4), triggering a spill when that crosses the cap -- NOT the
+  // old per-token estimate.
+  // `reporter` is the OPTIONAL writer-level build-RAM reporter (null off-Doris /
+  // unit tests). When non-null, the accumulator reports its REAL resident-byte
+  // deltas -- pool_.arena_bytes() + slot_of_.capacity()*4 -- positive on grow,
+  // negative on every reset/free, exactly once. NEVER reports live_bytes_ (a gated
+  // estimate that feeds only the spill threshold).
   explicit SpimiTermBuffer(const std::vector<std::string>* vocab, bool has_positions,
-                           size_t spill_threshold_bytes = 0);
+                           size_t spill_threshold_bytes = 0,
+                           MemoryReporter* reporter = nullptr);
 
   // OWNED-vocab (compatibility) constructor: no external vocab. The string-keyed
   // add_token interns terms into an internal vocabulary on first occurrence.
-  explicit SpimiTermBuffer(bool has_positions, size_t spill_threshold_bytes = 0);
+  explicit SpimiTermBuffer(bool has_positions, size_t spill_threshold_bytes = 0,
+                           MemoryReporter* reporter = nullptr);
 
   ~SpimiTermBuffer();
 
@@ -190,6 +203,11 @@ class SpimiTermBuffer {
   // (its callback signature has no return); callers MUST check this after
   // draining to detect a failed build.
   Status status() const { return spill_status_; }
+
+  // TEST-ONLY: number of spill run files written so far (== 0 in pure in-memory
+  // mode). Lets tests assert that a gate-2 spill actually fired once the REAL
+  // resident size crossed the configured cap. Not part of the production API.
+  size_t run_count_for_test() const { return run_paths_.size(); }
 
   // Materializes all terms sorted lexicographically; each term's docids are
   // ascending. Convenience wrapper around for_each_term_sorted that keeps the
@@ -264,8 +282,16 @@ class SpimiTermBuffer {
   Status spill_to_run();
   // Writes all current terms (sorted) to an already-open RunWriter, draining.
   Status drain_to_writer(class RunWriter* w);
-  // Approximate live byte cost a token adds (per the threshold model).
-  void account_token(uint32_t term_id, bool new_term, bool new_doc);
+  // REAL resident accumulator bytes: pool_.arena_bytes() + slot_of_.capacity()*4.
+  // The single source of truth for both the gate-2 spill trigger and the spill
+  // space-precheck -- replaces the old gated live_bytes_ estimate.
+  uint64_t resident_bytes() const;
+  // Reports the signed change in REAL resident bytes (pool_.arena_bytes() +
+  // slot_of_.capacity()*4) to mem_reporter_ since the previous call, then caches the
+  // new total. Single-source diff: every grow/reset/free emits EXACTLY ONE delta
+  // (self-balancing -> impossible to double-count or miss a negative). No-op when
+  // mem_reporter_ is null.
+  void report_arena_delta();
   // Final k-way merge over the spilled runs (+ the residual flushed as a run).
   // When `allow_stream_positions` is true (the streaming for_each path), a wide
   // merged term streams positions via pos_pump (valid only because fn consumes
@@ -285,7 +311,6 @@ class SpimiTermBuffer {
 
   bool has_positions_;
   size_t spill_threshold_bytes_;  // 0 => unlimited (no spilling)
-  size_t live_bytes_ = 0;         // tracked live cost of terms_ vs the threshold
   uint64_t total_tokens_ = 0;
 
   // POOLED accumulators (replaces a dense vocab-sized std::vector<Term>, which
@@ -309,6 +334,12 @@ class SpimiTermBuffer {
   // the bulk of the accumulator's memory in a few large blocks (no per-term vector
   // headers, no per-vector doubling slack) -- the compact-RSS win.
   CompactPostingPool pool_;
+
+  // Optional writer-level build-RAM reporter (null off-Doris / unit tests) and the
+  // last resident-byte total it was told about. report_arena_delta() diffs the live
+  // total (arena_bytes() + slot_of_.capacity()*4) against reported_resident_.
+  MemoryReporter* mem_reporter_ = nullptr;
+  int64_t reported_resident_ = 0;
 
   // Returns the live Term for `term_id`, claiming a pool slot on first touch.
   Term& term_slot(uint32_t term_id, bool* new_term);
