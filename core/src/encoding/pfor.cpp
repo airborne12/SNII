@@ -2,10 +2,24 @@
 
 #include <algorithm>
 #include <cstdint>
+#include <cstring>
 #include <vector>
+
+#include "snii/common/slice.h"
 
 namespace snii {
 namespace {
+
+// Unaligned little-endian 64-bit load from a raw byte pointer (single instruction on
+// x86; memcpy is the portable, UB-free spelling the compiler folds to a mov).
+inline uint64_t load_u64_le(const uint8_t* p) {
+  uint64_t v;
+  std::memcpy(&v, p, sizeof(v));
+#if defined(__BIG_ENDIAN__) || (defined(__BYTE_ORDER__) && __BYTE_ORDER__ == __ORDER_BIG_ENDIAN__)
+  v = __builtin_bswap64(v);
+#endif
+  return v;
+}
 
 uint8_t bits_for(uint32_t v) {
   uint8_t b = 0;
@@ -55,21 +69,43 @@ void bitpack(const uint32_t* v, size_t n, uint8_t w, ByteSink* out) {
 
 Status bitunpack(ByteSource* src, size_t n, uint8_t w, uint32_t* out) {
   if (w == 0) {
-    for (size_t i = 0; i < n; ++i) out[i] = 0;
+    std::memset(out, 0, n * sizeof(uint32_t));
     return Status::OK();
   }
-  uint64_t acc = 0;
-  int filled = 0;
-  for (size_t i = 0; i < n; ++i) {
-    while (filled < w) {
-      uint8_t b;
-      SNII_RETURN_IF_ERROR(src->get_u8(&b));
-      acc |= static_cast<uint64_t>(b) << filled;
-      filled += 8;
+  // Pull the whole packed run in ONE bounds-checked slice (#3: was one get_u8 per
+  // byte -- a Status-returning call + bounds check each), then unpack straight from the
+  // contiguous buffer. Each value's w<=32 bits start at bit offset i*w and span at most
+  // ceil((7+32)/8)=5 bytes, so a single unaligned 64-bit load at byte (i*w)/8 always
+  // covers it: one load + shift + mask per value, branchless, no per-byte accumulator
+  // loop (#2). Measured fewest instructions and fewest cycles of the alternatives --
+  // the dependency-free per-value form lets the core overlap the loads (the unaligned
+  // word reads all hit L1, the packed run being only KiB).
+  const size_t packed = (static_cast<size_t>(w) * n + 7) / 8;
+  Slice buf;
+  SNII_RETURN_IF_ERROR(src->get_bytes(packed, &buf));
+  const uint8_t* base = buf.data();
+  const uint64_t mask = low_mask(w);
+
+  // Fast path: values whose 8-byte load window stays inside the buffer (byte_off + 8
+  // <= packed). The final few are finished by the tail loop, which zero-pads past end.
+  size_t i = 0;
+  if (packed >= 8) {
+    const size_t last_safe_byte = packed - 8;
+    for (; i < n; ++i) {
+      const size_t bit_off = static_cast<size_t>(w) * i;
+      const size_t byte_off = bit_off >> 3;
+      if (byte_off > last_safe_byte) break;
+      out[i] = static_cast<uint32_t>((load_u64_le(base + byte_off) >> (bit_off & 7)) & mask);
     }
-    out[i] = static_cast<uint32_t>(acc & low_mask(w));
-    acc >>= w;
-    filled -= w;
+  }
+  for (; i < n; ++i) {
+    const size_t bit_off = static_cast<size_t>(w) * i;
+    const size_t byte_off = bit_off >> 3;
+    uint64_t word = 0;
+    for (size_t b = byte_off; b < packed && b < byte_off + 8; ++b) {
+      word |= static_cast<uint64_t>(base[b]) << ((b - byte_off) * 8);
+    }
+    out[i] = static_cast<uint32_t>((word >> (bit_off & 7)) & mask);
   }
   return Status::OK();
 }
