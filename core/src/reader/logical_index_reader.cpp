@@ -1,12 +1,29 @@
 #include "snii/reader/logical_index_reader.h"
 
+#include <cstdlib>
 #include <vector>
 
+#include "snii/encoding/crc32c.h"
 #include "snii/encoding/zstd_codec.h"
 #include "snii/format/dict_block.h"
 #include "snii/format/dict_block_directory.h"
 
 namespace snii::reader {
+
+namespace {
+// L0/L1 tiering threshold (bytes). Defaults to kBsbfResidentMaxBytes; the env
+// SNII_BSBF_RESIDENT_MAX overrides it for tuning and for exercising the on-demand
+// L1 path in tests without a 250K-term corpus. Read fresh each open.
+uint64_t bsbf_resident_max_bytes() {
+  const char* s = std::getenv("SNII_BSBF_RESIDENT_MAX");
+  if (s != nullptr) {
+    char* end = nullptr;
+    const unsigned long long v = std::strtoull(s, &end, 10);
+    if (end != s) return v;
+  }
+  return snii::format::kBsbfResidentMaxBytes;
+}
+}  // namespace
 
 using snii::format::BlockRef;
 using snii::format::DictBlockDirectoryReader;
@@ -15,7 +32,11 @@ using snii::format::DictEntry;
 using snii::format::IndexTier;
 using snii::format::PerIndexMetaReader;
 using snii::format::SampledTermIndexReader;
-using snii::format::XFilterReader;
+using snii::format::bsbf_hash;
+using snii::format::bsbf_probe;
+using snii::format::kBsbfBytesPerBlock;
+using snii::format::kBsbfHeaderSize;
+using snii::format::RegionRef;
 
 Status LogicalIndexReader::open(snii::io::FileReader* file_reader,
                                 IndexTier tier, bool has_positions,
@@ -34,9 +55,42 @@ Status LogicalIndexReader::open(snii::io::FileReader* file_reader,
       out->meta_.sampled_term_index_bytes(), &out->sti_));
   SNII_RETURN_IF_ERROR(DictBlockDirectoryReader::open(
       out->meta_.dict_block_directory_bytes(), &out->dbd_));
-  if (out->meta_.has_xfilter()) {
-    SNII_RETURN_IF_ERROR(
-        XFilterReader::open(out->meta_.xfilter_bytes(), &out->xfilter_));
+  // Block-split bloom XFilter: derive the resident header from the section ref
+  // (offset+length) -- ZERO open-time I/O, the whole point of the on-demand design.
+  // The bitset starts at the constant offset section.offset + 28; one 32-byte block
+  // is read on demand per probe in lookup().
+  const RegionRef& bsbf = out->meta_.section_refs().bsbf;
+  if (bsbf.length > 0) {
+    if (bsbf.length <= kBsbfHeaderSize)
+      return Status::Corruption("logical_index: bsbf section too small");
+    const uint64_t num_bytes = bsbf.length - kBsbfHeaderSize;
+    const bool resident = bsbf.length <= bsbf_resident_max_bytes();
+    // L0: read the WHOLE section (header + bitset) so probes are in-memory AND the
+    // bitset crc can be verified once. L1: read only the 28-byte header so open stays
+    // near-zero I/O; the on-demand single-block probe cannot verify a whole-bitset
+    // crc, so L1 relies on the storage layer's own integrity for the bitset body.
+    // Either way the header (magic/version/strategy/geometry + header crc) is parsed
+    // and verified -- BsbfHeader::parse rejects a corrupt header.
+    std::vector<uint8_t> head;
+    SNII_RETURN_IF_ERROR(file_reader->read_at(
+        bsbf.offset, resident ? bsbf.length : kBsbfHeaderSize, &head));
+    if (head.size() < kBsbfHeaderSize)
+      return Status::Corruption("logical_index: short bsbf header read");
+    SNII_RETURN_IF_ERROR(snii::format::BsbfHeader::parse(
+        Slice(head.data(), kBsbfHeaderSize), bsbf.offset, &out->bsbf_header_));
+    // Cross-check the header geometry against the section ref.
+    if (out->bsbf_header_.num_bytes != num_bytes)
+      return Status::Corruption("logical_index: bsbf header/section size mismatch");
+    out->has_bsbf_ = true;
+    if (resident) {
+      if (head.size() < bsbf.length)
+        return Status::Corruption("logical_index: short bsbf resident read");
+      const Slice bitset(head.data() + kBsbfHeaderSize, out->bsbf_header_.num_bytes);
+      if (snii::crc32c(bitset) != out->bsbf_header_.bitset_crc)
+        return Status::Corruption("logical_index: bsbf bitset crc mismatch");
+      out->bsbf_resident_bitset_.assign(bitset.data(), bitset.data() + bitset.size());
+      out->bsbf_resident_ = true;
+    }
   }
   return Status::OK();
 }
@@ -47,9 +101,22 @@ Status LogicalIndexReader::lookup(std::string_view term, bool* found,
   *found = false;
   if (reader_ == nullptr) return Status::InvalidArgument("logical_index: not opened");
 
-  // 1. XFilter fast rejection.
-  if (meta_.has_xfilter() && !xfilter_.maybe_contains(term)) {
-    return Status::OK();
+  // 1. XFilter fast rejection. DEFINITELY-ABSENT -> return empty without the dict
+  //    read. L0: in-memory probe of the resident bitset; L1: on-demand 32-byte block.
+  if (has_bsbf_) {
+    const uint64_t h = bsbf_hash(term);
+    bool maybe = false;
+    if (bsbf_resident_) {
+      // L0: in-memory probe of the resident bitset (no round).
+      const uint32_t blk = snii::format::bsbf_block_index(h, bsbf_header_.num_blocks);
+      maybe = snii::format::bsbf_block_contains(
+          h, bsbf_resident_bitset_.data() +
+                 static_cast<size_t>(blk) * kBsbfBytesPerBlock);
+    } else {
+      // L1: on-demand single-block probe.
+      SNII_RETURN_IF_ERROR(bsbf_probe(reader_, bsbf_header_, h, &maybe));
+    }
+    if (!maybe) return Status::OK();
   }
 
   // 2. SampledTermIndex -> candidate block ordinal.
@@ -94,6 +161,62 @@ Status LogicalIndexReader::lookup(std::string_view term, bool* found,
   *found = true;
   *frq_base = br.frq_base();
   *prx_base = br.prx_base();
+  return Status::OK();
+}
+
+Status LogicalIndexReader::prefix_terms(std::string_view prefix,
+                                        std::vector<PrefixHit>* out) const {
+  if (out == nullptr) return Status::InvalidArgument("logical_index: null out");
+  out->clear();
+  if (reader_ == nullptr) return Status::InvalidArgument("logical_index: not opened");
+
+  // Seek the start block: the SampledTermIndex block whose first term <= prefix
+  // (terms with `prefix` are >= prefix, so they begin in that block or later). If
+  // the prefix sorts before every sample (or is empty), start at block 0.
+  uint32_t start = 0;
+  if (!prefix.empty()) {
+    bool maybe = false;
+    uint32_t ordinal = 0;
+    SNII_RETURN_IF_ERROR(sti_.locate(prefix, &maybe, &ordinal));
+    if (maybe) start = ordinal;
+  }
+
+  for (uint32_t ord = start; ord < dbd_.n_blocks(); ++ord) {
+    BlockRef ref{};
+    SNII_RETURN_IF_ERROR(dbd_.get(ord, &ref));
+    std::vector<uint8_t> block_bytes;
+    SNII_RETURN_IF_ERROR(reader_->read_at(ref.offset, ref.length, &block_bytes));
+    std::vector<uint8_t> inflated;
+    Slice block_slice(block_bytes);
+    if (ref.flags & snii::format::block_ref_flags::kZstd) {
+      constexpr uint64_t kMaxDictBlockUncompBytes = 256ull * 1024 * 1024;
+      if (ref.uncomp_len == 0 || ref.uncomp_len > kMaxDictBlockUncompBytes) {
+        return Status::Corruption("dict block: zstd uncomp_len out of range");
+      }
+      SNII_RETURN_IF_ERROR(snii::zstd_decompress(
+          Slice(block_bytes), static_cast<size_t>(ref.uncomp_len), &inflated));
+      block_slice = Slice(inflated);
+    }
+    DictBlockReader br;
+    SNII_RETURN_IF_ERROR(
+        DictBlockReader::open(block_slice, tier_, has_positions_, &br));
+    std::vector<DictEntry> entries;
+    SNII_RETURN_IF_ERROR(br.decode_all(&entries));
+
+    for (DictEntry& e : entries) {
+      const std::string_view t(e.term);
+      if (t < prefix) continue;  // not yet at the prefix range
+      const bool has_prefix =
+          t.size() >= prefix.size() && t.compare(0, prefix.size(), prefix) == 0;
+      if (!has_prefix) return Status::OK();  // past the prefix range; sorted -> done
+      PrefixHit hit;
+      hit.term = e.term;
+      hit.entry = std::move(e);
+      hit.frq_base = br.frq_base();
+      hit.prx_base = br.prx_base();
+      out->push_back(std::move(hit));
+    }
+  }
   return Status::OK();
 }
 

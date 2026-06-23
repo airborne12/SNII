@@ -22,4 +22,13 @@ Status phrase_query(const snii::reader::LogicalIndexReader& idx,
                     const std::vector<std::string>& terms,
                     std::vector<uint32_t>* docids);
 
+// boolean_and (MATCH all-terms): sorted docid set of docs containing EVERY term,
+// no positional constraint. Reuses the docid-only conjunction (min-df driver +
+// covering-window reads for high-df terms) but fetches NO positions, so bytes scale
+// with selectivity rather than df. Valid on docs-only indexes. Empty terms or any
+// absent term -> empty result.
+Status boolean_and(const snii::reader::LogicalIndexReader& idx,
+                   const std::vector<std::string>& terms,
+                   std::vector<uint32_t>* docids);
+
 }  // namespace snii::query

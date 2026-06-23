@@ -97,6 +97,9 @@ class LogicalIndexWriter {
   uint64_t frq_pod_size() const { return frq_file_.size(); }
   uint64_t prx_pod_size() const { return prx_file_.size(); }
   const std::vector<uint8_t>& norms_bytes() const { return norms_section_; }
+  // Block-split bloom XFilter blob ([28B header][bitset]); empty when no terms.
+  const std::vector<uint8_t>& bsbf_bytes() const { return bsbf_bytes_; }
+  bool has_bsbf() const { return !bsbf_bytes_.empty(); }
 
   // Streams each section's bytes into the append-only container writer using a
   // fixed copy buffer (no whole-section reload). Append order/content is
@@ -190,12 +193,11 @@ class LogicalIndexWriter {
 
   std::vector<BlockRecord> blocks_;
   std::vector<std::string> sample_first_terms_;
-  // One 8-byte XXH3 key per term (the only input build_xfilter needs), collected
-  // during the build pass so the whole-vocabulary string copy (all_terms_) is
-  // never retained.
+  // One 8-byte XXH64 (seed 0) filter key per term, collected during the build pass
+  // so the whole-vocabulary string copy is never retained.
   std::vector<uint64_t> term_hashes_;
   snii::format::StatsBlock stats_;
-  std::vector<uint8_t> xfilter_bytes_;
+  std::vector<uint8_t> bsbf_bytes_;  // serialized block-split bloom XFilter section
 };
 
 }  // namespace snii::writer

@@ -99,6 +99,11 @@ class DictBlockReader {
   // miss (including out-of-range, gap) → *found=false. Structural error → non-OK Status.
   Status find_term(std::string_view target, bool* found, DictEntry* out) const;
 
+  // Decodes EVERY entry in the block in lexicographic order into *out (each a
+  // self-contained DictEntry, owning its term). Used for ordered term enumeration
+  // (prefix / range scans). Resets the front-coding base at each anchor segment.
+  Status decode_all(std::vector<DictEntry>* out) const;
+
   uint64_t frq_base() const { return frq_base_; }
   uint64_t prx_base() const { return prx_base_; }
   uint32_t n_entries() const { return n_entries_; }

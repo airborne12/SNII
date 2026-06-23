@@ -30,7 +30,7 @@ find_library(ROARING_LIB NAMES roaring libroaring.a PATHS ${_dt_installed_candid
 target_include_directories(snii PUBLIC ${ROARING_INCLUDE_DIR})
 target_link_libraries(snii PUBLIC ${ROARING_LIB})
 
-# xxHash header (used header-only via XXH_INLINE_ALL by the binary-fuse-8 filter).
+# xxHash header (used header-only via XXH_INLINE_ALL by the block-split bloom filter).
 find_path(XXHASH_INCLUDE_DIR xxhash.h PATHS ${_dt_installed_candidates}
   PATH_SUFFIXES include NO_DEFAULT_PATH REQUIRED)
 target_include_directories(snii PUBLIC ${XXHASH_INCLUDE_DIR})

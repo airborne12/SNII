@@ -21,14 +21,13 @@
 //     varint64 index_id
 //     varint32 suffix_len
 //     u8[]     suffix_bytes
-//     u32      flags (fixed32, little-endian)   # feature bits, e.g. kHasXFilter
+//     u32      flags (fixed32, little-endian)   # feature bits, e.g. kHasBsbf
 //     u32      crc32c (fixed32) over all preceding header bytes
 //   then framed sub-sections (each via SectionFramer, type+len+payload+crc32c):
 //     StatsBlock            (kStatsBlock,        built here)
 //     SampledTermIndex      (kSampledTermIndex,  embedded already-framed bytes)
 //     DICT block directory  (kDictBlockDirectory,embedded already-framed bytes)
-//     optional XFilter      (kXFilter,           embedded; present iff kHasXFilter)
-//     SectionRefs           (kSectionRefs,       built here)
+//     SectionRefs           (kSectionRefs,       built here; carries the bsbf ref)
 //     (+ any extra raw framed sections appended by add_raw_section)
 //
 // Design choice: the SampledTermIndex / DICT block directory / XFilter
@@ -54,13 +53,17 @@ struct SectionRefs {
   RegionRef prx_pod;
   RegionRef norms;
   RegionRef null_bitmap;
+  // Block-split bloom XFilter section ([28B header][bitset]); {0,0} when absent.
+  // A PHYSICAL section (not embedded in the resident meta) so a single 32-byte block
+  // can be probed on demand without loading the whole filter at open.
+  RegionRef bsbf;
 };
 
 // Builds a per-index meta block by composing already-built sub-sections.
 class PerIndexMetaBuilder {
  public:
   // Header flags / feature bits.
-  static constexpr uint32_t kHasXFilter = 1u << 0;
+  static constexpr uint32_t kHasBsbf = 1u << 1;  // block-split bloom XFilter (section ref)
 
   PerIndexMetaBuilder(uint64_t index_id, std::string index_suffix,
                       uint32_t flags);
@@ -72,9 +75,6 @@ class PerIndexMetaBuilder {
 
   // Raw output of DictBlockDirectoryBuilder::finish (a full kDictBlockDirectory frame).
   void set_dict_block_directory(Slice framed_bytes);
-
-  // Optional. Raw output of build_xfilter (a full kXFilter frame); sets kHasXFilter.
-  void set_xfilter(Slice framed_bytes);
 
   void set_section_refs(const SectionRefs& refs);
 
@@ -93,7 +93,6 @@ class PerIndexMetaBuilder {
   StatsBlock stats_;
   std::vector<uint8_t> sampled_term_index_;
   std::vector<uint8_t> dict_block_directory_;
-  std::vector<uint8_t> xfilter_;
   SectionRefs section_refs_;
   std::vector<std::vector<uint8_t>> extra_sections_;
 };
@@ -123,9 +122,8 @@ class PerIndexMetaReader {
   // Full kDictBlockDirectory frame Slice, ready for DictBlockDirectoryReader::open.
   Slice dict_block_directory_bytes() const { return dict_block_directory_; }
 
-  bool has_xfilter() const { return (flags_ & PerIndexMetaBuilder::kHasXFilter) != 0; }
-  // Full kXFilter frame Slice (empty when no XFilter is present).
-  Slice xfilter_bytes() const { return xfilter_; }
+  // Block-split bloom XFilter: present iff a non-empty bsbf section ref exists.
+  bool has_bsbf() const { return section_refs_.bsbf.length > 0; }
 
  private:
   uint64_t index_id_ = 0;
@@ -135,7 +133,6 @@ class PerIndexMetaReader {
   SectionRefs section_refs_;
   Slice sampled_term_index_;
   Slice dict_block_directory_;
-  Slice xfilter_;
 };
 
 }  // namespace snii::format

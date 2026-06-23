@@ -2,8 +2,10 @@
 
 #include <algorithm>
 #include <cmath>
+#include <cstdint>
 #include <map>
 #include <unordered_map>
+#include <unordered_set>
 
 namespace bench {
 namespace {
@@ -148,22 +150,6 @@ uint32_t lexicographic_max_id(const Corpus& c) {
   return best;
 }
 
-// Returns the document frequency of every vocabulary term in one pass.
-std::vector<uint32_t> all_dfs(const Corpus& c) {
-  std::vector<uint32_t> df(c.vocab.size(), 0);
-  std::vector<uint8_t> seen(c.vocab.size(), 0);
-  for (const auto& doc : c.docs) {
-    for (uint32_t tid : doc) {
-      if (!seen[tid]) {
-        seen[tid] = 1;
-        ++df[tid];
-      }
-    }
-    for (uint32_t tid : doc) seen[tid] = 0;  // reset only the touched entries
-  }
-  return df;
-}
-
 }  // namespace
 
 uint32_t highest_df_term(const Corpus& c) {
@@ -237,6 +223,91 @@ std::vector<std::string> extract_phrase(const Corpus& c, uint32_t length) {
     }
   }
   return {};
+}
+
+std::vector<uint32_t> all_dfs(const Corpus& c) {
+  std::vector<uint32_t> df(c.vocab.size(), 0);
+  std::vector<uint8_t> seen(c.vocab.size(), 0);
+  for (const auto& doc : c.docs) {
+    for (uint32_t tid : doc) {
+      if (!seen[tid]) {
+        seen[tid] = 1;
+        ++df[tid];
+      }
+    }
+    for (uint32_t tid : doc) seen[tid] = 0;  // reset only the touched entries
+  }
+  return df;
+}
+
+uint32_t term_in_df_bucket(const Corpus& c, double lo_frac, double hi_frac) {
+  const std::vector<uint32_t> df = all_dfs(c);
+  const uint32_t excluded = lexicographic_max_id(c);
+  const double n = static_cast<double>(c.doc_count);
+  const uint32_t lo = static_cast<uint32_t>(lo_frac * n);
+  const uint32_t hi = static_cast<uint32_t>(hi_frac * n);
+  uint32_t best = UINT32_MAX;
+  for (uint32_t i = 0; i < df.size(); ++i) {
+    if (i == excluded || df[i] < lo || df[i] > hi) continue;
+    if (best == UINT32_MAX || c.vocab[i] < c.vocab[best]) best = i;
+  }
+  return best == UINT32_MAX ? 0 : best;
+}
+
+uint32_t term_at_df(const Corpus& c, uint32_t target_df) {
+  const std::vector<uint32_t> df = all_dfs(c);
+  const uint32_t excluded = lexicographic_max_id(c);
+  uint32_t best = UINT32_MAX, best_dist = UINT32_MAX;
+  for (uint32_t i = 0; i < df.size(); ++i) {
+    if (i == excluded || df[i] == 0) continue;
+    const uint32_t dist =
+        df[i] > target_df ? df[i] - target_df : target_df - df[i];
+    if (dist < best_dist ||
+        (dist == best_dist && (best == UINT32_MAX || c.vocab[i] < c.vocab[best]))) {
+      best_dist = dist;
+      best = i;
+    }
+  }
+  return best == UINT32_MAX ? 0 : best;
+}
+
+uint32_t df1_term(const Corpus& c) {
+  const std::vector<uint32_t> df = all_dfs(c);
+  const uint32_t excluded = lexicographic_max_id(c);
+  uint32_t best = UINT32_MAX;
+  for (uint32_t i = 0; i < df.size(); ++i) {
+    if (i == excluded || df[i] != 1) continue;
+    if (best == UINT32_MAX || c.vocab[i] < c.vocab[best]) best = i;
+  }
+  return best == UINT32_MAX ? low_df_term(c) : best;
+}
+
+std::string absent_token(const Corpus& c) {
+  std::unordered_set<std::string> vocab(c.vocab.begin(), c.vocab.end());
+  for (uint32_t n = 0; n < 1000000; ++n) {
+    std::string cand = "zzq" + std::to_string(n);  // [a-z0-9] doris-english shape
+    if (vocab.find(cand) == vocab.end()) return cand;
+  }
+  return "zzqabsentfallback";
+}
+
+std::pair<uint32_t, uint32_t> cooccurring_pair(const Corpus& c, double a_lo,
+                                               double a_hi, double b_lo,
+                                               double b_hi) {
+  const std::vector<uint32_t> df = all_dfs(c);
+  const uint32_t excluded = lexicographic_max_id(c);
+  const double n = static_cast<double>(c.doc_count);
+  const uint32_t b_lodf = static_cast<uint32_t>(b_lo * n);
+  const uint32_t b_hidf = static_cast<uint32_t>(b_hi * n);
+  const uint32_t a = term_in_df_bucket(c, a_lo, a_hi);
+  for (const auto& doc : c.docs) {
+    if (std::find(doc.begin(), doc.end(), a) == doc.end()) continue;
+    for (uint32_t tid : doc) {
+      if (tid == a || tid == excluded) continue;
+      if (df[tid] >= b_lodf && df[tid] <= b_hidf) return {a, tid};
+    }
+  }
+  return {a, a};  // no co-occurring B (caller checks first != second)
 }
 
 }  // namespace bench

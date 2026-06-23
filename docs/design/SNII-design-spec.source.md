@@ -404,11 +404,37 @@ DictEntry
 - `frq_off_delta / frq_len`：命中后生成 `.frq` range。
 - `prx_off_delta / prx_len`：phrase/positions 查询时生成 `.prx` range。
 - `inline frq_bytes / prx_bytes`：低频 term 直接在词典块内完成读取，不再访问外部 payload。
-### 不存在的term快速过滤
-位于 per-index meta block，使用 binary-fuse-8 作为 exact term 的不存在查找过滤。该结构适合 immutable segment：finish 时 term 集合已知，可以一次性构建。布放策略：
-- `xf_bytes <= 256KB`：放入 L0 常驻。
-- 超过 256KB：放入 L1，首查整体读取，之后依赖 FileCache。
-- `term_count > 32M`：允许省略，L0 标记 `xf_absent`。XF 只用于 exact term。range、regexp、prefix、phrase_prefix 必须通过有序 term enum 展开，不能用XF裁剪。
+### 不存在的term快速过滤（block-split bloom + 按需单块探测）
+exact term 的不存在快速过滤（XFilter，简称 XF）位于 per-index meta block，构建于 immutable segment 的 finish 阶段（term 集合已知，一次性构建）。
+
+**结构：block-split bloom filter（BSBF，对齐 Parquet/Doris）。** 过滤器是 256-bit（32 字节）块的数组：一个 term 的 key（XXH3-64）映射到唯一块 `bucket = (hash>>32) & (nblocks-1)`，在该块内由 8 个 SALT 掩码置/验 8 位。`nblocks = num_bytes/32`，`num_bytes` 取 2 的幂（Parquet `OptimalNumOfBytes(ndv, fpp)`），记于 28 字节头。
+
+**探测：按需读单块，不整表载入。** open 时只把**头 + 轻量句柄/基址**进 searcher cache（不 deep-copy 整 blob）。探一个词：由 `hash` + 头里的 `nblocks` **当场算出 bucket（O(1)，零 I/O）** → `read_at(base + bucket*32, 32)` 读**恰好一个 32 字节块** → 比 8 个掩码。**不需要 offset 表、不需要 per-block 目录、不改其余磁盘结构**（bucket 自算）。
+
+**为什么不是 binary-fuse-8。** fuse-8 体积更省（~9 vs ~13–17 bit/key、FPR 稳定 ~0.4%），但其 3 探针落在 `3×segment_length` 的窗口、**窗宽随词表涨**（100M 词≈384KB），无法「只读 32 字节」——只能整表载入。大词表下整表载入是 open 时的读放大瓶颈（实测 20M 词整表 22.5MB / 12.9ms）。BSBF 牺牲 ~1.6× 体积，换来**单块按需探测恒定 ~32B / ~0.004ms（与词表规模脱钩）**。完整对比见 `docs/benchmark-results.md`「XFilter vs Block-Split Bloom 实测」。
+
+**净价值的诚实边界（成本模型）。**
+- **本地/热缓存(细粒度)**：探测 ~32B（一次 refill）≈ 免费；absent 词直接省掉一次 dict block 读（实测胜「无过滤器」16×）。XF 的价值在此区间最大。
+- **云冷读(1MiB FileCache 块地板)**：单块探测被 1MiB 块对齐顶成一个 cache block = 与它要省的 dict block 同量级 → absent 与「无过滤器」**持平**、present 多一个块。此区间过滤器净收益趋零，但 BSBF 按需读**至少不像 fuse-8 整表载入那样把成本放大到数 MB**。
+
+**布放与 gate（L0/L1 分级，已实现）。**
+- **L0（小 filter，`bsbf section <= 256KB`）→ open 时整块载入常驻**：`lookup()` 走内存探测，**无 per-lookup round**（等价 fuse-8 常驻的免费探测，但用 BSBF）。open 仅一次廉价整读（云端 ≤1 个 1MiB cache block）。
+- **L1（大 filter，`> 256KB`）→ 仅头常驻**：`bitset_base`/`num_blocks` 由 section ref 推导，**零 open-time I/O**；`lookup()` 按需读 1 个 32B 块。大词表的 open 整读放大被消除。
+- 阈值 `kBsbfResidentMaxBytes`（默认 256KB）可调；实测依据见下「为何按 256KB 分级」。
+- 仅在「云冷 + present-heavy + 低复用」角落，可按构建期开关**直接省略 XF**（不写 `kHasBsbf` / `bsbf` section 长度为 0，reader 优雅降级走有界 dict 读）；reader 对无 XF 已支持。
+- XF 只用于 **exact term**。range、regexp、prefix、phrase_prefix 必须通过有序 term enum 展开，不能用 XF 裁剪。
+
+**为何按 256KB 分级（真实 OSS 实测）。** 无分级地一律按需探测时，S3 上**每个 present 词查询多 1 个 serial round**（探测块 + dict 块），低/中-df 词延迟翻倍、输给 CLucene（CL/SNII=0.50–0.54）；且云冷 1MiB 块地板下 absent 也省不下 dict 读。改 L0/L1 后小 filter 走常驻，词查询**回到 1 round、反超 CLucene（CL/SNII=1.21–1.38）**，大 filter 仍享零 open 载入。即：小 filter「open 一次整读 + 查询期免费」优于「查询期每查 +1 round」；大 filter 反之。
+
+**实现现状（已落地）。** BSBF + 按需单块探测已贯通 writer/reader，取代 binary-fuse-8（模块 `core/.../format/bsbf.{h,cpp}`，commit `b5c887a`）：
+- **writer**：每词收 XXH64（seed 0）key → `BsbfBuilder`（fpp=1%，Parquet `OptimalNumOfBytes` 定尺）→ 序列化 `[28B 头][连续未压缩小端 bitset]`。
+- **物理 section**：compound writer 把该 blob 作为独立 section 写入容器（norms 之后），绝对 offset/len 记入 `SectionRefs.bsbf`（第 6 个 RegionRef）；**不再嵌入常驻 meta block**。
+- **reader（L0/L1 分级，commit `f33502d`）**：open 时**读并校验 28B 头**（`BsbfHeader::parse` 验 magic/version/strategy + header crc + 几何，并与 section ref 长度交叉核对）；**小 filter（≤256KB）整块载入常驻（L0）→ 同时校验 bitset crc → `lookup()` 内存探测、无 round**；**大 filter（>256KB）仅头常驻（L1）→ `bsbf_probe()` 按需读 1 个 32B 块**（`base+28+block*32`）。两者 DEFINITELY-ABSENT 都不读 dict 直接返回空。
+- **完整性校验**：bsbf 头 crc 两档都校验；**L0 额外校验整 bitset crc**（commit 见下）。**L1 的按需单块读本质上无法校验整-bitset crc**——大 filter 的 bitset body 依赖存储层（S3/磁盘）自身完整性，这是 on-demand 的设计权衡。其余持久化块（dict / frq / prx / norms / per-index-meta / meta-region）均在解析前校验各自 crc。
+- **SIMD**：单块校验用 AVX2（256-bit 块 = 一个 YMM，`testc`/`or`），逐函数 `target("avx2")` + 运行时门控 + 标量回退；build ~2.8×、热查最高 ~4×（三个参考实现 Parquet/Doris 均无 SIMD）。
+- **现状边界（真实 OSS 实测，300K docs）**：L0 下词查询 **1 round**（high-df `CL/SNII=1.67` 反超 CLucene）；L1 下词查询 **2 rounds**（探测那 1 round），小 posting 词 `CL/SNII=0.50–0.75` 输、大 posting 词仍赢（high-df 1.36）。即「小 filter 走 L0」是对的。净价值在本地/热最大、云冷因 1MiB 块地板封顶。
+- **fuse-8 已彻底移除**：旧 binary-fuse-8 模块（`xfilter.{h,cpp}` + 测试）及临时 A/B 开关均已删除；BSBF L0/L1 是唯一过滤器。L0 阈值由 `kBsbfResidentMaxBytes`（默认 256KB，env `SNII_BSBF_RESIDENT_MAX` 可调）控制。
+- **后续优化**：大词表 L1 的多段 fan-out 批量单块拒绝（一轮 GET 多段 bsbf 块、批量裁绝对缺失段），见下「多词算子的批量取窗」TODO。
 ### 词典采样索引
 SampledTermIndex 位于 per-index meta block 中，用于将查询 term 定位到候选 DICT block。它是 DICT block 读取前使用的常驻元数据，随 SniiLogicalIndexReader 进入 searcher cache。
 SampledTermIndex 的采样粒度是 DICT block，而不是固定 term 数。writer 每生成一个 DICT block，就把该 block 的 first_term 写入 SampledTermIndex。这样索引规模与 DICT block 数量成正比，而不是与 term 总数成正比。
@@ -574,6 +600,40 @@ SNII prelude:
 - slim && encoded_bytes <= inline_threshold：inline，posting 全部写入 DictEntry。
 - df < 512 && encoded_bytes > inline_threshold：pod_ref slim，posting 写入外部 `.frq/.prx` range，由 DictEntry 记录 offset / length。
 inline 用于减少低频 term 的额外 payload 读取；windowed 用于让中高 df term 在命中后可以先读 prelude，再生成 `.frq/.prx `的批量 range 读取计划。
+## 短语查询执行（计划取窗 + 游标流式求值）
+`MATCH_PHRASE` 是读路径上最重的查询：需要多 term 的 docid 合取 + 位置相邻性判断。若按执行期 cursor 逐段推进（CLucene 式），既会随 postings/positions 推进触发串行 seek，又会为大量最终不命中的 doc 解码位置。SNII 将其拆为「计划阶段批量取窗（docid 先行）」与「求值阶段游标流式单遍」两步，使三个金指标同时受控，位置解码与内存只花在最终幸存候选上。计划阶段决定 S3 读取形态（不可变的 S3-native 原则），求值阶段是取回内存后的纯列式流。
+
+### 计划阶段：docid 先行的批量取窗
+- 按 df 升序，最小 df 的 term 作 **driver**。driver 通过其 prelude 窗口目录取**全部窗口的 dd 子段**（连续 dd-block，一次并发 range），仅解 docid（整段跳过 freq-block）。
+- 其余 term 用 prelude 暴露的窗口 docid 范围，只选**覆盖当前候选集**的窗口（covering windows），把这些窗口的 dd 与 `.prx` 子段**同批一次取回**（dd 供本阶段求交、`.prx` 留给求值阶段），docid-only 解码后与候选求交收窄。
+- 关键：每个 term 命中窗口的 dd 与 `.prx` 字节在此阶段**一次性批量并发取回内存**，位置**不在此解码**。串行 I/O 轮次 ≈ 计划轮数（每 term 一批），与 df / 命中量无关——这正是相对 CLucene 执行期逐段 seek（轮次随 iterator 推进增长）的核心优势。
+
+### 求值阶段：游标流式单遍
+- 每 term 一个 **PostingCursor**，在已取回的内存窗口（按 docid 升序的 chunk 列表）上**单调前进**；docid 在计划阶段已解出并复用，dd 区每窗只解一次。
+- **单遍**遍历升序候选：各游标 `seek` 到候选（窗口级前移 + 窗口内局部下标前移，**无逐候选 docid 二分**）；按短语位置取各 term 该候选的位置——当前窗口的 `.prx` **懒解一次**进扁平列（`pos_flat` + per-doc offset 的 CSR 布局，PFOR 顺序解码，**无逐 doc 堆分配**），按局部下标 O(1) 取得 position span；相邻性 `term[0]@p / term[t]@p+t` 逐 start 校验、**词级短路**。
+- 位置只为**最终幸存候选所在的窗口**解码；每个 term 只缓存**当前窗口**的位置列，不物化全候选位置。候选升序 ⇒ 命中 docid 天然有序输出。
+
+### 与三金指标的对应
+- **串行 I/O 轮次**：计划阶段批量并发取窗 → 轮次少且与命中量无关。
+- **Range GET / 读取字节**：docid-only 求交跳过 freq-block；位置只解幸存覆盖窗 → range 数与字节随查询选择性收缩。
+- **求值 CPU**：纯内存列式流（每窗 dd / 位置各解一次），无逐候选二分、无全候选位置物化；CPU 受位置 PFOR 顺序解码下限约束。slim/inline 形态的 term 视为单 chunk，走同一游标路径。
+
+## TODO：多词算子的批量取窗（prefix / OR / phrase-prefix / wildcard / regexp）
+
+> 落地时机：后续**结合 Doris 与 SNII 代码实现**时一并完成（不改索引磁盘格式）。
+
+**背景（已验证）**：上面的「计划取窗」批量并发取回已用于 `phrase` 与 `boolean_and`（最小 df 驱动 + 覆盖窗一轮批量取）。但**多词展开类算子**（`prefix` / 布尔 `OR` / `phrase-prefix` / `wildcard` / `regexp`）目前是**逐展开词串行**：枚举展开词后对每个词单独取 posting，外层串行。在 S3-native（查询不预下载整文件、直查对象存储）下，这会退化为 **~N 个串行 Range GET 往返**，延迟随展开词数线性放大（实测宽前缀 'wa*' 在真实 OSS 上 wall 反慢于 CLucene，尽管 `request_bytes` 少 51×——慢的是串行轮次不是字节）。
+
+**关键判断（Doris 代码审计结论，已验证）**：Doris BE 重写的倒排算子（v1 `query/` 与 v2 `query_v2/`）**同样是逐词/逐块串行，算子层无批量、无预读、无跨词合并**——唯一的 prefetch 原语 `CachedRemoteFileReader::prefetch_range` 在倒排查询路径**零调用**，所有 posting 读落到一个同步 `read_at`（`inverted_index_fs_directory.cpp:229`）。Doris 之所以在生产不暴露此问题，是**架构性**地把 S3-awareness 推给独立缓存层（`FILE_BLOCK_CACHE`，1MiB 块 download-then-query），冷缓存/直查对象存储时其 `prefix` 等多词算子会暴露**同一类**串行 RTT 问题。
+
+**结论与设计意图**：
+1. **不照搬 Doris 的串行算子**——把 S3-native 做进**算子层**（而非靠缓存层兜底）正是 SNII 的差异化，也是 Doris 留下的空白。
+2. **把「计划 + 一轮批量取窗」推广到多词展开算子**：展开词集合确定后，每个词的 `.frq` 窗偏移可由 `DictEntry`/`prefix_terms` 回传的 `entry / frq_base / prx_base` 经 `resolve_frq_window` **纯算术算出（零额外 I/O，无需二次 lookup）**；将**所有展开词的 dd 窗一次性加入同一个 `BatchRangeFetcher`、一轮 `fetch()`**（一波最多并发 GET），再各自解码后 `union`（OR/prefix）或参与合取（phrase-prefix 复用现有合取+游标）。串行 I/O 轮次由 ~N 塌成 ~1，且保留 docid-only 跳 freq 的字节优势。
+3. 落地范围：core 新增批量 `prefix_query` / `union_query`（与 `phrase_query` 同源复用 `BatchRangeFetcher`/`resolve_frq_window`），bench 与上层调它；`boolean_or` / `phrase_prefix` 同款改造。**不动索引格式。**
+4. 度量修正：成本模型 `serial_rounds` 目前只在「1MiB 块未命中」时计数，会把多次串行 `fetch()` 因块预热而低估；批量化后此问题自然消除，但应同时让 `serial_rounds` 反映真实顺序阻塞 fetch 次数，避免掩盖串行延迟。
+
+**另一独立 TODO（牵涉格式，需单独评估）**：`.frq` dd 的 PFOR 缺 **frame-of-reference（每段减最小值）**。等差/恒定 gap 流（如 keyword 的等步长 docid）熵≈0 却仍按原值位宽编码（实测 keyword 恒定 gap=6 → 3 bit/doc）。加 per-run min 减法可把此类流降到接近 0 bit，但会改变 byte-identical 磁盘编码，需单独评估收益与兼容性，**与上面的取窗批量化无关**。
+
 ## footer元信息
 ### 设计原则
 Doris BE 可能同时打开大量 segment。SNII 的 tail meta region 必须保持紧凑，只保存查询规划所需的元数据。

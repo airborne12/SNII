@@ -4,6 +4,7 @@
 
 #include <cstdint>
 #include <cstdio>
+#include <cstdlib>
 #include <string>
 #include <vector>
 
@@ -22,7 +23,7 @@
 #include "snii/format/sampled_term_index.h"
 #include "snii/format/tail_meta_region.h"
 #include "snii/format/tail_pointer.h"
-#include "snii/format/xfilter.h"
+#include "snii/format/bsbf.h"
 #include "snii/io/local_file.h"
 #include "snii/io/metered_file_reader.h"
 #include "snii/query/phrase_query.h"
@@ -51,6 +52,16 @@ std::vector<uint8_t> ReadAll(const std::string& path) {
   std::vector<uint8_t> out;
   EXPECT_TRUE(r.read_at(0, r.size(), &out).ok());
   return out;
+}
+
+// Writes bytes to a fresh temp file and returns its path.
+std::string WriteTemp(const std::vector<uint8_t>& bytes) {
+  const std::string p = TempPath();
+  io::LocalFileWriter w;
+  EXPECT_TRUE(w.open(p).ok());
+  EXPECT_TRUE(w.append(Slice(bytes)).ok());
+  EXPECT_TRUE(w.finalize().ok());
+  return p;
 }
 
 // Builds a TermPostings with constant freq per doc and (optionally) positions.
@@ -206,13 +217,26 @@ TEST(SniiCompoundWriter, ReadBackSelfValidation) {
     EXPECT_EQ(refs.null_bitmap.offset, 0u);
     EXPECT_EQ(refs.null_bitmap.length, 0u);
 
-    // --- XFilter: present term true, absent term false ---
-    ASSERT_TRUE(meta.has_xfilter());
-    XFilterReader xf;
-    ASSERT_TRUE(XFilterReader::open(meta.xfilter_bytes(), &xf).ok());
-    EXPECT_TRUE(xf.maybe_contains("apple"));
-    EXPECT_TRUE(xf.maybe_contains("common"));
-    EXPECT_FALSE(xf.maybe_contains("nonexistent-term-xyzzy-12345"));
+    // --- XFilter (block-split bloom, physical section): present true, absent false ---
+    // Probe the on-disk filter directly: one 32-byte block at a self-computed offset.
+    EXPECT_TRUE(meta.has_bsbf());
+    ASSERT_GT(refs.bsbf.length, snii::format::kBsbfHeaderSize);
+    ASSERT_LE(refs.bsbf.offset + refs.bsbf.length, file.size());
+    const uint64_t bsbf_bitset = refs.bsbf.offset + snii::format::kBsbfHeaderSize;
+    const uint32_t bsbf_nblocks = static_cast<uint32_t>(
+        (refs.bsbf.length - snii::format::kBsbfHeaderSize) /
+        snii::format::kBsbfBytesPerBlock);
+    auto bsbf_present = [&](std::string_view term) {
+      const uint64_t h = snii::format::bsbf_hash(term);
+      const uint64_t off =
+          bsbf_bitset + static_cast<uint64_t>(
+                            snii::format::bsbf_block_index(h, bsbf_nblocks)) *
+                            snii::format::kBsbfBytesPerBlock;
+      return snii::format::bsbf_block_contains(h, file.data() + off);
+    };
+    EXPECT_TRUE(bsbf_present("apple"));
+    EXPECT_TRUE(bsbf_present("common"));
+    EXPECT_FALSE(bsbf_present("nonexistent-term-xyzzy-12345"));
 
     // --- windowed high-df term "common": read its .frq window ---
     bool found_common = false;
@@ -386,6 +410,57 @@ TEST(SniiCompoundWriter, MultiSuperBlockReadBack) {
   EXPECT_EQ(hot.enc, DictEntryEnc::kWindowed);
   EXPECT_TRUE(hot.has_sb);
 
+  // L0 tiering: this index's bsbf filter is tiny (<= kBsbfResidentMaxBytes), so it is
+  // loaded resident at open and an absent-term lookup is rejected IN MEMORY with zero
+  // reads (no per-lookup round). Loop a few absents to skip the rare false positive.
+  bool saw_resident_reject = false;
+  for (int i = 0; i < 8 && !saw_resident_reject; ++i) {
+    metered.reset_metrics();
+    bool af = true;
+    DictEntry ad;
+    uint64_t afb = 0, apb = 0;
+    ASSERT_TRUE(
+        idx.lookup("absent-zzz-" + std::to_string(i), &af, &ad, &afb, &apb).ok());
+    if (!af) {
+      EXPECT_EQ(metered.metrics().read_at_calls, 0u);
+      EXPECT_EQ(metered.metrics().serial_rounds, 0u);
+      saw_resident_reject = true;
+    }
+  }
+  EXPECT_TRUE(saw_resident_reject);
+  metered.reset_metrics();
+
+  // L1 tiering: force on-demand by lowering the resident threshold to 0, then re-open
+  // the SAME index. It now keeps only the header, so an absent-term lookup must do a
+  // real on-demand block READ (>= 1 read_at) -- unlike L0's in-memory zero-read
+  // reject above -- and a present term is still found via the on-demand probe + dict.
+  ::setenv("SNII_BSBF_RESIDENT_MAX", "0", /*overwrite=*/1);
+  {
+    reader::LogicalIndexReader idx_l1;
+    ASSERT_TRUE(seg.open_index(1, "body", &idx_l1).ok());
+    bool pf = false;
+    DictEntry pe;
+    uint64_t pfb = 0, ppb = 0;
+    ASSERT_TRUE(idx_l1.lookup("hot", &pf, &pe, &pfb, &ppb).ok());
+    EXPECT_TRUE(pf);  // present term found via L1 probe + dict
+    bool saw_l1_read = false;
+    for (int i = 0; i < 8 && !saw_l1_read; ++i) {
+      metered.reset_metrics();
+      bool af = true;
+      DictEntry ad;
+      uint64_t afb = 0, apb = 0;
+      ASSERT_TRUE(
+          idx_l1.lookup("absent-zzz-" + std::to_string(i), &af, &ad, &afb, &apb).ok());
+      if (!af) {
+        EXPECT_GE(metered.metrics().read_at_calls, 1u);  // on-demand block read
+        saw_l1_read = true;
+      }
+    }
+    EXPECT_TRUE(saw_l1_read);
+  }
+  ::unsetenv("SNII_BSBF_RESIDENT_MAX");
+  metered.reset_metrics();
+
   // Fetch + parse the two-level prelude.
   const uint64_t prelude_abs =
       idx.section_refs().frq_pod.offset + frq_base + hot.frq_off_delta;
@@ -521,4 +596,76 @@ TEST(SniiCompoundWriter, StreamedMultiIndexDeterministic) {
   EXPECT_EQ(ReadAll(p1), ReadAll(p2));
   std::remove(p1.c_str());
   std::remove(p2.c_str());
+}
+
+// A flipped on-disk byte in the bsbf filter (header or bitset) or in the meta region
+// must be detected on the read path, not silently propagated as a wrong probe result.
+TEST(SniiCompoundWriter, ChecksumCorruptionDetectedOnRead) {
+  const std::string good = TempPath();
+  {
+    io::LocalFileWriter w;
+    ASSERT_TRUE(w.open(good).ok());
+    SniiCompoundWriter cw(&w);
+    ASSERT_TRUE(cw.add_logical_index(MakeIndex(7, "body", 30)).ok());
+    ASSERT_TRUE(cw.finish().ok());
+  }
+  const std::vector<uint8_t> file = ReadAll(good);
+  std::remove(good.c_str());
+
+  // Locate the bsbf section + meta region from the tail.
+  TailPointer tp;
+  ASSERT_TRUE(decode_tail_pointer(
+                  Slice(file.data() + file.size() - tail_pointer_size(),
+                        tail_pointer_size()),
+                  &tp)
+                  .ok());
+  TailMetaRegionReader tmr;
+  ASSERT_TRUE(TailMetaRegionReader::open(
+                  Slice(file.data() + tp.meta_region_offset, tp.meta_region_length),
+                  &tmr)
+                  .ok());
+  bool found = false;
+  Slice meta_bytes;
+  ASSERT_TRUE(tmr.find(7, "body", &found, &meta_bytes).ok());
+  ASSERT_TRUE(found);
+  PerIndexMetaReader meta;
+  ASSERT_TRUE(PerIndexMetaReader::open(meta_bytes, &meta).ok());
+  const auto bsbf = meta.section_refs().bsbf;
+  ASSERT_GT(bsbf.length, snii::format::kBsbfHeaderSize);  // small filter -> L0
+
+  // The clean file opens fine.
+  auto opens_ok = [](const std::vector<uint8_t>& bytes) {
+    const std::string p = WriteTemp(bytes);
+    io::LocalFileReader r;
+    EXPECT_TRUE(r.open(p).ok());
+    reader::SniiSegmentReader seg;
+    Status sopen = reader::SniiSegmentReader::open(&r, &seg);
+    bool ok = sopen.ok();
+    if (ok) {
+      reader::LogicalIndexReader idx;
+      ok = seg.open_index(7, "body", &idx).ok();
+    }
+    std::remove(p.c_str());
+    return ok;
+  };
+  EXPECT_TRUE(opens_ok(file));
+
+  // (1) bsbf BITSET byte flip -> L0 open verifies the bitset crc -> rejected.
+  {
+    std::vector<uint8_t> bad = file;
+    bad[bsbf.offset + snii::format::kBsbfHeaderSize] ^= 0xFF;
+    EXPECT_FALSE(opens_ok(bad));
+  }
+  // (2) bsbf HEADER byte flip (num_bytes field, covered by header crc) -> rejected.
+  {
+    std::vector<uint8_t> bad = file;
+    bad[bsbf.offset + 8] ^= 0xFF;
+    EXPECT_FALSE(opens_ok(bad));
+  }
+  // (3) META REGION byte flip -> segment open verifies meta_region_checksum -> rejected.
+  {
+    std::vector<uint8_t> bad = file;
+    bad[tp.meta_region_offset] ^= 0xFF;
+    EXPECT_FALSE(opens_ok(bad));
+  }
 }

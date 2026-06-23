@@ -9,6 +9,7 @@
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
+#include <stdexcept>
 #include <string>
 #include <vector>
 
@@ -596,4 +597,40 @@ TEST(SpillRunCodec, TruncatedRunIsCorruption) {
   Status s = r.open(run.path, /*has_positions=*/true);
   while (s.ok() && !r.exhausted()) s = r.advance();
   EXPECT_FALSE(s.ok());
+}
+
+// Ownership contract: a streamed pos_pump captured by a STORED TermPostings (a
+// violation of the synchronous-consume-once contract) must throw if invoked after
+// the merge returns, not dereference the freed merge-stack/reader state (UAF).
+TEST(SpillRunCodec, StreamedPumpThrowsWhenCalledAfterMerge) {
+  TempRun run;
+  // Wide term (>= kSlimDfThreshold=512 docs) so the merge streams positions via a
+  // pos_pump instead of materializing positions_flat.
+  std::vector<uint32_t> docids, freqs, flat;
+  for (uint32_t d = 0; d < 1000; ++d) {
+    docids.push_back(d);
+    freqs.push_back(1);
+    flat.push_back(d);
+  }
+  TermPostings tp;
+  tp.docids = docids;
+  tp.freqs = freqs;
+  tp.positions_flat = flat;
+  {
+    RunWriter w;
+    ASSERT_TRUE(w.open(run.path).ok());
+    ASSERT_TRUE(w.write_term(0, tp).ok());
+    ASSERT_TRUE(w.close().ok());
+  }
+  const std::vector<std::string> vocab = {"wide"};
+  // Deliberately violate the contract: STORE the streamed TermPostings, do not pump.
+  TermPostings stored;
+  ASSERT_TRUE(MergeRuns({run.path}, vocab, /*has_positions=*/true,
+                        [&](TermPostings&& t) { stored = std::move(t); })
+                  .ok());
+  ASSERT_TRUE(static_cast<bool>(stored.pos_pump));  // streaming path was taken
+  EXPECT_TRUE(stored.positions_flat.empty());       // positions were not materialized
+  // The deferred call fails loudly instead of touching freed merge state.
+  std::vector<uint32_t> buf(stored.pos_total != 0 ? stored.pos_total : 1);
+  EXPECT_THROW(stored.pos_pump(buf.data(), buf.size()), std::logic_error);
 }

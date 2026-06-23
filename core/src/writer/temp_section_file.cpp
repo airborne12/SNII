@@ -9,6 +9,7 @@
 #include <string>
 
 #include "snii/io/local_file.h"
+#include "snii/writer/temp_dir.h"
 
 namespace snii::writer {
 
@@ -18,16 +19,8 @@ namespace {
 // count against transient RAM during the finish()-time concatenation.
 constexpr size_t kCopyBufBytes = 1u << 20;
 
-// Resolve the scratch directory: honor TMPDIR when set, else /tmp. ASCII only.
-std::string TempDir() {
-  const char* env = std::getenv("TMPDIR");
-  if (env != nullptr && env[0] != '\0') {
-    std::string d(env);
-    if (d.back() == '/') d.pop_back();
-    return d;
-  }
-  return "/tmp";
-}
+// Scratch directory: shared resolver (SNII_TEMP_DIR -> TMPDIR -> /tmp).
+std::string TempDir() { return resolve_temp_dir(); }
 
 // Process-unique scratch path (pid + monotonic counter so concurrent builds /
 // multiple sections never collide).

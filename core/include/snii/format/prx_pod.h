@@ -66,4 +66,12 @@ Status build_prx_window_flat(std::span<const uint32_t> positions_flat,
 Status read_prx_window(ByteSource* source,
                        std::vector<std::vector<uint32_t>>* per_doc_positions);
 
+// CSR variant of read_prx_window: decodes ALL docs' positions into one flat buffer
+// `pos_flat` with per-doc offsets `pos_off` (size doc_count+1, pos_off[0]==0), so
+// doc d's positions are pos_flat[pos_off[d] .. pos_off[d+1]). Avoids the per-doc
+// std::vector allocation of read_prx_window -- both output vectors are flat uint32
+// buffers whose capacity a caller can retain (clear()) across windows/queries.
+Status read_prx_window_csr(ByteSource* source, std::vector<uint32_t>* pos_flat,
+                           std::vector<uint32_t>* pos_off);
+
 }  // namespace snii::format

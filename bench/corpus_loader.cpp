@@ -7,18 +7,15 @@
 #include <unordered_map>
 #include <vector>
 
+#include "doris_english_analyzer.h"
+
 namespace bench {
 
 namespace {
 
-constexpr size_t kMaxTokenLen = 64;
-
-// Lowercases ASCII letters; leaves digits as-is; everything else is a separator.
-inline int normalize(unsigned char c) {
-  if (c >= 'A' && c <= 'Z') return c - 'A' + 'a';
-  if ((c >= 'a' && c <= 'z') || (c >= '0' && c <= '9')) return c;
-  return -1;  // separator
-}
+// The streaming loader applies the SAME tokenization rule as the parquet path,
+// sourced from the shared Doris-english analyzer so the two stay in lockstep.
+constexpr size_t kMaxTokenLen = kDorisEnglishMaxTokenLen;
 
 // RAII wrapper: closes the FILE* on any scope exit (including a thrown
 // allocation), so the descriptor never leaks. std::fclose ignores nullptr-free
@@ -97,7 +94,7 @@ Corpus load_from_file(const std::string& path, uint32_t max_docs) {
         continue;
       }
       doc_open = true;
-      const int nc = normalize(static_cast<unsigned char>(ch));
+      const int nc = doris_english_normalize(static_cast<unsigned char>(ch));
       if (nc < 0) {
         flush_token();
       } else if (tok.size() < kMaxTokenLen) {

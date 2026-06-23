@@ -2,6 +2,9 @@
 # CLucene reader on the same corpus. Depends on libsnii (public API) + CLucene.
 # This tree is fully separate from core/ (core has zero bench/clucene deps).
 find_package(CLucene REQUIRED)
+# Apache Arrow/Parquet: lets the bench read the real OTel-log parquet dataset
+# (Body column) directly, no pre-export step.
+find_package(ArrowParquet REQUIRED)
 
 # Bench sources are globbed so new components drop in without editing this file.
 # *_test.cpp files are gtest unit tests for individual bench components: they are
@@ -13,7 +16,7 @@ list(FILTER SNII_BENCH_SOURCES EXCLUDE REGEX "_test\\.cpp$")
 
 add_executable(snii_bench ${SNII_BENCH_SOURCES})
 target_include_directories(snii_bench PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
-target_link_libraries(snii_bench PRIVATE snii snii_clucene)
+target_link_libraries(snii_bench PRIVATE snii snii_clucene snii_arrow)
 
 # Real-OSS mode (optional). When SNII_WITH_S3 is ON the bench also compiles the
 # OSS-backed CLucene directory + adapters (all guarded by SNII_WITH_S3) and needs
@@ -40,6 +43,47 @@ if(SNII_BUILD_TESTS)
     PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
   target_link_libraries(snii_bench_corpus_loader_test PRIVATE snii_gtest)
 
+  # Pure tokenization rule (no Arrow/CLucene): the Doris-english analyzer.
+  add_executable(snii_bench_doris_english_analyzer_test
+    ${CMAKE_CURRENT_SOURCE_DIR}/doris_english_analyzer_test.cpp
+    ${CMAKE_CURRENT_SOURCE_DIR}/doris_english_analyzer.cpp)
+  target_include_directories(snii_bench_doris_english_analyzer_test
+    PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
+  target_link_libraries(snii_bench_doris_english_analyzer_test PRIVATE snii_gtest)
+
+  # Parallel tokenization equivalence (no Arrow/CLucene): builds a Corpus.
+  find_package(Threads REQUIRED)
+  add_executable(snii_bench_parallel_tokenizer_test
+    ${CMAKE_CURRENT_SOURCE_DIR}/parallel_tokenizer_test.cpp
+    ${CMAKE_CURRENT_SOURCE_DIR}/parallel_tokenizer.cpp
+    ${CMAKE_CURRENT_SOURCE_DIR}/doris_english_analyzer.cpp
+    ${CMAKE_CURRENT_SOURCE_DIR}/corpus_gen.cpp)
+  target_include_directories(snii_bench_parallel_tokenizer_test
+    PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
+  target_link_libraries(snii_bench_parallel_tokenizer_test
+    PRIVATE snii_gtest Threads::Threads)
+
+  # Parquet column reader (links Arrow; writes + reads a small fixture in-test).
+  add_executable(snii_bench_parquet_corpus_reader_test
+    ${CMAKE_CURRENT_SOURCE_DIR}/parquet_corpus_reader_test.cpp
+    ${CMAKE_CURRENT_SOURCE_DIR}/parquet_corpus_reader.cpp)
+  target_include_directories(snii_bench_parquet_corpus_reader_test
+    PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
+  target_link_libraries(snii_bench_parquet_corpus_reader_test
+    PRIVATE snii_gtest snii_arrow)
+
+  # df-bucket term selection (no Arrow/CLucene): pure Corpus selectors.
+  add_executable(snii_bench_corpus_gen_test
+    ${CMAKE_CURRENT_SOURCE_DIR}/corpus_gen_test.cpp
+    ${CMAKE_CURRENT_SOURCE_DIR}/corpus_gen.cpp)
+  target_include_directories(snii_bench_corpus_gen_test
+    PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
+  target_link_libraries(snii_bench_corpus_gen_test PRIVATE snii_gtest)
+
   include(GoogleTest)
   gtest_discover_tests(snii_bench_corpus_loader_test)
+  gtest_discover_tests(snii_bench_corpus_gen_test)
+  gtest_discover_tests(snii_bench_doris_english_analyzer_test)
+  gtest_discover_tests(snii_bench_parallel_tokenizer_test)
+  gtest_discover_tests(snii_bench_parquet_corpus_reader_test)
 endif()

@@ -14,6 +14,7 @@
 #include "snii/encoding/varint.h"
 #include "snii/format/format_constants.h"
 #include "snii/writer/spill_run_codec.h"
+#include "snii/writer/temp_dir.h"
 
 #if defined(__GLIBC__)
 #include <malloc.h>
@@ -42,12 +43,12 @@ constexpr size_t kBytesPerDocEntry = 4 + 4;  // one docid + one freq
 constexpr size_t kBytesPerPosition = 4;
 constexpr size_t kBytesPerTermNode = 64;     // per-term struct + slack
 
-// Process-unique temp path for a spill run (pid + monotonic counter so parallel
-// builds / multiple buffers never collide).
-std::string MakeRunPath() {
+// Process-unique temp path for a spill run under `dir` (pid + monotonic counter so
+// parallel builds / multiple buffers never collide).
+std::string MakeRunPath(const std::string& dir) {
   static std::atomic<uint64_t> counter{0};
   const uint64_t n = counter.fetch_add(1);
-  return "/tmp/snii_spill_" + std::to_string(::getpid()) + "_" + std::to_string(n) +
+  return dir + "/snii_spill_" + std::to_string(::getpid()) + "_" + std::to_string(n) +
          ".run";
 }
 
@@ -448,7 +449,18 @@ Status SpimiTermBuffer::drain_to_writer(RunWriter* w) {
 }
 
 Status SpimiTermBuffer::spill_to_run() {
-  const std::string path = MakeRunPath();
+  const std::string dir = resolve_temp_dir();
+  // Best-effort space pre-check: fail with a clear, early error rather than a
+  // mid-write IoError that leaves a half-written run. Best-effort only (TOCTOU; on
+  // tmpfs this reports RAM). live_bytes_ is the resident estimate about to drain.
+  const uint64_t avail = temp_dir_available_bytes(dir);
+  if (avail < live_bytes_) {
+    return Status::IoError("spimi: insufficient temp space in '" + dir +
+                           "' to spill ~" + std::to_string(live_bytes_) + " B (~" +
+                           std::to_string(avail) +
+                           " B free); set SNII_TEMP_DIR/TMPDIR to a larger disk");
+  }
+  const std::string path = MakeRunPath(dir);
   RunWriter w;
   SNII_RETURN_IF_ERROR(w.open(path));
   run_paths_.push_back(path);  // tracked for cleanup even if a later step fails

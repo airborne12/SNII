@@ -2,6 +2,7 @@
 
 #include <vector>
 
+#include "snii/encoding/crc32c.h"
 #include "snii/format/bootstrap_header.h"
 #include "snii/format/format_constants.h"
 #include "snii/format/per_index_meta.h"
@@ -59,6 +60,13 @@ Status SniiSegmentReader::open(snii::io::FileReader* reader,
   SNII_RETURN_IF_ERROR(reader->read_at(tp.meta_region_offset,
                                        tp.meta_region_length,
                                        &out->meta_region_));
+  // Verify the whole meta region against the tail pointer's checksum BEFORE parsing
+  // it. (TailMetaRegionReader::open also checks the region's own internal checksum;
+  // this is the read-boundary check that makes tp.meta_region_checksum meaningful and
+  // catches corruption before any framed sub-section is touched.)
+  if (snii::crc32c(Slice(out->meta_region_)) != tp.meta_region_checksum) {
+    return Status::Corruption("segment: meta region checksum mismatch");
+  }
   return TailMetaRegionReader::open(Slice(out->meta_region_),
                                     &out->region_reader_);
 }

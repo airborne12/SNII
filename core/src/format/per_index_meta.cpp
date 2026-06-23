@@ -24,7 +24,7 @@ Status decode_region(ByteSource* ps, RegionRef* r) {
   return Status::OK();
 }
 
-// SectionRefs payload: five RegionRefs in fixed order, each as varint64 pair.
+// SectionRefs payload: six RegionRefs in fixed order, each as varint64 pair.
 void encode_section_refs(const SectionRefs& refs, ByteSink* sink) {
   ByteSink payload;
   encode_region(refs.dict_region, &payload);
@@ -32,6 +32,7 @@ void encode_section_refs(const SectionRefs& refs, ByteSink* sink) {
   encode_region(refs.prx_pod, &payload);
   encode_region(refs.norms, &payload);
   encode_region(refs.null_bitmap, &payload);
+  encode_region(refs.bsbf, &payload);
   SectionFramer::write(*sink, static_cast<uint8_t>(SectionType::kSectionRefs),
                        payload.view());
 }
@@ -43,6 +44,7 @@ Status decode_section_refs(Slice payload, SectionRefs* out) {
   SNII_RETURN_IF_ERROR(decode_region(&ps, &out->prx_pod));
   SNII_RETURN_IF_ERROR(decode_region(&ps, &out->norms));
   SNII_RETURN_IF_ERROR(decode_region(&ps, &out->null_bitmap));
+  SNII_RETURN_IF_ERROR(decode_region(&ps, &out->bsbf));
   if (!ps.eof()) {
     return Status::Corruption("per_index_meta: trailing bytes in section_refs");
   }
@@ -113,14 +115,11 @@ Status read_frame(Slice block, ByteSource* src, uint8_t* type, Slice* frame) {
 // false (via *handled) for unrecognized types so the caller skips them.
 // Routes an optional sub-section frame to its slot. Unknown section types are
 // intentionally ignored (forward compatibility: skip unknown optional sections).
-void dispatch_frame(uint8_t type, Slice frame, Slice* sampled, Slice* dict,
-                    Slice* xfilter) {
+void dispatch_frame(uint8_t type, Slice frame, Slice* sampled, Slice* dict) {
   if (type == static_cast<uint8_t>(SectionType::kSampledTermIndex)) {
     *sampled = frame;
   } else if (type == static_cast<uint8_t>(SectionType::kDictBlockDirectory)) {
     *dict = frame;
-  } else if (type == static_cast<uint8_t>(SectionType::kXFilter)) {
-    *xfilter = frame;
   }
 }
 
@@ -145,12 +144,6 @@ void PerIndexMetaBuilder::set_dict_block_directory(Slice framed_bytes) {
                                framed_bytes.data() + framed_bytes.size());
 }
 
-void PerIndexMetaBuilder::set_xfilter(Slice framed_bytes) {
-  xfilter_.assign(framed_bytes.data(),
-                  framed_bytes.data() + framed_bytes.size());
-  flags_ |= kHasXFilter;
-}
-
 void PerIndexMetaBuilder::set_section_refs(const SectionRefs& refs) {
   section_refs_ = refs;
 }
@@ -168,9 +161,6 @@ Status PerIndexMetaBuilder::finish(ByteSink* sink) const {
   encode_stats_block(stats_, sink);
   sink->put_bytes(Slice(sampled_term_index_));
   sink->put_bytes(Slice(dict_block_directory_));
-  if ((flags_ & kHasXFilter) != 0) {
-    sink->put_bytes(Slice(xfilter_));
-  }
   encode_section_refs(section_refs_, sink);
   for (const auto& extra : extra_sections_) {
     sink->put_bytes(Slice(extra));
@@ -203,14 +193,11 @@ Status PerIndexMetaReader::open(Slice block, PerIndexMetaReader* out) {
       have_refs = true;
     } else {
       dispatch_frame(type, frame, &out->sampled_term_index_,
-                     &out->dict_block_directory_, &out->xfilter_);
+                     &out->dict_block_directory_);
     }
   }
   if (!have_stats || !have_refs) {
     return Status::Corruption("per_index_meta: missing required sub-section");
-  }
-  if (out->has_xfilter() && out->xfilter_.empty()) {
-    return Status::Corruption("per_index_meta: kHasXFilter set but no XFilter");
   }
   return Status::OK();
 }

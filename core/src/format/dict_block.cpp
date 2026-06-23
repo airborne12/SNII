@@ -220,6 +220,35 @@ bool DictBlockReader::locate_anchor(std::string_view target,
   return true;
 }
 
+Status DictBlockReader::decode_all(std::vector<DictEntry>* out) const {
+  if (out == nullptr) return Status::InvalidArgument("dict_block: out is null");
+  out->clear();
+  out->reserve(n_entries_);
+  for (size_t a = 0; a < anchor_offsets_.size(); ++a) {
+    const size_t seg_begin = anchor_offsets_[a];
+    const bool is_last = a + 1 == anchor_offsets_.size();
+    const size_t seg_end =
+        is_last ? (block_.size() - kNAnchorsBytes -
+                   anchor_offsets_.size() * kAnchorOffBytes)
+                : anchor_offsets_[a + 1];
+    if (seg_end < seg_begin || seg_end > block_.size()) {
+      return Status::Corruption("dict_block: anchor segment range invalid");
+    }
+    ByteSource src(block_.subslice(seg_begin, seg_end - seg_begin));
+    std::string prev;  // first entry of a segment is an anchor (prev_term="")
+    while (!src.eof()) {
+      DictEntry e;
+      SNII_RETURN_IF_ERROR(decode_dict_entry(&src, std::string_view(prev), tier_, &e));
+      prev = e.term;
+      out->push_back(std::move(e));
+    }
+  }
+  if (out->size() != n_entries_) {
+    return Status::Corruption("dict_block: decoded entry count mismatch");
+  }
+  return Status::OK();
+}
+
 Status DictBlockReader::scan_from_anchor(size_t anchor_idx,
                                          std::string_view target, bool* found,
                                          DictEntry* out) const {

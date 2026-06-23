@@ -35,12 +35,29 @@ class SniiOssAdapter {
   SniiOssAdapter(const SniiOssAdapter&) = delete;
   SniiOssAdapter& operator=(const SniiOssAdapter&) = delete;
 
+  // Keyword (non-tokenized, docs-only) build: set before build_upload_and_open.
+  void set_docs_only(bool v) { docs_only_ = v; }
+
   // Builds the .idx locally, uploads it to OSS under cfg.prefix, and opens it
   // over an S3FileReader. Throws std::runtime_error on failure.
   void build_upload_and_open(const Corpus& c, const snii::io::S3Config& cfg);
 
   // The OSS object key (prefix + "/" + key) that was uploaded, for cleanup.
   const std::string& uploaded_key() const { return uploaded_key_; }
+
+  // Bytes of the block-split bloom XFilter section (0 if none) -- lets the bench
+  // report the L0/L1 tier (resident iff <= kBsbfResidentMaxBytes).
+  uint64_t bsbf_section_bytes() const {
+    return index_ ? index_->section_refs().bsbf.length : 0;
+  }
+
+  // The raw OSS object key (no prefix) passed to S3FileReader::open -- pass it to
+  // open_uploaded on a fresh adapter to open the SAME uploaded index per thread.
+  const std::string& object_key() const { return object_key_; }
+
+  // Opens an ALREADY-uploaded index (its own S3FileReader + reader chain) without
+  // rebuilding/re-uploading -- one per worker thread for concurrent S3 querying.
+  void open_uploaded(const std::string& key, const snii::io::S3Config& cfg);
 
   // term_query for `term`: ascending docids + per-query I/O metrics. Throws on error.
   void term_query(const std::string& term, std::vector<uint32_t>* docids,
@@ -50,9 +67,25 @@ class SniiOssAdapter {
   void phrase_query(const std::vector<std::string>& words,
                     std::vector<uint32_t>* docids, snii::io::IoMetrics* metrics);
 
+  // Boolean / match-all / prefix / match_phrase_prefix -- same surface as the local
+  // SniiAdapter, over the OSS reader. Each fills docids + per-query I/O metrics.
+  void boolean_and(const std::vector<std::string>& terms,
+                   std::vector<uint32_t>* docids, snii::io::IoMetrics* metrics);
+  void boolean_or(const std::vector<std::string>& terms,
+                  std::vector<uint32_t>* docids, snii::io::IoMetrics* metrics);
+  void match_all(std::vector<uint32_t>* docids, snii::io::IoMetrics* metrics);
+  void prefix_query(const std::string& prefix, std::vector<uint32_t>* docids,
+                    snii::io::IoMetrics* metrics);
+  std::vector<std::string> enumerate_prefix(const std::string& prefix);
+  void phrase_prefix_query(const std::vector<std::string>& fixed,
+                           const std::vector<std::string>& expansions,
+                           std::vector<uint32_t>* docids, snii::io::IoMetrics* metrics);
+
  private:
+  bool docs_only_ = false;
   std::string local_path_;   // temp local .idx (removed in dtor)
   std::string uploaded_key_;  // full OSS key (prefix + "/" + key)
+  std::string object_key_;    // raw key for S3FileReader::open / open_uploaded
   std::unique_ptr<snii::io::S3FileReader> s3_;
   std::unique_ptr<snii::io::MeteredFileReader> metered_;
   std::unique_ptr<snii::reader::SniiSegmentReader> segment_;

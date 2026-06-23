@@ -12,7 +12,7 @@
 #include "snii/format/per_index_meta.h"
 #include "snii/format/sampled_term_index.h"
 #include "snii/format/stats_block.h"
-#include "snii/format/xfilter.h"
+#include "snii/format/bsbf.h"
 #include "snii/io/file_reader.h"
 
 // LogicalIndexReader -- read-side counterpart of LogicalIndexWriter for one
@@ -50,6 +50,22 @@ class LogicalIndexReader {
   Status lookup(std::string_view term, bool* found, snii::format::DictEntry* entry,
                 uint64_t* frq_base, uint64_t* prx_base) const;
 
+  // One enumerated term whose key has the requested prefix, with its DictEntry and
+  // the owning DICT block's frq/prx bases (for posting resolution).
+  struct PrefixHit {
+    std::string term;
+    snii::format::DictEntry entry;
+    uint64_t frq_base = 0;
+    uint64_t prx_base = 0;
+  };
+
+  // Ordered term enumeration: every term with `prefix`, in lexicographic order,
+  // by seeking the start DICT block via the SampledTermIndex and scanning forward
+  // across contiguous blocks until the terms pass the prefix range. Empty prefix
+  // enumerates all terms. This is the contiguous-DICT-block design the term-anchor
+  // layout was built for (MATCH_PHRASE_PREFIX / prefix / range queries).
+  Status prefix_terms(std::string_view prefix, std::vector<PrefixHit>* out) const;
+
   // Resolves a pod_ref entry's absolute .frq / .prx window byte range, validating
   // the locator against the section length (defends against corrupt entries:
   // prelude_len > frq_len underflow, or off_delta+len past the POD). *abs_off is
@@ -74,7 +90,13 @@ class LogicalIndexReader {
   snii::format::PerIndexMetaReader meta_;
   snii::format::SampledTermIndexReader sti_;
   snii::format::DictBlockDirectoryReader dbd_;
-  snii::format::XFilterReader xfilter_;
+  snii::format::BsbfHeader bsbf_header_;  // resident header (from section ref)
+  bool has_bsbf_ = false;
+  // L0 tiering: when the bsbf section is small (<= kBsbfResidentMaxBytes) its whole
+  // bitset is loaded here at open -> in-memory probe, no per-lookup round. Empty =>
+  // L1 (on-demand single-block probe via bsbf_probe).
+  bool bsbf_resident_ = false;
+  std::vector<uint8_t> bsbf_resident_bitset_;
 };
 
 }  // namespace snii::reader

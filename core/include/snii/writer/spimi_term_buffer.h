@@ -39,6 +39,15 @@ struct TermPostings {
   // sum(freqs)); it lets the writer validate without a flat buffer. When pos_pump
   // is null, positions come from positions_flat as before. Only the writer's prx
   // builders consume this; all other consumers use positions_flat.
+  //
+  // OWNERSHIP CONTRACT (synchronous-consume-once): a streamed pos_pump captures
+  // references into the producer's stack and its parked run readers/arena, valid ONLY
+  // for the duration of the synchronous fn(TermPostings&&) call that delivered this
+  // TermPostings. The consumer MUST pull all positions inside fn() and MUST NOT store
+  // the TermPostings or invoke pos_pump after fn() returns. Callers that retain the
+  // TermPostings pass allow_stream_positions=false, which materializes positions into
+  // positions_flat instead (no pump). As a safety net, a deferred call to a streamed
+  // pump throws std::logic_error rather than dereferencing freed state.
   std::function<void(uint32_t*, size_t)> pos_pump;
   uint64_t pos_total = 0;
 

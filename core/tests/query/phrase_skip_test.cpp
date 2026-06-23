@@ -16,6 +16,7 @@
 #include "snii/io/local_file.h"
 #include "snii/io/metered_file_reader.h"
 #include "snii/query/phrase_query.h"
+#include "snii/query/term_query.h"
 #include "snii/reader/logical_index_reader.h"
 #include "snii/reader/snii_segment_reader.h"
 #include "snii/reader/windowed_posting.h"
@@ -258,6 +259,109 @@ void HighDfStats(const LogicalIndexReader& idx, const std::string& term,
 }
 
 }  // namespace
+
+// boolean_and (MATCH all-terms) must equal the intersection of the per-term docid
+// sets (term_query is the trusted oracle). Covers high+low df mix, all-present,
+// an absent term (-> empty), and single-term (-> that term's docs).
+TEST(BooleanAnd, EqualsTermIntersection) {
+  Corpus c = BuildCorpus();
+  const std::string path = TempPath();
+  WriteCorpus(c, path);
+  io::LocalFileReader local;
+  ASSERT_TRUE(local.open(path).ok());
+  io::MeteredFileReader metered(&local, /*block_size=*/4096);
+  SniiSegmentReader seg;
+  ASSERT_TRUE(SniiSegmentReader::open(&metered, &seg).ok());
+  LogicalIndexReader idx;
+  ASSERT_TRUE(seg.open_index(1, "body", &idx).ok());
+
+  auto intersect_terms = [&](const std::vector<std::string>& terms) {
+    std::vector<uint32_t> acc;
+    bool first = true;
+    for (const auto& t : terms) {
+      std::vector<uint32_t> d;
+      EXPECT_TRUE(query::term_query(idx, t, &d).ok());
+      if (first) {
+        acc = d;
+        first = false;
+      } else {
+        std::vector<uint32_t> out;
+        std::set_intersection(acc.begin(), acc.end(), d.begin(), d.end(),
+                              std::back_inserter(out));
+        acc = std::move(out);
+      }
+    }
+    return acc;
+  };
+
+  const std::vector<std::vector<std::string>> cases = {
+      {"aa_hi", "aa_quick"},            // high + low df
+      {"aa_quick", "aa_brown", "aa_fox"},
+      {"aa_hi", "nope_absent"},         // absent term -> empty
+      {"aa_hi"},                        // single term -> its docs
+  };
+  for (const auto& terms : cases) {
+    std::string label;
+    for (const auto& t : terms) label += t + " ";
+    std::vector<uint32_t> got;
+    ASSERT_TRUE(query::boolean_and(idx, terms, &got).ok()) << label;
+    EXPECT_TRUE(std::is_sorted(got.begin(), got.end())) << label;
+    EXPECT_EQ(got, intersect_terms(terms)) << "boolean_and != term-intersection: [" << label << "]";
+  }
+  std::remove(path.c_str());
+}
+
+// prefix_terms ordered enumeration: the full enumeration (empty prefix) must be
+// strictly sorted; any prefix scan must equal the full enumeration filtered by that
+// prefix; and every enumerated term must lookup() to the SAME DictEntry (df).
+TEST(PrefixTerms, OrderedEnumerationMatchesFilterAndLookup) {
+  Corpus c = BuildCorpus();
+  const std::string path = TempPath();
+  WriteCorpus(c, path);
+  io::LocalFileReader local;
+  ASSERT_TRUE(local.open(path).ok());
+  io::MeteredFileReader metered(&local, /*block_size=*/4096);
+  SniiSegmentReader seg;
+  ASSERT_TRUE(SniiSegmentReader::open(&metered, &seg).ok());
+  LogicalIndexReader idx;
+  ASSERT_TRUE(seg.open_index(1, "body", &idx).ok());
+
+  std::vector<LogicalIndexReader::PrefixHit> all;
+  ASSERT_TRUE(idx.prefix_terms("", &all).ok());
+  ASSERT_FALSE(all.empty());
+  for (size_t i = 1; i < all.size(); ++i)
+    EXPECT_LT(all[i - 1].term, all[i].term) << "at " << i;
+  for (const auto& h : all) {
+    bool found = false;
+    snii::format::DictEntry e;
+    uint64_t fb = 0, pb = 0;
+    ASSERT_TRUE(idx.lookup(h.term, &found, &e, &fb, &pb).ok());
+    EXPECT_TRUE(found) << h.term;
+    EXPECT_EQ(e.df, h.entry.df) << h.term;
+  }
+  auto filtered = [&](const std::string& pfx) {
+    std::vector<std::string> v;
+    for (const auto& h : all)
+      if (h.term.size() >= pfx.size() && h.term.compare(0, pfx.size(), pfx) == 0)
+        v.push_back(h.term);
+    return v;
+  };
+  auto scanned = [&](const std::string& pfx) {
+    std::vector<LogicalIndexReader::PrefixHit> hits;
+    EXPECT_TRUE(idx.prefix_terms(pfx, &hits).ok());
+    std::vector<std::string> v;
+    for (const auto& h : hits) v.push_back(h.term);
+    return v;
+  };
+  for (const std::string& pfx : {"aa_", "aa_h", "zz_", "zz_0", "alpha"})
+    EXPECT_EQ(scanned(pfx), filtered(pfx)) << "prefix=" << pfx;
+  std::vector<LogicalIndexReader::PrefixHit> none;
+  ASSERT_TRUE(idx.prefix_terms("zzzznope", &none).ok());
+  EXPECT_TRUE(none.empty());
+  // Null output is rejected, not dereferenced.
+  EXPECT_FALSE(idx.prefix_terms("", nullptr).ok());
+  std::remove(path.c_str());
+}
 
 TEST(PhraseSkip, SkippingEqualsOracleAndFullRead) {
   Corpus c = BuildCorpus();
