@@ -66,7 +66,7 @@ class SpillableByteBuffer {
       ram_bytes_ += bytes.size();
       if (reporter_) reporter_->report(static_cast<int64_t>(bytes.size()));
     }
-    if (ram_bytes_ >= cap_bytes_) return spill_to_disk();
+    if (over_cap()) return spill_to_disk();
     return Status::OK();
   }
 
@@ -83,7 +83,7 @@ class SpillableByteBuffer {
       if (reporter_) reporter_->report(static_cast<int64_t>(v.size()));
       chunks_.push_back(std::move(v));
     }
-    if (ram_bytes_ >= cap_bytes_) return spill_to_disk();
+    if (over_cap()) return spill_to_disk();
     return Status::OK();
   }
 
@@ -120,6 +120,12 @@ class SpillableByteBuffer {
   bool spilled() const { return spilled_; }
 
  private:
+  // Gate-2 spill condition (UNIFIED): spill when the writer's TOTAL build RAM crosses
+  // the one shared cap (reporter_->over_cap()), with the local cap_bytes_ kept only as
+  // a defensive per-buffer hard ceiling (e.g. when no reporter is attached).
+  bool over_cap() const {
+    return (reporter_ != nullptr && reporter_->over_cap()) || ram_bytes_ >= cap_bytes_;
+  }
   Status spill_to_disk() {
     temp_path_ = resolve_temp_dir() + "/snii_" + tag_ + "_" +
                  std::to_string(::getpid()) + "_" +

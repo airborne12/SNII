@@ -17,8 +17,13 @@ namespace snii::writer {
 class MemoryReporter {
  public:
   using ConsumeReleaseFn = std::function<void(int64_t delta)>;  // null off-Doris
-  explicit MemoryReporter(ConsumeReleaseFn consume_release = nullptr)
-      : consume_release_(std::move(consume_release)) {}
+  // cap_bytes is the UNIFIED gate-2 buffer cap for the WHOLE writer (e.g. Doris's
+  // 512 MiB inverted-index buffer config); 0 = unlimited. Every build buffer of this
+  // writer (SPIMI arena + dict) self-spills when over_cap() is true -- one threshold on
+  // the unified total, not a separate per-buffer threshold.
+  explicit MemoryReporter(ConsumeReleaseFn consume_release = nullptr,
+                          uint64_t cap_bytes = 0)
+      : consume_release_(std::move(consume_release)), cap_bytes_(cap_bytes) {}
 
   MemoryReporter(const MemoryReporter&) = delete;
   MemoryReporter& operator=(const MemoryReporter&) = delete;
@@ -31,9 +36,17 @@ class MemoryReporter {
 
   int64_t current_bytes() const { return current_.load(std::memory_order_relaxed); }
 
+  // True once the writer's UNIFIED total build RAM (arena + slot index + dict + ...)
+  // reaches the cap. The single gate-2 trigger shared by every buffer of the writer.
+  bool over_cap() const {
+    return cap_bytes_ != 0 && current_bytes() >= static_cast<int64_t>(cap_bytes_);
+  }
+  uint64_t cap_bytes() const { return cap_bytes_; }
+
  private:
   std::atomic<int64_t> current_{0};
   ConsumeReleaseFn consume_release_;
+  uint64_t cap_bytes_ = 0;
 };
 
 }  // namespace snii::writer

@@ -176,18 +176,24 @@ void SpimiTermBuffer::accumulate(uint32_t term_id, uint32_t docid, uint32_t pos)
   // >4 GiB in-memory segment wraps alloc_run and silently corrupts data. A forced
   // spill + final k-way merge stays byte-identical regardless of when it fires.
   constexpr uint64_t kArenaSpillCap = 0xE0000000ull;  // 3.5 GiB, < UINT32_MAX margin
-  const uint64_t resident = resident_bytes();
-  const bool threshold_hit =
-      spill_threshold_bytes_ != 0 && resident >= spill_threshold_bytes_;
+  // Report this token's REAL resident growth FIRST so the writer's unified total
+  // (reporter_->current_bytes()) reflects it before the gate-2 check. Single-source
+  // diff: cheap (subtraction + relaxed atomic add; arena_bytes() is two field reads).
+  report_arena_delta();
+  // Gate-2 spill (UNIFIED): when a reporter is attached, trigger on the writer's TOTAL
+  // build RAM (arena + slot index + dict) crossing the one configured cap -- the same
+  // total and cap every buffer of this writer shares, not a per-buffer threshold. Off
+  // Doris (no reporter) fall back to the local spill_threshold_bytes_. The hard arena
+  // safety stop (4 GiB uint32-offset limit) is always active. spill_to_run() resets the
+  // arena and reports its negative internally, so the unified total drops after a spill.
+  const bool over_cap =
+      mem_reporter_ != nullptr
+          ? mem_reporter_->over_cap()
+          : (spill_threshold_bytes_ != 0 && resident_bytes() >= spill_threshold_bytes_);
   const bool arena_near_limit = pool_.arena_bytes() >= kArenaSpillCap;
-  if ((threshold_hit || arena_near_limit) && spill_status_.ok()) {
+  if ((over_cap || arena_near_limit) && spill_status_.ok()) {
     spill_status_ = spill_to_run();
   }
-  // Report this token's REAL resident growth (arena blocks emplaced via the
-  // chain appends, plus any slot_of_/slots_ growth) -- or, if a spill just fired
-  // above, its reset is captured in the SAME diff call. Single-source diff: cheap
-  // (a subtraction + relaxed atomic add; arena_bytes() is two field reads).
-  report_arena_delta();
 }
 
 void SpimiTermBuffer::add_token(uint32_t term_id, uint32_t docid, uint32_t pos) {

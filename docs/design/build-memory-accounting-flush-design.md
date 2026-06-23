@@ -152,19 +152,27 @@ MemTableMemoryLimiter（软/硬限，memtable_memory_limiter.cpp:124）挑某 me
 - **SNII 侧**：实现/对接 `InvertedIndexColumnWriter` 背后的 `add_values→SpimiTermBuffer 喂入` 与
   `finish→finalize` 即可；finalize 内核已存在。
 
-### 3.2 门控 2：倒排 buffer 上限（512M）→ 内部分段 spill（已实现 P2）
+### 3.2 门控 2：倒排 **统一总量** 上限（512M）→ 内部分段 spill（已实现 P2，统一触发）
 
-- **保留**现有内部阈值自触发（`spimi_term_buffer.cpp`），这就是门控 2。已落地的两处改动：
-  1. **阈值即配置接缝**：复用现有的 `SpimiTermBuffer` 构造参数 `spill_threshold_bytes`（0=无限默认，
-     保持现状）——buffer 由调用方构造，合并侧把 Doris 配置（如 512 MiB）传进来即可，**无需新增
-     `SniiIndexInput` 字段**。
-  2. **判定改用真实字节**：触发条件改为 `resident_bytes()`（= `arena_bytes() + slot_of_.capacity()*4`）
-     `>= 阈值`，**不再用 `live_bytes_` 估计**；`live_bytes_` / `account_token` / 其系数常量已**删除**，
-     spill 前的空间预检也改用 `resident_bytes()`。
-- spill 一个小段到临时目录（`spill_to_run`，可重入），reset arena + 报负 delta（释放被 Doris 看见），
-  继续累积。**自触发、在累积线程内**——沿用现有安全模型，无跨线程。
+**核心：一个 cap 管整个 writer 的总内存，不是每个 buffer 各设一个阈值。** 这正是「统一计算 +
+按统一标准下刷」的下半场——P1 用 `MemoryReporter` 把 arena+slot+dict 统一成 `current_bytes()`，
+门控 2 就在**这个统一总量**上设一个 cap：
+
+- **统一判定 `over_cap()`**：`MemoryReporter` 持一个 `cap_bytes`（= Doris 配置，如 512 MiB；0=无限）。
+  `over_cap() == current_bytes() >= cap_bytes`。**writer 内每个 buffer 共用同一个 reporter、同一个 cap**：
+  - SPIMI（`add_token` 累积期）：先 `report` 本 token 增量，再查 `mem_reporter_->over_cap()` → 触发
+    `spill_to_run`；无 reporter 时回退本地 `spill_threshold_bytes`（standalone/legacy）。
+  - dict（`SpillableByteBuffer::append`）：查 `reporter_->over_cap()` → 触发 `spill_to_disk`；本地
+    `cap_bytes_` 仅作无 reporter 时的兜底硬顶。
+  - 因两大消费者**峰值错时**（feed 期是 arena、build 期是 dict），统一 cap 下「谁在涨谁自旋」，
+    把 writer 的**瞬时总量**压在 cap 附近——单一旋钮即可（实测 cap=4MiB 同时压住 arena+dict，
+    RSS 75.7 MiB，对照不设上限 121 MiB）。
+- **判定用真实字节**：`current_bytes()` 由各模块报真实驻留（`arena_bytes()+slot`、dict `ram_bytes_`），
+  **不用 `live_bytes_` 估计**（`live_bytes_`/`account_token` 已删除）。
+- spill 一个小段到临时目录（`spill_to_run` / `spill_to_disk`，可重入），reset + 报负 delta（释放
+  被 Doris 看见），继续累积。**自触发、在累积线程内**——无跨线程。
 - segment flush（门控 1 的 finalize）时 `MergeRuns` 把所有小段 + 残留合并成最终 `.idx`，**byte-identical**。
-- 4 GiB arena 兜底（`kArenaSpillCap`，`:158`）保留为格式正确性下限，与上面正交。
+- 4 GiB arena 兜底（`kArenaSpillCap`）保留为格式正确性下限，与统一 cap 正交。
 
 > 「小段」的字节格式：现状是私有 raw-u32 run（`spill_run_codec.h`，build-内部、最终 merge 成 `.idx`），
 > 满足「内部分段 + k-way merge」。是否升级为 native idx 段是后续优化，与两门控逻辑无关。

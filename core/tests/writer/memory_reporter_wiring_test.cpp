@@ -79,6 +79,20 @@ TEST(MemoryReporterWiring, DictDtorReleasesUnspilledRam) {
   EXPECT_EQ(reporter.current_bytes(), 0);
 }
 
+// UNIFIED gate-2: a small cap on the shared reporter triggers the dict spill BEFORE
+// its (huge) local cap_bytes_ is reached -- proving the spill is driven by the writer's
+// total RAM (reporter->over_cap()), not a per-buffer threshold.
+TEST(MemoryReporterWiring, UnifiedCapDrivesDictSpill) {
+  MemoryReporter reporter(/*consume_release=*/nullptr, /*cap_bytes=*/8000);
+  SpillableByteBuffer buf(/*local cap=*/UINT64_MAX, "dict", &reporter);
+  ASSERT_TRUE(buf.append(Slice(Block(5000, 1))).ok());
+  EXPECT_FALSE(buf.spilled());                       // 5000 < unified cap 8000
+  ASSERT_TRUE(buf.append(Slice(Block(4000, 2))).ok());  // 9000 >= 8000 -> spill
+  EXPECT_TRUE(buf.spilled());                         // unified cap fired, not local
+  EXPECT_EQ(reporter.current_bytes(), 0);             // resident handed to disk
+  ASSERT_TRUE(buf.seal().ok());
+}
+
 // A spill drops the resident tier: the reporter returns to 0 (one negative ==
 // prior ram_bytes_) while buf.size() still counts the on-disk bytes.
 TEST(MemoryReporterWiring, DictSpillFreesRam) {
