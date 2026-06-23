@@ -67,6 +67,31 @@ TEST(SpillableByteBuffer, MaxCapNeverSpills) {
   RoundTrip(/*cap=*/UINT64_MAX, /*block=*/65536, /*blocks=*/8, /*expect_spill=*/false);
 }
 
+// append_move adopts the caller's vector; verify identical bytes for RAM + spill.
+void RoundTripMove(uint64_t cap, size_t block, int blocks, bool expect_spill) {
+  SpillableByteBuffer buf(cap, "test");
+  std::vector<uint8_t> expect;
+  for (int b = 0; b < blocks; ++b) {
+    auto chunk = Pattern(block, static_cast<uint8_t>(b + 7));
+    expect.insert(expect.end(), chunk.begin(), chunk.end());
+    ASSERT_TRUE(buf.append_move(std::move(chunk)).ok());
+  }
+  EXPECT_EQ(buf.size(), expect.size());
+  EXPECT_EQ(buf.spilled(), expect_spill);
+  ASSERT_TRUE(buf.seal().ok());
+  CollectWriter out;
+  ASSERT_TRUE(buf.stream_into(&out).ok());
+  EXPECT_EQ(out.bytes(), expect);
+}
+
+TEST(SpillableByteBuffer, MoveAppendStaysInRam) {
+  RoundTripMove(/*cap=*/1u << 20, /*block=*/4096, /*blocks=*/4, /*expect_spill=*/false);
+}
+
+TEST(SpillableByteBuffer, MoveAppendSpillsAndRoundTrips) {
+  RoundTripMove(/*cap=*/8192, /*block=*/4096, /*blocks=*/8, /*expect_spill=*/true);
+}
+
 TEST(SpillableByteBuffer, EmptyBufferStreamsNothing) {
   SpillableByteBuffer buf(1u << 20, "test");
   EXPECT_EQ(buf.size(), 0u);

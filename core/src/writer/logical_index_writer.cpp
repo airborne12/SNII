@@ -84,7 +84,7 @@ Status EncodeRegions(std::span<const uint32_t> docids,
   ByteSink dd_sink;
   SNII_RETURN_IF_ERROR(
       snii::format::build_dd_region(docids, win_base, kRawFrqRegion, &dd_sink, dd_meta));
-  *dd_out = dd_sink.buffer();
+  *dd_out = dd_sink.take();
   if (!has_freq) {
     *freq_out = std::vector<uint8_t>();
     *freq_meta = FrqRegionMeta{};
@@ -93,7 +93,7 @@ Status EncodeRegions(std::span<const uint32_t> docids,
   ByteSink freq_sink;
   SNII_RETURN_IF_ERROR(
       snii::format::build_freq_region(freqs, kRawFrqRegion, &freq_sink, freq_meta));
-  *freq_out = freq_sink.buffer();
+  *freq_out = freq_sink.take();
   return Status::OK();
 }
 
@@ -134,7 +134,7 @@ Status MakePrxWindow(std::span<const uint32_t> positions_flat,
   ByteSink sink;
   SNII_RETURN_IF_ERROR(
       snii::format::build_prx_window_flat(positions_flat, freqs, kAutoZstd, &sink));
-  *out = sink.buffer();
+  *out = sink.take();
   return Status::OK();
 }
 
@@ -185,7 +185,7 @@ Status BuildPrelude(const std::vector<WindowMeta>& windows, bool has_freq, bool 
   cols.windows = windows;
   ByteSink sink;
   SNII_RETURN_IF_ERROR(snii::format::build_frq_prelude(cols, &sink));
-  *out = sink.buffer();
+  *out = sink.take();
   return Status::OK();
 }
 
@@ -250,6 +250,15 @@ Status BuildWindowedPosting(TermPostings& tp, bool has_freq, bool has_prx,
   const size_t n = tp.docids.size();
   const std::span<const uint32_t> all_docs(tp.docids);
   const std::span<const uint32_t> all_freqs(tp.freqs);
+
+  // Size the per-term transient blocks up front so a very-high-df term (split into
+  // thousands of windows, dd/freq blocks of MiB) does not grow them by geometric
+  // doubling -- which would briefly hold the old+new buffer co-resident at the build
+  // peak. windows count is exact; dd/freq use a conservative byte/doc upper estimate
+  // (PFOR-packed deltas are typically <= 2 B/doc). Slack is freed when the term ends.
+  out->windows.reserve((n + unit - 1) / unit);
+  out->dd_block.reserve(n * 2);
+  if (has_freq) out->freq_block.reserve(n);
 
   WindowScratch sc;  // reused across all windows (no per-window allocation churn)
 
@@ -493,7 +502,7 @@ Status LogicalIndexWriter::flush_block(DictBlockBuilder* block,
   rec.rel_offset = dict_buf_.size();
   rec.n_entries = block->n_entries();
   rec.checksum = snii::crc32c(plain);  // crc over UNCOMPRESSED block bytes
-  rec.first_term = first_term;
+  rec.first_term = std::move(first_term);
 
   std::vector<uint8_t> comp;
   Status zs = snii::zstd_compress(plain, kDictBlockZstdLevel, &comp);
@@ -501,14 +510,13 @@ Status LogicalIndexWriter::flush_block(DictBlockBuilder* block,
     rec.flags = snii::format::block_ref_flags::kZstd;
     rec.uncomp_len = static_cast<uint64_t>(plain.size());
     rec.length = static_cast<uint64_t>(comp.size());
-    SNII_RETURN_IF_ERROR(dict_buf_.append(Slice(comp)));
+    SNII_RETURN_IF_ERROR(dict_buf_.append_move(std::move(comp)));
   } else {
     rec.flags = 0;
     rec.uncomp_len = 0;
     rec.length = static_cast<uint64_t>(plain.size());
-    SNII_RETURN_IF_ERROR(dict_buf_.append(bsink.view()));
+    SNII_RETURN_IF_ERROR(dict_buf_.append_move(bsink.take()));
   }
-  sample_first_terms_.push_back(std::move(first_term));
   blocks_.push_back(std::move(rec));
   return Status::OK();
 }
@@ -608,7 +616,7 @@ Status LogicalIndexWriter::build(snii::io::FileWriter* posting_out) {
     for (uint8_t n : encoded_norms_) nw.add(n);
     ByteSink nsink;
     nw.finish(&nsink);
-    norms_section_ = nsink.buffer();
+    norms_section_ = nsink.take();
   }
 
   // Build the absent-term filter (block-split bloom, Parquet-canonical) from the
@@ -622,7 +630,7 @@ Status LogicalIndexWriter::build(snii::io::FileWriter* posting_out) {
     for (uint64_t k : term_hashes_) bf.insert(k);
     ByteSink bsink;
     SNII_RETURN_IF_ERROR(bf.serialize(&bsink));
-    bsbf_bytes_ = bsink.buffer();
+    bsbf_bytes_ = bsink.take();
   }
   std::vector<uint64_t>().swap(term_hashes_);  // release
   return Status::OK();
@@ -634,7 +642,7 @@ Status LogicalIndexWriter::finish_meta(const SectionRefs& abs_refs,
   if (out == nullptr) return Status::InvalidArgument("logical_index: null meta sink");
 
   SampledTermIndexBuilder sti;
-  for (const auto& t : sample_first_terms_) sti.add_block_first_term(t);
+  for (const auto& b : blocks_) sti.add_block_first_term(b.first_term);
   ByteSink sti_sink;
   sti.finish(&sti_sink);
 

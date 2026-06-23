@@ -214,7 +214,6 @@ class LogicalIndexWriter {
   std::vector<uint8_t> norms_section_;
 
   std::vector<BlockRecord> blocks_;
-  std::vector<std::string> sample_first_terms_;
   // One 8-byte XXH64 (seed 0) filter key per term, collected during the build pass
   // so the whole-vocabulary string copy is never retained.
   std::vector<uint64_t> term_hashes_;
