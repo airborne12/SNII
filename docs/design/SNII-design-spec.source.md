@@ -174,10 +174,10 @@ SNII container: one Doris segment ({rowset_id}_{seg_id}.idx)
      连续 append 到输出流（prx 先、frq 后）；INLINE term 不写 posting region；
      !has_prx 时 prx span 为空、仅含 frq span。posting 是大块 append-only 流，直接落
      容器，不经临时文件中转（一次写，无「写临时 + 读回重写」）。
-   DICT region 在 RAM 中分级缓冲（SpillableByteBuffer）：每个 dict block 压缩后作为一个
-     右尺寸 chunk 追加进 chunk 链（无连续 vector 的倍增 realloc 瞬态与容量 slack），常驻
-     RAM；累计超过 SNII_DICT_RAM_MAX（默认 64MiB）才 spill 到临时盘，使典型 segment 全程
-     零 section temp、巨型词典峰值 RSS 受界。posting 写完后把 DICT region 紧接其后流入
+   DICT region 在 RAM 中缓冲（SpillableByteBuffer）：每个 dict block 压缩后作为一个右尺寸
+     chunk 追加进 chunk 链（无连续 vector 的倍增 realloc 瞬态与容量 slack），常驻 RAM；当
+     writer 的统一内存 cap（MemoryReporter，门控 2）被越过时才 spill 到临时盘——dict 与 SPIMI
+     arena 共用同一个 cap，无独立的 dict 旋钮。posting 写完后把 DICT region 紧接其后流入
      容器：posting 在前、DICT 在后。
    故唯一的磁盘 scratch 是步骤 4 的 SPIMI spill run；section 写出阶段不产生任何临时文件。
    frq_base / prx_base 在 block 打开时取同一 posting region 内偏移快照（两者相等）；

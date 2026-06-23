@@ -208,15 +208,13 @@ class LogicalIndexWriter {
   uint32_t target_dict_block_bytes_;
   // The DICT region (zstd-compressed blocks) is staged here as blocks flush. It must
   // land contiguously AFTER the posting region (which streams concurrently to the
-  // output), so it cannot stream directly. The buffer is TIERED (like the bsbf L0/L1):
-  // RAM while under the cap (small index = zero section temp files = spill-only build),
-  // spilling to a temp once it crosses the cap (huge dict = bounded peak RSS). The
-  // orchestrator streams it into the container right after the posting region. The cap
-  // is set from SNII_DICT_RAM_MAX at construction.
-  // The cap and the optional writer-level build-RAM reporter (null off-Doris) come from
-  // SniiIndexInput; the dict buffer self-reports its ram_bytes_ deltas. The SPIMI
-  // term_source self-reports its arena+slot deltas (the reporter is injected at the
-  // source's own construction by the caller, so this writer holds no reporter member).
+  // output), so it cannot stream directly; the orchestrator streams it into the
+  // container right after the posting region. It has NO independent local cap -- it
+  // spills to a temp via the writer's UNIFIED gate-2 cap (the MemoryReporter from
+  // SniiIndexInput, null off-Doris), the same single cap the SPIMI arena uses, so one
+  // threshold bounds the writer's total build RAM. The dict self-reports its ram_bytes_
+  // deltas; the SPIMI term_source self-reports its arena+slot deltas (its reporter is
+  // injected at the source's own construction by the caller).
   SpillableByteBuffer dict_buf_;
   // The interleaved [prx][frq] posting region streams STRAIGHT into the container
   // output during build() -- no temp. posting_out_ is the container writer (borrowed

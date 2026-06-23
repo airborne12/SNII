@@ -176,10 +176,11 @@ TEST(MemoryReporterWiring, SpimiStreamingDrainNetZero) {
 // spill's arena-reset negative AND merge_runs' slot_of_ free are both reported).
 TEST(MemoryReporterWiring, SpimiSpillPathNetZero) {
   std::vector<std::string> vocab = {"w0", "w1", "w2", "w3", "w4", "w5", "w6", "w7"};
-  MemoryReporter reporter;
-  // Tiny cap so the REAL resident size (arena + slot index) crosses early and forces
-  // spills, exercising the drain_to_writer / merge_runs free sites for the reporter.
-  SpimiTermBuffer buf(&vocab, /*has_positions=*/true, /*spill=*/256, &reporter);
+  // Tiny UNIFIED cap on the reporter so the REAL resident size (arena + slot index)
+  // crosses it early and forces spills, exercising the drain_to_writer / merge_runs
+  // free sites. (The local spill_threshold arg is unused once a reporter is attached.)
+  MemoryReporter reporter(/*consume_release=*/nullptr, /*cap_bytes=*/256);
+  SpimiTermBuffer buf(&vocab, /*has_positions=*/true, /*spill=*/0, &reporter);
   for (uint32_t doc = 0; doc < 500; ++doc)
     for (uint32_t t = 0; t < 8; ++t) buf.add_token(t, doc, doc & 7);
   size_t seen = 0;

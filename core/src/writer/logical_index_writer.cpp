@@ -54,22 +54,6 @@ constexpr uint32_t kPreludeGroupSize = 64;
 // trip it shrinks. Higher levels gain <1% here for materially more CPU.
 constexpr int kDictBlockZstdLevel = 3;
 
-// DICT-region RAM cap (bytes) before it spills to a temp. Tiered like the bsbf
-// L0/L1: a dict under the cap stays fully in RAM, so the whole index builds with zero
-// section temp files (spill-only); a larger dict spills so peak build RSS stays
-// bounded at ~the cap. 64 MiB default keeps typical segment dictionaries resident.
-// Overridable via SNII_DICT_RAM_MAX (bytes, 0/invalid = default). Read per build.
-constexpr uint64_t kDefaultDictRamMaxBytes = 64ull * 1024 * 1024;
-uint64_t dict_ram_cap_bytes() {
-  const char* s = std::getenv("SNII_DICT_RAM_MAX");
-  if (s != nullptr) {
-    char* end = nullptr;
-    const unsigned long long v = std::strtoull(s, &end, 10);
-    if (end != s && v > 0) return static_cast<uint64_t>(v);
-  }
-  return kDefaultDictRamMaxBytes;
-}
-
 using snii::format::FrqRegionMeta;
 
 // Encodes one window's dd region (and freq region when has_freq) into separate
@@ -348,7 +332,9 @@ LogicalIndexWriter::LogicalIndexWriter(const SniiIndexInput& in)
       target_dict_block_bytes_(in.target_dict_block_bytes != 0
                                    ? in.target_dict_block_bytes
                                    : snii::format::kDefaultTargetDictBlockBytes),
-      dict_buf_(dict_ram_cap_bytes(), "dict", in.mem_reporter) {}
+      // No independent dict cap: the dict spills via the writer's UNIFIED gate-2 cap
+      // (in.mem_reporter->over_cap()); UINT64_MAX disables the local per-buffer cap.
+      dict_buf_(UINT64_MAX, "dict", in.mem_reporter) {}
 
 Status LogicalIndexWriter::validate_term(const TermPostings& tp) const {
   if (tp.freqs.size() != tp.docids.size()) {
