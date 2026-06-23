@@ -1,6 +1,7 @@
 #include "snii/writer/logical_index_writer.h"
 
 #include <algorithm>
+#include <cstdlib>
 #include <memory>
 #include <span>
 #include <utility>
@@ -67,7 +68,7 @@ Status EncodeRegions(std::span<const uint32_t> docids,
   ByteSink dd_sink;
   SNII_RETURN_IF_ERROR(
       snii::format::build_dd_region(docids, win_base, kRawFrqRegion, &dd_sink, dd_meta));
-  *dd_out = dd_sink.buffer();
+  *dd_out = dd_sink.take();
   if (!has_freq) {
     *freq_out = std::vector<uint8_t>();
     *freq_meta = FrqRegionMeta{};
@@ -76,7 +77,7 @@ Status EncodeRegions(std::span<const uint32_t> docids,
   ByteSink freq_sink;
   SNII_RETURN_IF_ERROR(
       snii::format::build_freq_region(freqs, kRawFrqRegion, &freq_sink, freq_meta));
-  *freq_out = freq_sink.buffer();
+  *freq_out = freq_sink.take();
   return Status::OK();
 }
 
@@ -117,7 +118,7 @@ Status MakePrxWindow(std::span<const uint32_t> positions_flat,
   ByteSink sink;
   SNII_RETURN_IF_ERROR(
       snii::format::build_prx_window_flat(positions_flat, freqs, kAutoZstd, &sink));
-  *out = sink.buffer();
+  *out = sink.take();
   return Status::OK();
 }
 
@@ -168,7 +169,7 @@ Status BuildPrelude(const std::vector<WindowMeta>& windows, bool has_freq, bool 
   cols.windows = windows;
   ByteSink sink;
   SNII_RETURN_IF_ERROR(snii::format::build_frq_prelude(cols, &sink));
-  *out = sink.buffer();
+  *out = sink.take();
   return Status::OK();
 }
 
@@ -177,9 +178,9 @@ void AppendBytes(std::vector<uint8_t>* dst, const std::vector<uint8_t>& src) {
 }
 
 // One windowed term's grouped .frq layout (design 1.6): all dd regions form the
-// dd-block, all freq regions form the freq-block. The final .frq payload is
+// dd-block, all freq regions form the freq-block. The final frq span is
 // [prelude][dd-block][freq-block]. The .prx windows are STREAMED straight to the
-// .prx scratch file during pass 1 (not buffered here) -- so the widest term's
+// posting sink (the container output) during pass 1 (not buffered here) -- so the widest term's
 // ~tens-of-MiB prx bytes never co-exist with the dd/freq blocks at peak RSS;
 // only prx_total_len (the entry's prx byte span) is tracked. Per-window metadata
 // (region offsets/lens/modes/crcs, prx_off within the entry) is recorded for the prelude.
@@ -228,16 +229,25 @@ void LayoutWindowRegions(const FrqRegionMeta& dd_meta, const std::vector<uint8_t
 // byte-identical to the single-pass build (regions/prelude/prx are independent).
 Status BuildWindowedPosting(TermPostings& tp, bool has_freq, bool has_prx,
                             const std::vector<uint8_t>& norms,
-                            TempSectionFile* prx_file, WindowedPosting* out) {
+                            snii::io::FileWriter* posting_out, WindowedPosting* out) {
   const uint32_t unit = AdaptiveWindowDocs(static_cast<uint32_t>(tp.docids.size()));
   const size_t n = tp.docids.size();
   const std::span<const uint32_t> all_docs(tp.docids);
   const std::span<const uint32_t> all_freqs(tp.freqs);
 
+  // Size the per-term transient blocks up front so a very-high-df term (split into
+  // thousands of windows, dd/freq blocks of MiB) does not grow them by geometric
+  // doubling -- which would briefly hold the old+new buffer co-resident at the build
+  // peak. windows count is exact; dd/freq use a conservative byte/doc upper estimate
+  // (PFOR-packed deltas are typically <= 2 B/doc). Slack is freed when the term ends.
+  out->windows.reserve((n + unit - 1) / unit);
+  out->dd_block.reserve(n * 2);
+  if (has_freq) out->freq_block.reserve(n);
+
   WindowScratch sc;  // reused across all windows (no per-window allocation churn)
 
-  // ---- pass 1: prx (STREAMED to disk) + window skeleton ----
-  // Each window's .prx bytes are appended straight to the .prx scratch file as
+  // ---- pass 1: prx (STREAMED to the output) + window skeleton ----
+  // Each window's .prx bytes are appended straight to the posting sink (container output) as
   // they are built, so the entry's full prx payload (tens of MiB for the widest
   // term) is never buffered in RAM alongside the dd/freq blocks that pass 2
   // grows. m.prx_off is the byte offset WITHIN this entry's prx span (running
@@ -277,7 +287,7 @@ Status BuildWindowedPosting(TermPostings& tp, bool has_freq, bool has_prx,
             snii::format::build_prx_window_flat(pos_span, freqs, kAutoZstd, &sc.prx_sink));
         m.prx_off = out->prx_total_len;
         m.prx_len = static_cast<uint64_t>(sc.prx_sink.size());
-        SNII_RETURN_IF_ERROR(prx_file->append(sc.prx_sink.buffer()));
+        SNII_RETURN_IF_ERROR(posting_out->append(sc.prx_sink.view()));
         out->prx_total_len += m.prx_len;
       }
       pos_off += win_pos;
@@ -321,7 +331,10 @@ LogicalIndexWriter::LogicalIndexWriter(const SniiIndexInput& in)
       encoded_norms_(in.encoded_norms),
       target_dict_block_bytes_(in.target_dict_block_bytes != 0
                                    ? in.target_dict_block_bytes
-                                   : snii::format::kDefaultTargetDictBlockBytes) {}
+                                   : snii::format::kDefaultTargetDictBlockBytes),
+      // No independent dict cap: the dict spills via the writer's UNIFIED gate-2 cap
+      // (in.mem_reporter->over_cap()); UINT64_MAX disables the local per-buffer cap.
+      dict_buf_(UINT64_MAX, "dict", in.mem_reporter) {}
 
 Status LogicalIndexWriter::validate_term(const TermPostings& tp) const {
   if (tp.freqs.size() != tp.docids.size()) {
@@ -348,17 +361,19 @@ Status LogicalIndexWriter::validate_term(const TermPostings& tp) const {
 
 // Emits a windowed term: splits into base-unit windows, encodes each window's
 // dd/freq regions separately, groups them at posting level, builds a two-level
-// prelude, and lays out [prelude][dd-block][freq-block] in the .frq POD and
-// [win0 prx][win1 prx]... in the .prx POD. Sets enc=windowed + has_sb.
-// frq_docs_len = prelude_len + dd_block_len is the contiguous docs-only prefix.
+// prelude, and lays out [prx span][prelude][dd-block][freq-block] CONTIGUOUSLY in
+// the single posting region (prx span first, then the frq span). Sets
+// enc=windowed + has_sb. frq_docs_len = prelude_len + dd_block_len is the
+// contiguous docs-only prefix, which stays INSIDE the frq span.
 Status LogicalIndexWriter::build_windowed_entry(TermPostings& tp, uint64_t frq_base,
                                                 uint64_t prx_base, DictEntry* e) {
-  // Capture the entry's .prx start offset BEFORE the build: pass 1 streams each
-  // .prx window straight into prx_file_, so prx_off_delta is measured here.
-  const uint64_t prx_off = prx_file_.size();
+  // The prx span starts here: pass 1 streams each .prx window straight into
+  // the posting sink, so prx_off_delta is measured against the live posting-sink size.
+  const uint64_t prx_off = posting_size();
   WindowedPosting wp;
   SNII_RETURN_IF_ERROR(
-      BuildWindowedPosting(tp, has_freq_, has_prx_, encoded_norms_, &prx_file_, &wp));
+      BuildWindowedPosting(tp, has_freq_, has_prx_, encoded_norms_, posting_out_, &wp));
+  // wp.prx_total_len bytes were just streamed straight to the posting sink (0 when !has_prx).
   // docids/freqs are now fully encoded into wp; release the source arrays before
   // the (potentially large) wp blocks are appended to disk.
   std::vector<uint32_t>().swap(tp.docids);
@@ -373,15 +388,19 @@ Status LogicalIndexWriter::build_windowed_entry(TermPostings& tp, uint64_t frq_b
   e->frq_docs_len =
       e->prelude_len + static_cast<uint64_t>(wp.dd_block.size());  // [prelude][dd-block]
 
-  const uint64_t frq_off = frq_file_.size();
-  SNII_RETURN_IF_ERROR(frq_file_.append(prelude));
-  SNII_RETURN_IF_ERROR(frq_file_.append(wp.dd_block));
-  SNII_RETURN_IF_ERROR(frq_file_.append(wp.freq_block));
+  // The frq span starts immediately AFTER the prx span, in the SAME sink. The
+  // writer-side property frq_off == prx_off + wp.prx_total_len holds because
+  // nothing is appended to the posting sink between the prx pass and here -- but the
+  // delta is measured from the live size, not assumed.
+  const uint64_t frq_off = posting_size();
+  SNII_RETURN_IF_ERROR(posting_out_->append(Slice(prelude)));
+  SNII_RETURN_IF_ERROR(posting_out_->append(Slice(wp.dd_block)));
+  SNII_RETURN_IF_ERROR(posting_out_->append(Slice(wp.freq_block)));
   e->frq_off_delta = frq_off - frq_base;
-  e->frq_len = frq_file_.size() - frq_off;
+  e->frq_len = posting_size() - frq_off;
   if (has_prx_) {
     e->prx_off_delta = prx_off - prx_base;
-    e->prx_len = wp.prx_total_len;  // == prx_file_.size() - prx_off
+    e->prx_len = wp.prx_total_len;  // == frq_off - prx_off
   }
   return Status::OK();
 }
@@ -389,7 +408,10 @@ Status LogicalIndexWriter::build_windowed_entry(TermPostings& tp, uint64_t frq_b
 // Emits a slim term as a single .frq window (win_base=0) laid out [dd][freq]:
 // inline when the encoded bytes are tiny, otherwise a slim pod_ref (no prelude).
 // The dd region is the docs-only prefix; the freq region (when has_freq) is the
-// skippable suffix. Region codecs are recorded in the DictEntry.
+// skippable suffix. Region codecs are recorded in the DictEntry. For a pod_ref,
+// the term's [prx][frq] spans are appended to the single posting region with the
+// prx span FIRST (consistent with the windowed path); the reader resolves each
+// delta independently so the relative order is not load-bearing.
 Status LogicalIndexWriter::build_slim_entry(TermPostings& tp, uint64_t frq_base,
                                             uint64_t prx_base, DictEntry* e) {
   std::vector<uint8_t> dd_bytes, freq_bytes;
@@ -415,24 +437,26 @@ Status LogicalIndexWriter::build_slim_entry(TermPostings& tp, uint64_t frq_base,
     return Status::OK();
   }
 
+  // POD_REF: write [prx][frq] into the single posting sink, prx span first.
   e->kind = DictEntryKind::kPodRef;
   e->frq_docs_len = dd_meta.disk_len;  // docs-only prefix = the single dd region
-  const uint64_t frq_off = frq_file_.size();
-  SNII_RETURN_IF_ERROR(frq_file_.append(frq_win));
-  e->frq_off_delta = frq_off - frq_base;
-  e->frq_len = frq_file_.size() - frq_off;
   if (has_prx_) {
-    const uint64_t prx_off = prx_file_.size();
-    SNII_RETURN_IF_ERROR(prx_file_.append(prx_win));
+    const uint64_t prx_off = posting_size();
+    SNII_RETURN_IF_ERROR(posting_out_->append(Slice(prx_win)));
     e->prx_off_delta = prx_off - prx_base;
-    e->prx_len = prx_file_.size() - prx_off;
+    e->prx_len = posting_size() - prx_off;
   }
+  const uint64_t frq_off = posting_size();  // immediately after the prx span
+  SNII_RETURN_IF_ERROR(posting_out_->append(Slice(frq_win)));
+  e->frq_off_delta = frq_off - frq_base;
+  e->frq_len = posting_size() - frq_off;
   return Status::OK();
 }
 
 // Builds the DictEntry for one term. Inline entries embed their .frq/.prx bytes;
-// pod_ref entries append posting bytes to the PODs and record off_delta relative
-// to frq_base/prx_base (the POD sizes captured when the block opened).
+// pod_ref entries append [prx][frq] bytes to the single posting region and record
+// off_delta relative to frq_base/prx_base (the posting-region size captured when
+// the block opened; both bases hold that same value).
 Status LogicalIndexWriter::build_entry(TermPostings& tp, uint64_t frq_base,
                                        uint64_t prx_base, DictEntry* e) {
   e->term = tp.term;
@@ -461,10 +485,10 @@ Status LogicalIndexWriter::flush_block(DictBlockBuilder* block,
   block->finish(&bsink);
   const Slice plain = bsink.view();
   BlockRecord rec;
-  rec.rel_offset = dict_file_.size();
+  rec.rel_offset = dict_buf_.size();
   rec.n_entries = block->n_entries();
   rec.checksum = snii::crc32c(plain);  // crc over UNCOMPRESSED block bytes
-  rec.first_term = first_term;
+  rec.first_term = std::move(first_term);
 
   std::vector<uint8_t> comp;
   Status zs = snii::zstd_compress(plain, kDictBlockZstdLevel, &comp);
@@ -472,14 +496,13 @@ Status LogicalIndexWriter::flush_block(DictBlockBuilder* block,
     rec.flags = snii::format::block_ref_flags::kZstd;
     rec.uncomp_len = static_cast<uint64_t>(plain.size());
     rec.length = static_cast<uint64_t>(comp.size());
-    SNII_RETURN_IF_ERROR(dict_file_.append(comp));
+    SNII_RETURN_IF_ERROR(dict_buf_.append_move(std::move(comp)));
   } else {
     rec.flags = 0;
     rec.uncomp_len = 0;
     rec.length = static_cast<uint64_t>(plain.size());
-    SNII_RETURN_IF_ERROR(dict_file_.append(bsink.buffer()));
+    SNII_RETURN_IF_ERROR(dict_buf_.append_move(bsink.take()));
   }
-  sample_first_terms_.push_back(std::move(first_term));
   blocks_.push_back(std::move(rec));
   return Status::OK();
 }
@@ -501,8 +524,10 @@ Status LogicalIndexWriter::process_term(TermPostings& tp, BlockState* st) {
   stats_.sum_total_term_freq += SumOf(tp.freqs);
 
   if (!st->block) {
-    st->frq_base = frq_file_.size();
-    st->prx_base = prx_file_.size();
+    // Both bases come from the SAME posting sink, snapshotted at block open.
+    const uint64_t base = posting_size();
+    st->frq_base = base;
+    st->prx_base = base;
     st->block =
         std::make_unique<DictBlockBuilder>(tier_, has_prx_, st->frq_base, st->prx_base);
     st->block_first_term = tp.term;
@@ -547,23 +572,25 @@ Status LogicalIndexWriter::build_blocks() {
   return Status::OK();
 }
 
-Status LogicalIndexWriter::build() {
+Status LogicalIndexWriter::build(snii::io::FileWriter* posting_out) {
+  if (posting_out == nullptr) {
+    return Status::InvalidArgument("logical_index: null posting sink");
+  }
   if (has_norms_ && encoded_norms_.size() != doc_count_) {
     return Status::InvalidArgument("logical_index: norms length must equal doc_count");
   }
-  // Open the scratch files BEFORE any term is processed: the DICT region, .frq POD
-  // and .prx POD stream to disk instead of accumulating in RAM. .prx is opened
-  // only when positions exist (no empty file otherwise).
-  SNII_RETURN_IF_ERROR(dict_file_.open("dict"));
-  SNII_RETURN_IF_ERROR(frq_file_.open("frq"));
-  if (has_prx_) SNII_RETURN_IF_ERROR(prx_file_.open("prx"));
+  // The interleaved posting region streams STRAIGHT into the container output (no
+  // temp round-trip): posting_size() is the region-relative byte count, derived from
+  // the output offset advanced since this index's region began. The DICT region is
+  // staged in dict_buf_ (tiered: RAM under the cap = spill-only; spills above it) since
+  // it must land contiguously after the concurrently-streamed posting region.
+  posting_out_ = posting_out;
+  posting_off0_ = posting_out->bytes_written();
 
   SNII_RETURN_IF_ERROR(build_blocks());
-
-  // Seal the scratch files so the orchestrator can stream them into the container.
-  SNII_RETURN_IF_ERROR(dict_file_.seal());
-  SNII_RETURN_IF_ERROR(frq_file_.seal());
-  if (has_prx_) SNII_RETURN_IF_ERROR(prx_file_.seal());
+  // Seal the dict buffer so a spilled temp is flushed before stream_dict_region_into
+  // reads it back. A no-op for a RAM-resident dict.
+  SNII_RETURN_IF_ERROR(dict_buf_.seal());
 
   stats_.doc_count = doc_count_;
   stats_.indexed_doc_count = doc_count_;
@@ -575,7 +602,7 @@ Status LogicalIndexWriter::build() {
     for (uint8_t n : encoded_norms_) nw.add(n);
     ByteSink nsink;
     nw.finish(&nsink);
-    norms_section_ = nsink.buffer();
+    norms_section_ = nsink.take();
   }
 
   // Build the absent-term filter (block-split bloom, Parquet-canonical) from the
@@ -589,7 +616,7 @@ Status LogicalIndexWriter::build() {
     for (uint64_t k : term_hashes_) bf.insert(k);
     ByteSink bsink;
     SNII_RETURN_IF_ERROR(bf.serialize(&bsink));
-    bsbf_bytes_ = bsink.buffer();
+    bsbf_bytes_ = bsink.take();
   }
   std::vector<uint64_t>().swap(term_hashes_);  // release
   return Status::OK();
@@ -601,7 +628,7 @@ Status LogicalIndexWriter::finish_meta(const SectionRefs& abs_refs,
   if (out == nullptr) return Status::InvalidArgument("logical_index: null meta sink");
 
   SampledTermIndexBuilder sti;
-  for (const auto& t : sample_first_terms_) sti.add_block_first_term(t);
+  for (const auto& b : blocks_) sti.add_block_first_term(b.first_term);
   ByteSink sti_sink;
   sti.finish(&sti_sink);
 
@@ -619,7 +646,10 @@ Status LogicalIndexWriter::finish_meta(const SectionRefs& abs_refs,
   ByteSink dir_sink;
   dir.finish(&dir_sink);
 
-  const uint32_t flags = bsbf_bytes_.empty() ? 0u : PerIndexMetaBuilder::kHasBsbf;
+  uint32_t flags = bsbf_bytes_.empty() ? 0u : PerIndexMetaBuilder::kHasBsbf;
+  // Persist positions capability explicitly (the R1 fix): the reader must NOT infer
+  // it from posting_region.length, which is non-zero for any docs-only pod_ref index.
+  if (has_prx_) flags |= PerIndexMetaBuilder::kHasPositions;
   PerIndexMetaBuilder builder(index_id_, index_suffix_, flags);
   builder.set_stats(stats_);
   builder.set_sampled_term_index(sti_sink.view());

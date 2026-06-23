@@ -14,12 +14,13 @@
 #include "snii/format/sampled_term_index.h"
 #include "snii/format/stats_block.h"
 #include "snii/io/file_writer.h"
+#include "snii/writer/memory_reporter.h"
+#include "snii/writer/spillable_byte_buffer.h"
 #include "snii/writer/spimi_term_buffer.h"
-#include "snii/writer/temp_section_file.h"
 
-// LogicalIndexWriter -- builds the per-logical-index section bytes (DICT block
-// region, .frq POD, .prx POD) and the meta sub-sections (SampledTermIndex, DICT
-// block directory, StatsBlock, XFilter) for ONE logical index. It owns the
+// LogicalIndexWriter -- builds the per-logical-index section bytes (interleaved
+// posting region + DICT block region) and the meta sub-sections (SampledTermIndex,
+// DICT block directory, StatsBlock, XFilter) for ONE logical index. It owns the
 // in-memory section bytes and the metadata needed by the container orchestrator
 // (SniiCompoundWriter) to resolve absolute offsets and emit the per-index meta
 // block.
@@ -29,25 +30,35 @@
 // orchestrator stitches the absolute offsets in afterward (append-only, no
 // seek-back). See snii_compound_writer.h for the precise offset contract.
 //
+// POSTING REGION (single interleaved sink): the former separate .frq POD and .prx
+// POD are merged into ONE posting region. For each pod_ref term, in term order, the
+// writer appends its prx span FIRST then its frq span, contiguously:
+//   posting region = concat over pod_ref terms of [prx span][frq span].
+// The prx span is empty when !has_prx (docs-only / keyword tier). INLINE terms
+// append NOTHING to the posting region.
+//
 // Per-term encoding policy (v1):
-//   df >= kSlimDfThreshold (512): WINDOWED pod_ref. A frq_prelude (one window)
-//     plus one .frq window is appended to the .frq POD; one .prx window to the
-//     .prx POD (when tier>=T2). The DictEntry records frq/prx off_delta+len
-//     relative to frq_base/prx_base (see below).
+//   df >= kSlimDfThreshold (512): WINDOWED pod_ref. The term's [prx windows] are
+//     appended to the posting region first, then its [prelude][dd-block][freq-block]
+//     frq span. The DictEntry records frq/prx off_delta+len relative to
+//     frq_base/prx_base (see below).
 //   df < kSlimDfThreshold: SLIM. The postings are encoded as a single .frq
 //     window (and .prx window). If the encoded .frq bytes are small
 //     (<= kDefaultInlineThreshold), they are stored INLINE inside the DictEntry
-//     (kind=inline); otherwise they are appended to the .frq POD as a slim
-//     pod_ref (kind=pod_ref, enc=slim, no prelude).
+//     (kind=inline); otherwise the term's [prx][frq] spans are appended to the
+//     posting region as a slim pod_ref (kind=pod_ref, enc=slim, no prelude).
 //
 // frq_base / prx_base convention (DOCUMENTED CONTRACT):
-//   For each DICT block, frq_base = the running byte offset into THIS index's
-//   .frq POD at the moment the block's first POD-backed entry is appended (i.e.
-//   the POD size when the block opens). A windowed/slim pod_ref entry then sets
-//   frq_off_delta = (offset of its frq bytes within the .frq POD) - frq_base, so
-//   the reader computes the absolute file offset as
-//     section_refs.frq_pod.offset + frq_base + frq_off_delta.
-//   prx_base / prx_off_delta follow the identical rule against the .prx POD.
+//   For each DICT block, frq_base == prx_base == the running byte offset into THIS
+//   index's posting region at the moment the block opens (the posting-region size
+//   when the block's first POD-backed entry is appended). A windowed/slim pod_ref
+//   entry then sets frq_off_delta = (offset of its frq span within the posting
+//   region) - frq_base, so the reader computes the absolute file offset as
+//     section_refs.posting_region.offset + frq_base + frq_off_delta.
+//   prx_base / prx_off_delta follow the identical rule against the SAME region.
+//   Because [prx][frq] are written contiguously per term, a writer-side property
+//   holds when has_prx: frq_off_delta == prx_off_delta + prx_len. The reader does
+//   NOT rely on it -- each delta is resolved independently.
 //   Inline entries carry no off_delta (bytes live in the entry).
 namespace snii::writer {
 
@@ -75,6 +86,14 @@ struct SniiIndexInput {
   // this. 0 uses kDefaultTargetDictBlockBytes. Smaller values yield more blocks
   // (and a finer-grained sampled-term index).
   uint32_t target_dict_block_bytes = 0;
+  // Optional writer-level build-RAM reporter (one per SniiCompoundWriter = one
+  // segment inverted index). When non-null, the dict buffer reports its REAL
+  // resident-byte deltas (positive on grow, negative on spill). The SPIMI side
+  // (arena + slot index) reports through the SAME reporter, injected directly at
+  // the term_source's construction by the caller. null in bench / unit tests -> no
+  // reporting. NEVER report live_bytes_ (a gated estimate); report
+  // arena_bytes()+slot_of_+dict ram_bytes_.
+  MemoryReporter* mem_reporter = nullptr;
 };
 
 // Builds and holds the section bytes + meta sub-sections for one logical index.
@@ -82,36 +101,33 @@ class LogicalIndexWriter {
  public:
   explicit LogicalIndexWriter(const SniiIndexInput& in);
 
-  // Builds DICT blocks, .frq/.prx PODs, sampled-term index, dict directory,
-  // stats and xfilter. Must be called once before the accessors below.
-  // Returns InvalidArgument on inconsistent input (e.g. norms/doc_count
+  // Builds DICT blocks, the interleaved posting region, sampled-term index, dict
+  // directory, stats and bsbf. The posting region is written STRAIGHT into
+  // `posting_out` as terms are produced (no temp round-trip for the bulk); the
+  // orchestrator captures its absolute offset/length from posting_out->bytes_written()
+  // around this call. Must be called once before the accessors below. Returns
+  // InvalidArgument on a null sink or inconsistent input (e.g. norms/doc_count
   // mismatch when scoring is enabled, or non-ascending docids).
-  Status build();
+  Status build(snii::io::FileWriter* posting_out);
 
-  // Section byte lengths (relative; orchestrator decides their absolute offsets).
-  // The DICT region, .frq POD and .prx POD are streamed to scratch temp files
-  // during build() rather than buffered in RAM, so only their lengths are exposed
-  // here; their bytes are emitted via stream_*_into below. norms stays in RAM
-  // (1 byte/doc, small) and is returned directly.
-  uint64_t dict_region_size() const { return dict_file_.size(); }
-  uint64_t frq_pod_size() const { return frq_file_.size(); }
-  uint64_t prx_pod_size() const { return prx_file_.size(); }
+  // DICT region byte length (relative; orchestrator decides its absolute offset). The
+  // DICT region (zstd-compressed blocks) is built into a tiered buffer during build()
+  // -- it must land contiguously AFTER the posting region (streamed concurrently), so
+  // it cannot stream directly. The buffer stays in RAM while small (spill-only build)
+  // and spills to a temp once it crosses the RAM cap (bounded peak RSS for a huge
+  // dict). Its bytes are emitted via stream_dict_region_into below. The posting region
+  // went straight to the output during build(), so it has no length accessor here --
+  // the orchestrator measures it directly. norms stays in RAM (1 byte/doc).
+  uint64_t dict_region_size() const { return dict_buf_.size(); }
   const std::vector<uint8_t>& norms_bytes() const { return norms_section_; }
   // Block-split bloom XFilter blob ([28B header][bitset]); empty when no terms.
   const std::vector<uint8_t>& bsbf_bytes() const { return bsbf_bytes_; }
   bool has_bsbf() const { return !bsbf_bytes_.empty(); }
 
-  // Streams each section's bytes into the append-only container writer using a
-  // fixed copy buffer (no whole-section reload). Append order/content is
-  // unchanged, so the produced container is byte-identical to the in-RAM path.
+  // Streams the DICT region (RAM or spilled temp) into the append-only container
+  // after its posting region.
   Status stream_dict_region_into(snii::io::FileWriter* out) const {
-    return dict_file_.stream_into(out);
-  }
-  Status stream_frq_pod_into(snii::io::FileWriter* out) const {
-    return frq_file_.stream_into(out);
-  }
-  Status stream_prx_pod_into(snii::io::FileWriter* out) const {
-    return prx_file_.stream_into(out);
+    return dict_buf_.stream_into(out);
   }
 
   bool has_prx() const { return has_prx_; }
@@ -127,11 +143,11 @@ class LogicalIndexWriter {
                      uint64_t dict_region_offset, ByteSink* out) const;
 
  private:
-  // One DICT block's directory record. The block's serialized bytes are streamed
-  // to the dict scratch file as soon as the block is cut (not retained); only this
-  // compact summary (offset within the dict region + length + entry count +
-  // checksum) is kept to build the DICT block directory at finish_meta time. The
-  // absolute file offset is computed as dict_region_offset + rel_offset.
+  // One DICT block's directory record. The block's serialized bytes are appended to
+  // the in-RAM dict buffer as soon as the block is cut; only this compact summary
+  // (offset within the dict region + length + entry count + checksum) is kept to
+  // build the DICT block directory at finish_meta time. The absolute file offset is
+  // computed as dict_region_offset + rel_offset.
   struct BlockRecord {
     uint64_t rel_offset = 0;  // byte offset of this block within the dict region
     uint64_t length = 0;      // ON-DISK block length (compressed when flags&kZstd)
@@ -155,11 +171,18 @@ class LogicalIndexWriter {
   // arrays (docids/freqs/positions_flat) as soon as they are consumed, so the
   // widest term's source does not co-exist with its encoded output at peak RSS.
   Status process_term(TermPostings& tp, BlockState* st);
-  // Builds one DictEntry (inline or pod_ref), growing the PODs as needed.
+  // Region-relative byte count of the posting bytes written so far (the offset basis
+  // for frq_base/prx_base + frq_off_delta/prx_off_delta). During build() the only
+  // writes to posting_out_ are this index's posting region, so the count is the
+  // output offset advanced since the region began.
+  uint64_t posting_size() const {
+    return posting_out_->bytes_written() - posting_off0_;
+  }
+  // Builds one DictEntry (inline or pod_ref), growing the posting region as needed.
   Status build_entry(TermPostings& tp, uint64_t frq_base, uint64_t prx_base,
                      snii::format::DictEntry* e);
   // Builds a windowed (df >= kSlimDfThreshold) entry: multi-window + two-level
-  // prelude appended to the .frq/.prx PODs.
+  // prelude. The term's [prx span][frq span] is appended to the posting region.
   Status build_windowed_entry(TermPostings& tp, uint64_t frq_base,
                               uint64_t prx_base, snii::format::DictEntry* e);
   // Builds a slim (df < kSlimDfThreshold) entry: single window, inline or
@@ -183,16 +206,25 @@ class LogicalIndexWriter {
   const std::vector<uint8_t>& encoded_norms_;
 
   uint32_t target_dict_block_bytes_;
-  // Large per-term-accumulated sections streamed to scratch temp files instead of
-  // being buffered in RAM until finish(). build() seals them; the orchestrator
-  // streams them into the container. RAII-cleaned on every path.
-  TempSectionFile dict_file_;
-  TempSectionFile frq_file_;
-  TempSectionFile prx_file_;
+  // The DICT region (zstd-compressed blocks) is staged here as blocks flush. It must
+  // land contiguously AFTER the posting region (which streams concurrently to the
+  // output), so it cannot stream directly; the orchestrator streams it into the
+  // container right after the posting region. It has NO independent local cap -- it
+  // spills to a temp via the writer's UNIFIED gate-2 cap (the MemoryReporter from
+  // SniiIndexInput, null off-Doris), the same single cap the SPIMI arena uses, so one
+  // threshold bounds the writer's total build RAM. The dict self-reports its ram_bytes_
+  // deltas; the SPIMI term_source self-reports its arena+slot deltas (its reporter is
+  // injected at the source's own construction by the caller).
+  SpillableByteBuffer dict_buf_;
+  // The interleaved [prx][frq] posting region streams STRAIGHT into the container
+  // output during build() -- no temp. posting_out_ is the container writer (borrowed
+  // for the duration of build); posting_off0_ is its absolute offset when this index's
+  // region began, so posting_size() = bytes_written() - posting_off0_.
+  snii::io::FileWriter* posting_out_ = nullptr;
+  uint64_t posting_off0_ = 0;
   std::vector<uint8_t> norms_section_;
 
   std::vector<BlockRecord> blocks_;
-  std::vector<std::string> sample_first_terms_;
   // One 8-byte XXH64 (seed 0) filter key per term, collected during the build pass
   // so the whole-vocabulary string copy is never retained.
   std::vector<uint64_t> term_hashes_;

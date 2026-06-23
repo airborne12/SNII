@@ -20,10 +20,11 @@ using snii::format::WindowMeta;
 namespace {
 
 // Resolves the absolute file offset of the prelude bytes for a windowed entry.
+// The frq span lives in the interleaved posting region (after the term's prx span).
 uint64_t PreludeAbs(const LogicalIndexReader& idx, const DictEntry& entry,
                     uint64_t frq_base) {
-  const auto& frq = idx.section_refs().frq_pod;
-  return frq.offset + frq_base + entry.frq_off_delta;
+  const auto& region = idx.section_refs().posting_region;
+  return region.offset + frq_base + entry.frq_off_delta;
 }
 
 // Validates that [off, off+len) fits within [0, total).
@@ -148,7 +149,7 @@ Status windowed_window_range(const LogicalIndexReader& idx, const DictEntry& ent
     return Status::Corruption("windowed_posting: positions requested but prelude has none");
   }
   const uint64_t prx_region_start =
-      idx.section_refs().prx_pod.offset + prx_base + entry.prx_off_delta;
+      idx.section_refs().posting_region.offset + prx_base + entry.prx_off_delta;
   SNII_RETURN_IF_ERROR(InBounds(meta.prx_off, meta.prx_len, entry.prx_len));
   out->prx_off = prx_region_start + meta.prx_off;
   out->prx_len = meta.prx_len;
@@ -208,7 +209,7 @@ Status FetchBlocks(const LogicalIndexReader& idx, const DictEntry& entry,
   }
   if (want_positions) {
     const uint64_t prx_region_start =
-        idx.section_refs().prx_pod.offset + prx_base + entry.prx_off_delta;
+        idx.section_refs().posting_region.offset + prx_base + entry.prx_off_delta;
     *prx_h = fetcher->add(prx_region_start, static_cast<size_t>(entry.prx_len));
   }
   return fetcher->fetch();

@@ -35,14 +35,6 @@ void TrimMalloc() {
 }
 
 
-// Per-element overhead used by the live-byte estimate (4-byte docid/freq/pos
-// each, plus a rough per-term node + key cost). The exact constant is irrelevant
-// to correctness (output is byte-identical regardless of when we spill); it only
-// governs WHEN a spill fires relative to the threshold.
-constexpr size_t kBytesPerDocEntry = 4 + 4;  // one docid + one freq
-constexpr size_t kBytesPerPosition = 4;
-constexpr size_t kBytesPerTermNode = 64;     // per-term struct + slack
-
 // Process-unique temp path for a spill run under `dir` (pid + monotonic counter so
 // parallel builds / multiple buffers never collide).
 std::string MakeRunPath(const std::string& dir) {
@@ -55,32 +47,61 @@ std::string MakeRunPath(const std::string& dir) {
 }  // namespace
 
 SpimiTermBuffer::SpimiTermBuffer(const std::vector<std::string>* vocab,
-                                 bool has_positions, size_t spill_threshold_bytes)
+                                 bool has_positions, size_t spill_threshold_bytes,
+                                 MemoryReporter* reporter)
     : vocab_(vocab),
       has_positions_(has_positions),
-      spill_threshold_bytes_(spill_threshold_bytes) {
+      spill_threshold_bytes_(spill_threshold_bytes),
+      mem_reporter_(reporter) {
   // Borrowed-vocab mode: only the 4 B/id slot-index array is sized to the
   // vocabulary; the Term pool (slots_) grows with the LIVE touched count, so an
   // all-but-empty vocabulary costs ~4 B/id instead of ~80 B/id.
   slot_of_.assign(vocab_->size(), 0);
+  // The vocab-sized slot index is resident immediately and survives spills; report
+  // its initial positive delta now.
+  report_arena_delta();
 }
 
-SpimiTermBuffer::SpimiTermBuffer(bool has_positions, size_t spill_threshold_bytes)
+SpimiTermBuffer::SpimiTermBuffer(bool has_positions, size_t spill_threshold_bytes,
+                                 MemoryReporter* reporter)
     : vocab_(&owned_vocab_),
       has_positions_(has_positions),
-      spill_threshold_bytes_(spill_threshold_bytes) {
+      spill_threshold_bytes_(spill_threshold_bytes),
+      mem_reporter_(reporter) {
   // Owned-vocab mode: the vocabulary grows as strings are interned; terms_ /
   // present_ grow alongside it in add_token(string_view, ...).
 }
 
-SpimiTermBuffer::~SpimiTermBuffer() { cleanup_runs(); }
+SpimiTermBuffer::~SpimiTermBuffer() {
+  // Balance the writer-level / Doris tracker on the error path: if the buffer is
+  // destroyed while resident bytes were reported but not yet freed-and-reported
+  // (e.g. a build aborts before draining), return them here so nothing leaks.
+  if (mem_reporter_ != nullptr && reported_resident_ != 0) {
+    mem_reporter_->report(-reported_resident_);
+    reported_resident_ = 0;
+  }
+  cleanup_runs();
+}
+
+void SpimiTermBuffer::report_arena_delta() {
+  if (mem_reporter_ == nullptr) return;
+  // Diff the REAL resident bytes (arena + slot index) against the last reported
+  // total; emit the signed delta exactly once.
+  const int64_t now = static_cast<int64_t>(resident_bytes());
+  mem_reporter_->report(now - reported_resident_);
+  reported_resident_ = now;
+}
 
 size_t SpimiTermBuffer::unique_terms() const { return live_term_count_; }
 
-void SpimiTermBuffer::account_token(uint32_t term_id, bool new_term, bool new_doc) {
-  if (new_term) live_bytes_ += kBytesPerTermNode + vocab()[term_id].size();
-  if (new_doc) live_bytes_ += kBytesPerDocEntry;
-  if (has_positions_) live_bytes_ += kBytesPerPosition;
+uint64_t SpimiTermBuffer::resident_bytes() const {
+  // REAL resident accumulator bytes: the posting arena plus the vocab-sized slot
+  // index (capacity, since the reserved-but-unused tail is still resident RSS and
+  // survives spills -- spill_to_run does NOT free slot_of_). This is the gate-2
+  // spill trigger metric and the spill space-precheck figure -- NOT the old gated
+  // live_bytes_ estimate.
+  return pool_.arena_bytes() +
+         static_cast<uint64_t>(slot_of_.capacity()) * sizeof(uint32_t);
 }
 
 // Returns the live Term for `term_id`, claiming a pool slot on first touch (1 ==
@@ -147,18 +168,30 @@ void SpimiTermBuffer::accumulate(uint32_t term_id, uint32_t docid, uint32_t pos)
   ++t.ntok;
   ++total_tokens_;
 
-  if (spill_threshold_bytes_ != 0) {
-    account_token(term_id, new_term, new_doc);
-  }
-  // Spill when the live size crosses the configured threshold, OR (hard safety,
-  // active even in unlimited mode) when the arena nears the 4 GiB uint32-offset
-  // limit -- without this, a single >4 GiB in-memory segment wraps alloc_run and
-  // silently corrupts data. A forced spill + final k-way merge stays byte-identical.
+  // Gate-2 spill: trigger on REAL resident bytes (arena + slot index), NOT the old
+  // gated live_bytes_ estimate. arena_bytes() is monotonic per fill and reset to 0
+  // by spill_to_run()'s pool_.reset(), so the trigger self-rearms after each spill.
+  // The OTHER trigger is the hard arena safety stop (active even in unlimited mode):
+  // when the arena nears the 4 GiB uint32-offset limit -- without it, a single
+  // >4 GiB in-memory segment wraps alloc_run and silently corrupts data. A forced
+  // spill + final k-way merge stays byte-identical regardless of when it fires.
   constexpr uint64_t kArenaSpillCap = 0xE0000000ull;  // 3.5 GiB, < UINT32_MAX margin
-  const bool threshold_hit =
-      spill_threshold_bytes_ != 0 && live_bytes_ >= spill_threshold_bytes_;
+  // Report this token's REAL resident growth FIRST so the writer's unified total
+  // (reporter_->current_bytes()) reflects it before the gate-2 check. Single-source
+  // diff: cheap (subtraction + relaxed atomic add; arena_bytes() is two field reads).
+  report_arena_delta();
+  // Gate-2 spill (UNIFIED): when a reporter is attached, trigger on the writer's TOTAL
+  // build RAM (arena + slot index + dict) crossing the one configured cap -- the same
+  // total and cap every buffer of this writer shares, not a per-buffer threshold. Off
+  // Doris (no reporter) fall back to the local spill_threshold_bytes_. The hard arena
+  // safety stop (4 GiB uint32-offset limit) is always active. spill_to_run() resets the
+  // arena and reports its negative internally, so the unified total drops after a spill.
+  const bool over_cap =
+      mem_reporter_ != nullptr
+          ? mem_reporter_->over_cap()
+          : (spill_threshold_bytes_ != 0 && resident_bytes() >= spill_threshold_bytes_);
   const bool arena_near_limit = pool_.arena_bytes() >= kArenaSpillCap;
-  if ((threshold_hit || arena_near_limit) && spill_status_.ok()) {
+  if ((over_cap || arena_near_limit) && spill_status_.ok()) {
     spill_status_ = spill_to_run();
   }
 }
@@ -418,7 +451,6 @@ void SpimiTermBuffer::drain_sorted(const std::function<void(TermPostings&&)>& fn
     fn(std::move(tp));
   }
   touched_ids_.clear();
-  live_bytes_ = 0;
   // Drop the arena + the slot pool (their bytes are fully decoded) and return the
   // freed chunks to the OS so the process peak reflects only what survives the
   // drain, not retained input-phase arena memory.
@@ -427,6 +459,9 @@ void SpimiTermBuffer::drain_sorted(const std::function<void(TermPostings&&)>& fn
   std::vector<uint32_t>().swap(free_slots_);
   std::vector<uint32_t>().swap(slot_of_);
   TrimMalloc();
+  // Arena reset + slot_of_ freed: now real resident ~0, so this emits the final
+  // negative that returns every reported byte (no leak after the in-memory drain).
+  report_arena_delta();
 }
 
 Status SpimiTermBuffer::drain_to_writer(RunWriter* w) {
@@ -443,8 +478,11 @@ Status SpimiTermBuffer::drain_to_writer(RunWriter* w) {
     if (st.ok()) st = w->write_term(id, tp);
   }
   touched_ids_.clear();
-  live_bytes_ = 0;
   pool_.reset();  // all chains decoded into the run; free the arena for the refill
+  // The spill returns the arena to 0; slot_of_ keeps its capacity (survives
+  // the spill). Report the arena-drop negative now so the gate-2 spill is balanced
+  // immediately, not deferred to the next token.
+  report_arena_delta();
   return st;
 }
 
@@ -452,11 +490,13 @@ Status SpimiTermBuffer::spill_to_run() {
   const std::string dir = resolve_temp_dir();
   // Best-effort space pre-check: fail with a clear, early error rather than a
   // mid-write IoError that leaves a half-written run. Best-effort only (TOCTOU; on
-  // tmpfs this reports RAM). live_bytes_ is the resident estimate about to drain.
+  // tmpfs this reports RAM). resident_bytes() (arena + slot index) is the REAL
+  // resident figure about to drain -- a conservative over-estimate of the run size.
+  const uint64_t resident = resident_bytes();
   const uint64_t avail = temp_dir_available_bytes(dir);
-  if (avail < live_bytes_) {
+  if (avail < resident) {
     return Status::IoError("spimi: insufficient temp space in '" + dir +
-                           "' to spill ~" + std::to_string(live_bytes_) + " B (~" +
+                           "' to spill ~" + std::to_string(resident) + " B (~" +
                            std::to_string(avail) +
                            " B free); set SNII_TEMP_DIR/TMPDIR to a larger disk");
   }
@@ -489,6 +529,10 @@ void SpimiTermBuffer::merge_runs(const std::function<void(TermPostings&&)>& fn,
   std::vector<uint32_t>().swap(free_slots_);
   std::vector<uint32_t>().swap(slot_of_);
   TrimMalloc();
+  // pool_ was already reset by the final spill_to_run -> drain_to_writer (reported
+  // there); this swap frees slot_of_, so report the remaining negative now. After a
+  // full spilled drain reported_resident_ returns to 0 (no leak).
+  report_arena_delta();
   Status s = MergeRuns(run_paths_, vocab(), has_positions_, fn, allow_stream_positions);
   if (!s.ok() && spill_status_.ok()) spill_status_ = s;
   // The merge churns one large coalesced TermPostings per term (the widest term's

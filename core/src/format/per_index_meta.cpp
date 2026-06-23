@@ -24,12 +24,12 @@ Status decode_region(ByteSource* ps, RegionRef* r) {
   return Status::OK();
 }
 
-// SectionRefs payload: six RegionRefs in fixed order, each as varint64 pair.
+// SectionRefs payload: five RegionRefs in fixed order, each as varint64 pair.
+// Order: dict_region, posting_region, norms, null_bitmap, bsbf.
 void encode_section_refs(const SectionRefs& refs, ByteSink* sink) {
   ByteSink payload;
   encode_region(refs.dict_region, &payload);
-  encode_region(refs.frq_pod, &payload);
-  encode_region(refs.prx_pod, &payload);
+  encode_region(refs.posting_region, &payload);
   encode_region(refs.norms, &payload);
   encode_region(refs.null_bitmap, &payload);
   encode_region(refs.bsbf, &payload);
@@ -40,8 +40,7 @@ void encode_section_refs(const SectionRefs& refs, ByteSink* sink) {
 Status decode_section_refs(Slice payload, SectionRefs* out) {
   ByteSource ps(payload);
   SNII_RETURN_IF_ERROR(decode_region(&ps, &out->dict_region));
-  SNII_RETURN_IF_ERROR(decode_region(&ps, &out->frq_pod));
-  SNII_RETURN_IF_ERROR(decode_region(&ps, &out->prx_pod));
+  SNII_RETURN_IF_ERROR(decode_region(&ps, &out->posting_region));
   SNII_RETURN_IF_ERROR(decode_region(&ps, &out->norms));
   SNII_RETURN_IF_ERROR(decode_region(&ps, &out->null_bitmap));
   SNII_RETURN_IF_ERROR(decode_region(&ps, &out->bsbf));

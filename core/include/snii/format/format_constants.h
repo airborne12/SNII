@@ -13,6 +13,11 @@ inline constexpr uint32_t kContainerMagic = 0x49494E53u;  // 'S''N''I''I'
 inline constexpr uint32_t kTailMagic = 0x4C494154u;       // 'T''A''I''L'
 inline constexpr uint16_t kFormatVersion = 1;
 inline constexpr uint16_t kMinReaderVersion = 1;
+// Self-describing version of the meta layout (the per-index meta header AND the tail
+// meta region share this single constant; a reader fails fast with Corruption on any
+// mismatch). This is a from-scratch, pre-launch format: there is exactly ONE meta
+// layout, so the value is 1. Bump it only AFTER launch, when a real on-disk change
+// must coexist with already-written indexes -- pre-launch changes just fold into v1.
 inline constexpr uint16_t kMetaFormatVersion = 1;
 
 // ---- SectionFramer section type ids (within per-index meta / tail region) ----

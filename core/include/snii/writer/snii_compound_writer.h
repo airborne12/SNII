@@ -16,26 +16,31 @@
 // CONTAINER LAYOUT PRODUCED (this is the on-disk contract the reader matches):
 //   [bootstrap_header]                          (kBootstrapHeaderSize bytes)
 //   for each logical index, in add order:
+//     [posting region]       interleaved [prx][frq] per pod_ref term, term order
+//                            (prx span empty when !has_prx)
 //     [DICT blocks region]   concatenated DICT blocks, split by
 //                            target_dict_block_bytes
-//     [.frq POD]             concatenated frq prelude+windows / slim windows
-//     [.prx POD]             concatenated prx windows (tier>=T2 only)
 //   for each logical index, in add order:
 //     [norms POD]            NormsPodWriter::finish (scoring only; else absent)
 //   [tail_meta_region]       one per_index_meta block per index + directory
 //   [tail_pointer]           encode_tail_pointer at EOF
 //
+// (The posting region is streamed BEFORE the DICT region per index: postings are
+// the large append-only term-ordered stream; the DICT region is the compact
+// compressed trailer.)
+//
 // OFFSET CONVENTIONS (ABSOLUTE file offsets unless stated otherwise):
 //   - SectionRefs in each per_index_meta record ABSOLUTE file offset+length of
-//     that index's dict_region, frq_pod, prx_pod, norms. Absent regions are
-//     (0,0) (e.g. .prx and norms for a docs-positions index carry .prx but not
-//     norms; null_bitmap is always (0,0) in v1).
+//     that index's posting_region, dict_region, norms. Absent regions are (0,0)
+//     (e.g. norms for a docs-positions index; null_bitmap is always (0,0) in v1).
+//     A present-but-empty posting_region (all-INLINE index) is (off, 0).
 //   - DictBlockDirectory entries record each DICT block's ABSOLUTE file offset +
 //     length.
 //   - A windowed/slim pod_ref entry's absolute .frq offset =
-//       section_refs.frq_pod.offset + frq_base + frq_off_delta
-//     where frq_base is the .frq-POD-relative running offset captured at the
-//     block's open (see logical_index_writer.h). prx follows the identical rule.
+//       section_refs.posting_region.offset + frq_base + frq_off_delta
+//     where frq_base is the posting-region-relative running offset captured at the
+//     block's open (see logical_index_writer.h). prx follows the identical rule
+//     against the SAME region (prx_base == frq_base).
 //   - tail_pointer.meta_region_offset/length point at the tail_meta_region;
 //     hot_off = 0 (no hot region in v1).
 namespace snii::writer {
@@ -57,25 +62,27 @@ class SniiCompoundWriter {
   struct Placement {
     uint64_t dict_off = 0;
     uint64_t dict_len = 0;
-    uint64_t frq_off = 0;
-    uint64_t frq_len = 0;
-    uint64_t prx_off = 0;
-    uint64_t prx_len = 0;
+    uint64_t post_off = 0;  // interleaved [prx][frq] posting region (was frq + prx)
+    uint64_t post_len = 0;
     uint64_t norms_off = 0;
     uint64_t norms_len = 0;
     uint64_t bsbf_off = 0;
     uint64_t bsbf_len = 0;
   };
 
+  Status ensure_bootstrap();
   Status write_bootstrap();
-  Status write_index_sections(std::vector<Placement>* placements);
-  Status write_norms(std::vector<Placement>* placements);
-  Status write_tail(const std::vector<Placement>& placements);
+  Status write_norms();
+  Status write_tail();
   Status append(const std::vector<uint8_t>& bytes);
 
   snii::io::FileWriter* out_;
   std::vector<std::unique_ptr<LogicalIndexWriter>> indexes_;
-  uint64_t cursor_ = 0;  // running absolute write offset
+  // Per-index placement; post_off/post_len are filled as each index's posting region
+  // streams in during add_logical_index, the rest during finish(). The absolute write
+  // offset is out_->bytes_written() (the single source of truth -- no separate cursor).
+  std::vector<Placement> placements_;
+  bool bootstrap_written_ = false;
   bool finished_ = false;
 };
 

@@ -263,3 +263,33 @@ TEST(SpimiSpillWriter, FinalizeSortedMatchesAcrossSpill) {
   EXPECT_TRUE(un.status().ok());
   EXPECT_TRUE(sp.status().ok());
 }
+
+// Gate-2 trigger now compares REAL resident bytes (pool_.arena_bytes() +
+// slot_of_.capacity()*4) against the configured cap, NOT the old per-token
+// estimate. With a small cap, the first 32 KiB arena block immediately exceeds it,
+// so at least one spill fires; the unlimited (cap=0) build never spills.
+TEST(SpimiSpillWriter, ArenaByteCapTriggersSpill) {
+  constexpr uint32_t kDocs = 400;
+
+  SpimiTermBuffer capped(/*has_positions=*/true, /*spill=*/4096);
+  Feed(&capped, kDocs);
+  SniiIndexInput capped_in = BaseInput(kDocs);
+  capped_in.term_source = &capped;
+  const std::vector<uint8_t> capped_bytes = WriteContainer(capped_in);
+  EXPECT_TRUE(capped.status().ok());
+  // A spill ran: real resident (>= one 32 KiB block) crossed the 4 KiB cap.
+  EXPECT_GE(capped.run_count_for_test(), 1u);
+
+  SpimiTermBuffer unlimited(/*has_positions=*/true, /*spill=*/0);
+  Feed(&unlimited, kDocs);
+  SniiIndexInput unlimited_in = BaseInput(kDocs);
+  unlimited_in.term_source = &unlimited;
+  const std::vector<uint8_t> unlimited_bytes = WriteContainer(unlimited_in);
+  EXPECT_TRUE(unlimited.status().ok());
+  // Unlimited never spills (corpus fits well under the arena hard-stop).
+  EXPECT_EQ(unlimited.run_count_for_test(), 0u);
+
+  // And the metric switch did not change the output: byte-for-byte identical.
+  ASSERT_EQ(capped_bytes.size(), unlimited_bytes.size());
+  EXPECT_EQ(capped_bytes, unlimited_bytes);
+}

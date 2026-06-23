@@ -114,8 +114,8 @@ Status PlanTerms(const LogicalIndexReader& idx,
     p.pod_ref = (p.entry.kind == DictEntryKind::kPodRef);
     p.windowed = p.pod_ref && p.entry.enc == DictEntryEnc::kWindowed;
     if (p.windowed) {
-      const uint64_t prelude_abs = idx.section_refs().frq_pod.offset + p.frq_base +
-                                   p.entry.frq_off_delta;
+      const uint64_t prelude_abs = idx.section_refs().posting_region.offset +
+                                   p.frq_base + p.entry.frq_off_delta;
       p.prelude_handle =
           fetcher->add(prelude_abs, static_cast<size_t>(p.entry.prelude_len));
     } else if (p.pod_ref) {

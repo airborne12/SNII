@@ -30,6 +30,12 @@ class ByteSink {
   // peak RSS during the merge of a high-df term split into thousands of windows.
   void clear() { buf_.clear(); }
 
+  // Moves the backing buffer OUT to the caller (the sink is left empty), so an encoded
+  // section can be handed off without the copy (+ copy-induced capacity slack) that
+  // reading buffer() and copy-assigning would incur. Use only when the sink is not
+  // reused afterward (a stack-local about to die, or one that is clear()'d next).
+  std::vector<uint8_t> take() { return std::move(buf_); }
+
  private:
   std::vector<uint8_t> buf_;
 };

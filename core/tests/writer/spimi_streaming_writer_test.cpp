@@ -172,6 +172,12 @@ TEST(SpimiStreamingWriter, StreamingConsumesSource) {
   SniiIndexInput in = BaseInput(50);
   in.term_source = &buf;
   LogicalIndexWriter writer(in);
-  ASSERT_TRUE(writer.build().ok());
+  // build() streams the posting region straight into a FileWriter sink; this test
+  // only asserts the source is drained, so a throwaway temp sink suffices.
+  const std::string post_path = TempPath();
+  io::LocalFileWriter post;
+  ASSERT_TRUE(post.open(post_path).ok());
+  ASSERT_TRUE(writer.build(&post).ok());
   EXPECT_EQ(buf.unique_terms(), 0u);
+  std::remove(post_path.c_str());
 }

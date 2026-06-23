@@ -2288,6 +2288,30 @@ int main(int argc, char** argv) {
     return run_resources_mode(args, corpus);
   }
 
+  // 1a'. Persist mode: when --out-dir is given for the synthetic corpus, build BOTH
+  //      engines onto disk (out_dir/snii/index.idx + out_dir/clucene) and exit. The
+  //      pair can then be fed to --query-dir for the local cold/warm latency
+  //      distribution (run_query_mode), with no rebuild between samples.
+  if (!args.out_dir.empty()) {
+    const std::string snii_path = args.out_dir + "/snii/index.idx";
+    const std::string clu_dir = args.out_dir + "/clucene";
+    try {
+      std::filesystem::create_directories(args.out_dir + "/snii");
+      std::filesystem::create_directories(clu_dir);
+      bench::SniiAdapter snii_idx;
+      bench::CluceneAdapter cl_idx;
+      snii_idx.build_at(snii_path, corpus, /*keep_on_disk=*/true);
+      cl_idx.build_at(clu_dir, corpus, /*keep_on_disk=*/true);
+    } catch (const std::exception& e) {
+      std::fprintf(stderr, "FATAL: persist build failed: %s\n", e.what());
+      return 1;
+    }
+    std::printf("persisted synthetic index pair to %s (snii/index.idx + clucene/); "
+                "run --query-dir %s for local latency\n",
+                args.out_dir.c_str(), args.out_dir.c_str());
+    return 0;
+  }
+
   const Oracle oracle(corpus);
 
   // 1b. Real-OSS mode: build + upload both indexes to OSS and run the SAME

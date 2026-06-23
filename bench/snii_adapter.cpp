@@ -16,6 +16,7 @@
 #include "snii/query/term_query.h"
 #include "snii/writer/snii_compound_writer.h"
 #include "snii/writer/spimi_term_buffer.h"
+#include "snii/writer/memory_reporter.h"
 
 namespace bench {
 namespace {
@@ -71,7 +72,13 @@ void SniiAdapter::build_range(const std::string& path, const Corpus& c,
   // doc_lo. The corpus tokens are ALREADY dense ids into c.vocab (shared across
   // segments, no copy). A non-zero spill threshold bounds input RAM.
   // Keyword (docs-only) build stores no positions; tokenized stores positions.
-  SpimiTermBuffer buf(&c.vocab, /*has_positions=*/!docs_only_, spill_threshold_bytes_);
+  // One UNIFIED per-writer reporter with cap = spill_threshold_bytes_ drives gate-2
+  // for BOTH the SPIMI arena AND the dict buffer (in.mem_reporter below): a single
+  // cap on the writer's total inverted-index RAM, not a per-buffer threshold.
+  snii::writer::MemoryReporter reporter(/*consume_release=*/nullptr,
+                                        /*cap_bytes=*/spill_threshold_bytes_);
+  SpimiTermBuffer buf(&c.vocab, /*has_positions=*/!docs_only_, spill_threshold_bytes_,
+                      &reporter);
   for (uint32_t d = doc_lo; d < doc_hi; ++d) {
     const auto& toks = c.docs[d];
     for (uint32_t pos = 0; pos < toks.size(); ++pos) {
@@ -90,6 +97,7 @@ void SniiAdapter::build_range(const std::string& path, const Corpus& c,
                            : IndexConfig::kDocsPositions;
   in.doc_count = seg_docs;
   in.term_source = &buf;
+  in.mem_reporter = &reporter;  // same reporter -> unified gate-2 cap across buffers
   // A scoring index needs per-doc length norms (BM25 length normalization); the
   // doc length is its token count in [doc_lo, doc_hi).
   if (scoring_) {
@@ -153,8 +161,10 @@ void SniiAdapter::build_multi(const std::string& path,
   uint32_t index_id = 1;
   for (const LogicalSpec& spec : specs) {
     const Corpus& c = *spec.corpus;
+    snii::writer::MemoryReporter reporter(/*consume_release=*/nullptr,
+                                          /*cap_bytes=*/spill_threshold_bytes_);
     SpimiTermBuffer buf(&c.vocab, /*has_positions=*/!spec.docs_only,
-                        spill_threshold_bytes_);
+                        spill_threshold_bytes_, &reporter);
     for (uint32_t d = 0; d < c.doc_count; ++d) {
       const auto& toks = c.docs[d];
       for (uint32_t pos = 0; pos < toks.size(); ++pos) buf.add_token(toks[pos], d, pos);
@@ -165,6 +175,7 @@ void SniiAdapter::build_multi(const std::string& path,
     in.config = spec.docs_only ? IndexConfig::kDocsOnly : IndexConfig::kDocsPositions;
     in.doc_count = c.doc_count;
     in.term_source = &buf;
+    in.mem_reporter = &reporter;  // unified gate-2 cap across SPIMI + dict
     in.target_dict_block_bytes = 64 * 1024;
     if (Status s = compound.add_logical_index(in); !s.ok())
       fail("add index " + spec.suffix, s);

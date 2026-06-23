@@ -21,17 +21,37 @@ SniiCompoundWriter::SniiCompoundWriter(snii::io::FileWriter* out) : out_(out) {}
 
 Status SniiCompoundWriter::append(const std::vector<uint8_t>& bytes) {
   if (bytes.empty()) return Status::OK();
-  SNII_RETURN_IF_ERROR(out_->append(Slice(bytes)));
-  cursor_ += bytes.size();
-  return Status::OK();
+  return out_->append(Slice(bytes));
+}
+
+// The bootstrap header occupies offset 0 and must precede the first posting region,
+// which streams straight into the output during build(). Written lazily exactly once
+// (on the first add, or in finish() for an empty container).
+Status SniiCompoundWriter::ensure_bootstrap() {
+  if (bootstrap_written_) return Status::OK();
+  bootstrap_written_ = true;
+  return write_bootstrap();
 }
 
 Status SniiCompoundWriter::add_logical_index(const SniiIndexInput& in) {
   if (out_ == nullptr) return Status::InvalidArgument("compound: null file writer");
   if (finished_) return Status::Internal("compound: add after finish");
+  SNII_RETURN_IF_ERROR(ensure_bootstrap());
   auto liw = std::make_unique<LogicalIndexWriter>(in);
-  SNII_RETURN_IF_ERROR(liw->build());
+  Placement p;
+  // The posting region streams DIRECTLY into the container during build() -- no temp
+  // round-trip for the bulk -- followed immediately by this index's compact DICT
+  // trailer (produced interleaved into a temp, but laid out right after its posting
+  // region, preserving the per-index [posting][dict] layout). Offsets are read off
+  // the output writer (the single source of truth -- no separate cursor).
+  p.post_off = out_->bytes_written();
+  SNII_RETURN_IF_ERROR(liw->build(out_));
+  p.post_len = out_->bytes_written() - p.post_off;
+  p.dict_off = out_->bytes_written();
+  SNII_RETURN_IF_ERROR(liw->stream_dict_region_into(out_));
+  p.dict_len = out_->bytes_written() - p.dict_off;
   indexes_.push_back(std::move(liw));
+  placements_.push_back(p);
   return Status::OK();
 }
 
@@ -43,68 +63,37 @@ Status SniiCompoundWriter::write_bootstrap() {
   return append(sink.buffer());
 }
 
-// Streams each index's dict_region, frq_pod, prx_pod (in add order) from its
-// scratch temp files into the container, capturing the absolute offset/length of
-// each into placements[i]. The bytes/order are identical to the prior in-RAM
-// path, so the produced container is byte-identical; only the peak RSS drops.
-Status SniiCompoundWriter::write_index_sections(std::vector<Placement>* placements) {
-  for (size_t i = 0; i < indexes_.size(); ++i) {
-    Placement& p = (*placements)[i];
-    const LogicalIndexWriter& w = *indexes_[i];
-
-    p.dict_off = cursor_;
-    SNII_RETURN_IF_ERROR(w.stream_dict_region_into(out_));
-    cursor_ += w.dict_region_size();
-    p.dict_len = cursor_ - p.dict_off;
-
-    p.frq_off = cursor_;
-    SNII_RETURN_IF_ERROR(w.stream_frq_pod_into(out_));
-    cursor_ += w.frq_pod_size();
-    p.frq_len = cursor_ - p.frq_off;
-
-    if (w.has_prx()) {
-      p.prx_off = cursor_;
-      SNII_RETURN_IF_ERROR(w.stream_prx_pod_into(out_));
-      cursor_ += w.prx_pod_size();
-      p.prx_len = cursor_ - p.prx_off;
-    }
-  }
-  return Status::OK();
-}
-
-// Writes each index's norms POD (in add order), after all dict/frq/prx regions.
-Status SniiCompoundWriter::write_norms(std::vector<Placement>* placements) {
+// Writes each index's norms POD then bsbf section (in add order), after all the
+// per-index [posting][dict] regions.
+Status SniiCompoundWriter::write_norms() {
   for (size_t i = 0; i < indexes_.size(); ++i) {
     const LogicalIndexWriter& w = *indexes_[i];
     if (!w.has_norms() || w.norms_bytes().empty()) continue;
-    Placement& p = (*placements)[i];
-    p.norms_off = cursor_;
+    Placement& p = placements_[i];
+    p.norms_off = out_->bytes_written();
     SNII_RETURN_IF_ERROR(append(w.norms_bytes()));
-    p.norms_len = cursor_ - p.norms_off;
+    p.norms_len = out_->bytes_written() - p.norms_off;
   }
-  // Block-split bloom XFilter sections (one physical section per index, after the
-  // norms), so the reader can probe a single 32-byte block on demand at open.
   for (size_t i = 0; i < indexes_.size(); ++i) {
     const LogicalIndexWriter& w = *indexes_[i];
     if (!w.has_bsbf()) continue;
-    Placement& p = (*placements)[i];
-    p.bsbf_off = cursor_;
+    Placement& p = placements_[i];
+    p.bsbf_off = out_->bytes_written();
     SNII_RETURN_IF_ERROR(append(w.bsbf_bytes()));
-    p.bsbf_len = cursor_ - p.bsbf_off;
+    p.bsbf_len = out_->bytes_written() - p.bsbf_off;
   }
   return Status::OK();
 }
 
-Status SniiCompoundWriter::write_tail(const std::vector<Placement>& placements) {
+Status SniiCompoundWriter::write_tail() {
   TailMetaRegionBuilder region;
   for (size_t i = 0; i < indexes_.size(); ++i) {
     const LogicalIndexWriter& w = *indexes_[i];
-    const Placement& p = placements[i];
+    const Placement& p = placements_[i];
 
     SectionRefs refs;
     refs.dict_region = {p.dict_off, p.dict_len};
-    refs.frq_pod = {p.frq_off, p.frq_len};
-    refs.prx_pod = {p.prx_off, p.prx_len};
+    refs.posting_region = {p.post_off, p.post_len};
     refs.norms = {p.norms_off, p.norms_len};
     refs.null_bitmap = {0, 0};
     refs.bsbf = {p.bsbf_off, p.bsbf_len};
@@ -116,9 +105,9 @@ Status SniiCompoundWriter::write_tail(const std::vector<Placement>& placements) 
 
   ByteSink region_sink;
   region.finish(&region_sink);
-  const uint64_t region_off = cursor_;
+  const uint64_t region_off = out_->bytes_written();
   SNII_RETURN_IF_ERROR(append(region_sink.buffer()));
-  const uint64_t region_len = cursor_ - region_off;
+  const uint64_t region_len = out_->bytes_written() - region_off;
 
   TailPointer tp;
   tp.meta_region_offset = region_off;
@@ -140,11 +129,9 @@ Status SniiCompoundWriter::finish() {
   if (finished_) return Status::Internal("compound: finish called twice");
   finished_ = true;
 
-  std::vector<Placement> placements(indexes_.size());
-  SNII_RETURN_IF_ERROR(write_bootstrap());
-  SNII_RETURN_IF_ERROR(write_index_sections(&placements));
-  SNII_RETURN_IF_ERROR(write_norms(&placements));
-  SNII_RETURN_IF_ERROR(write_tail(placements));
+  SNII_RETURN_IF_ERROR(ensure_bootstrap());  // empty container still gets a header
+  SNII_RETURN_IF_ERROR(write_norms());
+  SNII_RETURN_IF_ERROR(write_tail());
   return out_->finalize();
 }
 
