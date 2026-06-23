@@ -15,30 +15,45 @@ Scope: `core/include/snii/writer/spimi_term_buffer.{h,cpp}`、`compact_posting_p
 
 ## 0. 目标与职责边界（Why）
 
+粒度是 **writer 级**：一个 SNII writer = 一个 `SniiCompoundWriter` = 一个 segment 的倒排索引 =
+**一个下刷单元**。一个 BE 进程里同时有很多 writer 在跑（多个导入 / tablet / compaction 任务），
+真正的并发与内存压力来自**进程内多个 writer 之间**（单个 writer 内部是串行的）。
+
+完整闭环（你描述的标准 Doris 内存回收路径）：
+
 ```
-┌───────────────────────── Doris 全局内存管理（policy / 决策） ─────────────────────────┐
-│  MemTrackerLimiter / GlobalMemoryArbitrator / MemoryReclamation                        │
-│  读取全局内存统计 → 全局压力大时，挑一个 SNII writer 调它的 flush()                     │
-└───────────────────────────────────┬─────────────────────────────────────────────────┘
-                                     │ 1) 读统计   2) 触发 flush()
-┌────────────────────────────────────▼──────────────────────────────────────────────────┐
-│  SNII writer（mechanism / 执行）                                                         │
-│   (1) 各模块准确自报内存占用 → 汇总成一个准确的全局 current_bytes（纯观测，不决策）       │
-│   (2) flush()：被外部触发时，把当前累积下刷成一个 idx 分段 + reset（可重入）             │
-│   (3) finalize：所有分段经 k-way merge 合并                                              │
+┌─────────────────────── Doris 内存管理（policy / 决策） ──────────────────────────────┐
+│  ① 每个 writer 把自己的内存计入 MemTracker 层级节点                                    │
+│  ② MemTracker 汇总到进程级 → 内存过高触发 SOFT LIMIT                                   │
+│  ③ MemoryReclamation 尝试下刷：memtable + 倒排索引                                     │
+│  ④ 对内存大的 writer 节点，调它的 flush()（决策「刷谁」在 Doris，它有 per-writer 数据） │
+└───────────────────┬──────────────────────────────────────────────────────────────────┘
+        ① consume/release（writer 级上报）   ④ 触发 flush()
+┌────────────────────▼──────────────────────────────────────────────────────────────────┐
+│  SNII writer（mechanism / 执行，per segment）                                            │
+│   (1) writer 内各模块准确自报内存 → 汇总成该 writer 的 current_bytes，并 consume 到       │
+│       Doris MemTracker 对应节点（纯观测，不决策）                                         │
+│   (2) flush()：被 Doris 触发时，把当前累积**下刷一个 idx 分段到临时文件目录** + reset      │
+│       （可重入：内存压力期可多次 flush，产生多个临时分段）                                │
+│   (3) segment flush（finalize）：把所有临时 idx 分段 + 残留 **k-way merge** 成该 segment   │
+│       的最终倒排索引                                                                     │
 └─────────────────────────────────────────────────────────────────────────────────────────┘
 ```
 
 三件事，**仅此而已**：
 
-1. **准确的全局内存统计**：各模块各自统计自己的内存占用，汇总成一个准确全局值。
-   **SNII 不据此做任何下刷决策**——它只把数字报出去。
-2. **外部下刷**：Doris memory manager 结合其 allocator/MemTracker 做全局调度；压力大时调用某个
-   SNII writer 的 `flush()`，把当前内存中的累积刷成一个 idx 分段。
-3. **idx 分段 + k-way merge**：多次下刷产生多个统一分段，最终 k-way merge 合并。
+1. **writer 级准确内存统计**：一个 writer 内各模块自报自己的内存，汇总成该 writer 的占用，
+   并 consume 到 Doris MemTracker 节点；MemTracker 自然 roll-up 到进程级。**SNII 不做下刷决策**。
+2. **外部下刷到临时分段**：Doris 触发 soft limit → MemoryReclamation 对内存大的 writer 调 `flush()`
+   → SNII 把当前累积**落一个 idx 分段到临时目录**（可重入，多次 flush = 多个临时分段）。
+3. **segment flush 时 k-way merge**：该 segment 真正 flush（所有行就绪）时，把临时目录里的所有 idx
+   分段 + 内存残留 **k-way merge** 成最终倒排索引。
 
-**非目标（明确删除）**：SNII **不**实现 victim 选择、共享预算器、charge/relieve、跨 buffer 协调、
-锁内 spill。这些是 Doris 全局内存管理的职责，SNII 重复实现只会与之打架。
+**职责边界**：「刷谁、何时刷」= Doris（它有 per-writer MemTracker 数据 + 全局 soft limit）；
+「怎么落分段、怎么 merge」= SNII。
+
+**非目标（明确删除）**：SNII **不**实现 victim 选择、共享预算器、charge/relieve、跨 writer 协调、
+锁内 spill。这些是 Doris MemTracker / MemoryReclamation 的职责，SNII 重复实现只会与之打架。
 
 ---
 
@@ -66,21 +81,32 @@ Scope: `core/include/snii/writer/spimi_term_buffer.{h,cpp}`、`compact_posting_p
 // core/include/snii/writer/memory_reporter.h
 namespace snii::writer {
 
-// A process-wide accurate byte counter for build-time RAM. Each SNII module REPORTS
-// its own resident-byte changes here; the sum is an accurate global current_bytes that
-// Doris's memory manager reads. This is OBSERVE-ONLY: SNII never makes a spill/flush
-// decision from it. Thread-safe (atomic); cheap on the hot path (one relaxed add).
+// Per-WRITER accurate byte counter for build-time RAM (one per SniiCompoundWriter =
+// one per segment's inverted index). Every module inside that writer REPORTS its own
+// resident-byte changes here; current_bytes() is that writer's accurate live usage,
+// which Doris reads and rolls up to process level via its MemTracker. OBSERVE-ONLY:
+// SNII never makes a flush decision from it. Thread-safe (atomic); cheap on the hot
+// path (one relaxed add + an optional bridge call).
 class MemoryReporter {
  public:
+  // consume_release: optional bridge to Doris's MemTracker node for this writer.
+  // Called with the same delta on every report (delta>0 = consume, <0 = release).
+  // Null when SNII runs without Doris (bench / unit tests) -> local atomic only.
+  using ConsumeReleaseFn = std::function<void(int64_t delta)>;
+  explicit MemoryReporter(ConsumeReleaseFn consume_release = nullptr)
+      : consume_release_(std::move(consume_release)) {}
+
   // delta > 0 on growth, < 0 on shrink/free. Each module is the sole source of truth
   // for ITS OWN bytes; double-reporting is a module bug, not handled here.
   void report(int64_t delta) {
     current_.fetch_add(delta, std::memory_order_relaxed);
+    if (consume_release_) consume_release_(delta);  // mirror into Doris MemTracker
   }
   int64_t current_bytes() const { return current_.load(std::memory_order_relaxed); }
 
  private:
   std::atomic<int64_t> current_{0};
+  ConsumeReleaseFn consume_release_;
 };
 
 }  // namespace snii::writer
@@ -107,17 +133,26 @@ class MemoryReporter {
 - drain（`for_each_term_sorted` 末尾 `live_bytes_=0`）也是一处 report 负 delta——上一版漏掉它造成
   泄漏；这里把它列为**必报点**。
 
-### 2.3 与 Doris MemTracker 的对接（集成边界）
+### 2.3 粒度与 Doris MemTracker 的对接（集成边界）
 
-两种对接，按 Doris 现有机制择一（合并侧决定）：
+**粒度 = writer 级**：每个 `SniiCompoundWriter` 持有一个 `MemoryReporter`；该 writer 内的所有模块
+（各列的 `SpimiTermBuffer` / `dict_buf_` / `CompactPostingPool`）都 report 到**这一个** reporter。
+于是：
 
-- **(A) 桥接**：`MemoryReporter::report` 同时调 Doris `ThreadMemTrackerMgr` / `MemTrackerLimiter`
-  的 consume/release，使 SNII 构建内存进入 Doris 的全局 MemTracker 层级，
-  `GlobalMemoryArbitrator` 据此全局裁决。
-- **(B) 暴露读取**：SNII 只维护自己的 `current_bytes()`，Doris memory manager 周期性读取 +
-  在其 `MemoryReclamation` 流程里把 SNII writer 作为可回收对象之一调 `flush()`。
+```
+writer.current_bytes() == 该 segment 倒排索引构建的实时常驻字节   ← Doris 查「这个 writer 用了多少」
+```
 
-无论 A/B，**下刷决策都在 Doris 侧**；SNII 侧 `MemoryReporter` 不变。
+对接 Doris MemTracker（SNII core 不直接依赖 Doris 类型，用一个回调桥接）：
+
+- `MemoryReporter` 持一个可选的 `consume_release_fn`（合并侧注入）。`report(delta)` 时既更新本地
+  atomic，又调 `consume_release_fn(delta)` 把该 writer 的内存 **consume/release 到 Doris 对应的
+  MemTracker 节点**。
+- Doris MemTracker 自然 **roll-up 到进程级**；`GlobalMemoryArbitrator` 看进程总量触发 **soft limit**；
+  `MemoryReclamation` 看各 writer 节点（per-writer 数据）决定**对哪个 writer 调 `flush()`**。
+
+即「实时查询」与「挑谁 flush」共用**同一套 per-writer MemTracker 节点**，SNII 不维护第二份。
+未连 Doris（如 bench / 单测）时 `consume_release_fn` 为空，只走本地 atomic，`current_bytes()` 仍可读。
 
 ### 2.4 旧内部阈值的处置
 
@@ -129,22 +164,38 @@ class MemoryReporter {
 
 ## 3. 外部下刷 API + idx 分段
 
-### 3.1 `flush()`：把触发权交给外部
+### 3.1 `flush()`：把触发权交给外部（时序）
+
+下刷与最终合并发生在**两个不同时刻**，对应 Doris 的两个动作：
+
+```
+  导入中（行不断进入，倒排累积在内存）
+     │
+     ├──[内存压力] Doris soft limit → MemoryReclamation 对该 writer 调 flush()
+     │      → 把当前累积落一个 idx 分段到【临时目录】+ reset，继续累积   ← 可重复多次
+     │
+     └──[segment 真正 flush，所有行就绪] Doris 调 finalize/close
+            → 把临时目录里所有 idx 分段 + 内存残留 k-way merge 成该 segment 的最终倒排索引
+```
 
 ```cpp
-// SpimiTermBuffer 新增（公开）
-// Externally triggered: flush the current resident accumulation as ONE segment and
-// reset, so the next fill starts clean. Re-entrant (multiple flushes -> multiple
-// segments, k-way merged at finalize). Reuses the existing spill_to_run kernel.
-// Doris's memory manager calls this under global memory pressure; SNII does NOT
-// self-trigger it (except the 4 GiB arena hard-stop).
+// 由 SniiCompoundWriter 暴露、透传到各列的 SpimiTermBuffer（公开）
+// Externally triggered by Doris under memory soft-limit: flush this writer's CURRENT
+// resident accumulation as ONE idx segment into the temp directory and reset, so
+// accumulation continues with freed RAM. Re-entrant (each flush -> one more temp
+// segment). Does NOT produce the final index -- that happens at finalize via k-way
+// merge. SNII does NOT self-trigger flush (except the 4 GiB arena hard-stop).
 Status flush();
 ```
 
-- 内核复用现有 `spill_to_run()`（已可重入：落段、reset arena、`live_bytes_=0` 并 report 负 delta、继续）。
-- `account_token` 内**移除**阈值自触发（只留 4 GiB 兜底）；下刷时机完全由外部 `flush()` 决定。
-- `LogicalIndexWriter` / `SniiCompoundWriter` 透传 `flush()`，使 Doris 能对一个正在构建的 SNII
-  writer 发下刷。
+- **flush() 时**：复用现有 `spill_to_run()`（已可重入：落一个临时分段、reset arena、
+  `live_bytes_=0` 并 report 负 delta、继续累积）。RAM 被释放（report 负 delta → Doris MemTracker
+  release），缓解进程内存压力。
+- **finalize（segment flush）时**：复用现有 `merge_runs()` / `MergeRuns()`，把所有临时分段 +
+  残留 k-way merge 成最终倒排索引（已保证 byte-identical，与 flush 次数/时机无关）。
+- `account_token` 内**移除**阈值自触发（只留 4 GiB 兜底）；常规下刷时机完全由 Doris 决定。
+- `LogicalIndexWriter` / `SniiCompoundWriter` 透传 `flush()`，使 Doris 能对**一个具体 writer**
+  （内存大的那个）精准下刷。
 
 ### 3.2 idx 统一分段：两种粒度
 
