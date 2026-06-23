@@ -34,11 +34,13 @@
 // and scan independently without needing earlier terms, enabling anchor binary search + local scan for exact term lookup.
 namespace snii::format {
 
-// DICT block entry_format_ver (aligned with DictEntry encoding version).
-//   v1: per-region crc32c stored for every slim/inline entry.
-//   v2: INLINE entries omit the redundant per-region crc32c (covered by the
-//       block-level crc32c); slim/windowed POD-ref entries still carry theirs.
-inline constexpr uint8_t kDictBlockFormatVer = 2;
+// DICT block entry_format_ver: self-describing version of the DictEntry encoding, a
+// fail-fast sentinel (reader rejects a mismatch). From-scratch pre-launch format ->
+// exactly one encoding -> value 1. In it, INLINE entries omit the redundant per-region
+// crc32c (the block-level crc32c already covers them); slim/windowed POD-ref entries
+// carry their own. Bump only post-launch when a real change must coexist with written
+// indexes.
+inline constexpr uint8_t kDictBlockFormatVer = 1;
 
 // block_flags bit definitions.
 namespace dict_block_flags {

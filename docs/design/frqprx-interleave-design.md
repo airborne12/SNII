@@ -729,10 +729,16 @@ either direction (non-empty docs-only, or empty all-INLINE positional).
 
 ## 9. Migration & files to touch (breaking format change)
 
+> **Correction (post-implementation).** The plan below bumped `kMetaFormatVersion`
+> 1 -> 2. That was reverted: SNII is a **from-scratch, pre-launch** format, so no v2
+> index ever needs to coexist with a v1 one — bumping is migration ceremony with no
+> deployed reader to gate. The constant stays at **1** (the single, first meta layout);
+> the field remains a self-describing fail-fast sentinel. Bump only **after launch**.
+> The rest of §9 is kept for historical context but the bump is **not** performed.
+
 This changes the on-disk container (meta `SectionRefs` field set, the per-index
-section order, and one meta-header flag bit). **Bump `kMetaFormatVersion`** so an old
-reader fails fast rather than mis-parsing. Pre-launch: no backward-compat shim, no
-dual-read.
+section order, and one meta-header flag bit). Pre-launch: no backward-compat shim, no
+dual-read — the change folds into the single v1 meta layout.
 
 > **Version constant scope (R3).** `kMetaFormatVersion`
 > (`core/include/snii/format/format_constants.h:16`) is a **single shared constant**
