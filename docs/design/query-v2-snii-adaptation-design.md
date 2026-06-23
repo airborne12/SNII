@@ -341,9 +341,57 @@ SNII `DictEntry.df` 即 document frequency，直接作 `size_hint`。这让 quer
 
 ---
 
-## 10. 结论（一句话）
+## 10. Writer 集成：Doris `InvertedIndexColumnWriter` → SNII writer
 
-**复用 query_v2 的全部复合算子与评分逻辑，仅把叶子 `SegmentPostings` 换成 SNII 原生实现
-（SNII window ≡ query_v2 block，prelude 即 skip 目录 + block-max），并加一个查询树级预取
-协调器把惰性迭代触发的 I/O 收敛回 SNII「按阶段一轮并发取」——即可让 query_v2 读 SNII 格式
-而三个黄金指标不退化。**
+前面 §0–§9 是**读路径**（query_v2 算子读 SNII 格式）。**写路径**是同一次合并的另一条轴：
+Doris 的倒排 writer（`InvertedIndexColumnWriter`：`init` / `add_values` / `add_nulls` / `finish`，
+`be/src/storage/index/inverted/inverted_index_writer.h:74-107`）需要坐在 SNII writer 之上。
+内存统计 / 下刷的两门控模型见 `build-memory-accounting-flush-design.md`；本节只给**接口映射**。
+
+### 10.1 SNII writer 的对接面（实际签名）
+
+- `SpimiTermBuffer`（`core/include/snii/writer/spimi_term_buffer.h`）—— 输入累积，**两个 `add_token`**：
+  - `add_token(uint32_t term_id, uint32_t docid, uint32_t pos)`：借用 vocab、按 term-id（SNII 内部用）。
+  - **`add_token(std::string_view term, uint32_t docid, uint32_t pos)`**：owned-vocab，首次出现自动
+    intern 进内部词表（`:194`，注释「for string-fed callers」）——**Doris 走这个**。
+  - owned-vocab 构造：`SpimiTermBuffer(has_positions, /*spill_threshold*/0, MemoryReporter*)`。
+- `SniiCompoundWriter`（`core/include/snii/writer/snii_compound_writer.h`）—— per-segment 容器：
+  `add_logical_index(const SniiIndexInput&)`（`:54`，drain 一个 term_source 并写出该 logical index）、
+  `finish()`（`:58`，写出 `.idx`）。
+- `SniiIndexInput`（`logical_index_writer.h:66`）：`index_id` / `index_suffix` / `config` /
+  `doc_count` / `term_source` / `mem_reporter` / `encoded_norms`。
+
+### 10.2 生命周期映射
+
+| Doris `InvertedIndexColumnWriter` | SNII |
+|---|---|
+| `init()` / open | 构造 `SpimiTermBuffer`（owned-vocab）+ `MemoryReporter(consume_release→Doris MemTracker, cap=倒排 buffer 配置如 512 MiB)`；持有一个 per-segment `SniiCompoundWriter` |
+| `add_values(field, values, count)` | **Doris analyzer 切词**（分词留 Doris 侧，SNII 不含分词器）→ 每 token 调 `buf.add_token(token_str, docid, pos)`；`docid`=行在 segment 内序号，`pos`=字段内 token 位置 |
+| `add_nulls(count)` | 推进 `docid`（null 行不产 token）；scoring 时该 doc 的 norm 记默认 |
+| `finish()`（每列） | 组装 `SniiIndexInput in`（`term_source=&buf`、`mem_reporter=&reporter`、`config`、scoring 时 `encoded_norms`）→ `compound.add_logical_index(in)`（**此处 drain + k-way merge 掉门控 2 落的小段**） |
+| segment close | **一次** `compound.finish()` → 写最终 `.idx` |
+
+### 10.3 要点
+
+1. **粒度**：Doris 列 writer 是 per-column；`SniiCompoundWriter` 是 per-segment（一个 `.idx` 含多列
+   logical index）。每列一个 `SpimiTermBuffer` + 一次 `add_logical_index`；`finish()` 整段一次。
+2. **分词归 Doris**：`add_token(string_view)` 收的是已切好的 token，SNII 只 intern + 累积。
+3. **`config`**：keyword/docs-only → `kDocsOnly`；全文 → `kDocsPositions`；需 BM25 → `kDocsPositionsScoring`
+   （后者填 `in.encoded_norms[docid] = snii::query::encode_norm(doc_token_count)`）。
+4. **门控 2 自动生效**：`add_token` 累积超过 reporter 的**统一 cap** 即自旋 spill 小段，`add_logical_index`
+   时 k-way merge——Doris 侧无感（见 memory 设计文档 §3.2）。
+5. **门控 1 自动生效**：内存压力下 Doris 经 `MemTableMemoryLimiter` flush memtable → segment 写出
+   自然走到列 writer 的 `finish()` → SNII finalize（见 memory 设计文档 §3.1）。
+6. **端到端已验证**：owned-vocab + `add_token(string)` + `add_logical_index` 路径有测试覆盖
+   （`core/tests/reader/snii_end_to_end_test.cpp:136`）。
+
+---
+
+## 11. 结论（一句话）
+
+**读路径**：复用 query_v2 的全部复合算子与评分逻辑，仅把叶子 `SegmentPostings` 换成 SNII 原生实现
+（SNII window ≡ query_v2 block，prelude 即 skip 目录 + block-max），并加一个查询树级预取协调器把
+惰性迭代触发的 I/O 收敛回 SNII「按阶段一轮并发取」。**写路径**：Doris `InvertedIndexColumnWriter`
+的 `add_values`→`SpimiTermBuffer::add_token(string_view,…)`、`finish`→`add_logical_index`+
+`compound.finish()`，SNII 坐在该接口背后，两门控内存管理对 Doris 无感——读写两轴都让 SNII 接进 Doris
+而三个黄金指标不退化。
