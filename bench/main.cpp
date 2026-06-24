@@ -18,6 +18,7 @@
 
 #include <algorithm>
 #include <chrono>
+#include <cinttypes>
 #include <cstdint>
 #include <cctype>
 #include <cstdio>
@@ -33,9 +34,11 @@
 #include <vector>
 
 #include "bench_jsonl.h"
+#include "bench_manifest.h"
 #include "clucene_adapter.h"
 #include "corpus_gen.h"
 #include "corpus_loader.h"
+#include "oss_gate.h"
 #include "parallel_tokenizer.h"
 #include "parquet_corpus_reader.h"
 #include "resource_gate.h"
@@ -348,6 +351,62 @@ void print_wall_distribution(const char* engine, std::vector<double> samples) {
               engine, n, samples.front(), med, p90, sum / static_cast<double>(n));
 }
 
+// Emits exactly one surface=oss JSONL line for a single gated OSS query: the two
+// engines' median wall_ms + serial_rounds/request_bytes (the SAME cost-model
+// yardstick), the noise-tolerant OssVerdict, and the reproduction metadata
+// (scenario id, doc_count scale, seed, git rev, wall-floor). Integer metrics are
+// written as integer literals; doubles use %.6g (never sci-notation). Mirrors the
+// escaping/precision convention of bench_jsonl / resource_gate.
+void write_oss_jsonl(std::ostream& os, const char* scenario_id,
+                     uint32_t doc_count, uint64_t seed, const std::string& rev,
+                     size_t hits, double cl_median_ms, double sn_median_ms,
+                     const snii::io::IoMetrics& cl, const snii::io::IoMetrics& sn,
+                     const bench::OssVerdict& v) {
+  auto u64 = [&os](const char* k, uint64_t val) {
+    char b[32];
+    std::snprintf(b, sizeof(b), "%" PRIu64, val);
+    os << '"' << k << "\":" << b;
+  };
+  auto dbl = [&os](const char* k, double val) {
+    char b[32];
+    std::snprintf(b, sizeof(b), "%.6g", val);
+    os << '"' << k << "\":" << b;
+  };
+  auto boolean = [&os](const char* k, bool val) {
+    os << '"' << k << "\":" << (val ? "true" : "false");
+  };
+  os << '{';
+  os << "\"metric_kind\":\"oss\",";
+  os << "\"surface\":\"oss\",";
+  os << "\"scenario_id\":\"" << bench::json_escape(scenario_id) << "\",";
+  u64("doc_count", doc_count); os << ',';
+  u64("seed", seed); os << ',';
+  os << "\"git_rev\":\"" << bench::json_escape(rev) << "\",";
+  u64("hits", hits); os << ',';
+  os << "\"clucene\":{";
+  dbl("median_wall_ms", cl_median_ms); os << ',';
+  u64("serial_rounds", cl.serial_rounds); os << ',';
+  u64("range_gets", cl.range_gets); os << ',';
+  u64("total_request_bytes", cl.total_request_bytes);
+  os << "},";
+  os << "\"snii\":{";
+  dbl("median_wall_ms", sn_median_ms); os << ',';
+  u64("serial_rounds", sn.serial_rounds); os << ',';
+  u64("range_gets", sn.range_gets); os << ',';
+  u64("total_request_bytes", sn.total_request_bytes);
+  os << "},";
+  os << "\"verdict\":{";
+  dbl("wall_ratio_cl_over_snii", v.wall_ratio_cl_over_snii); os << ',';
+  dbl("min_wall_ratio", v.min_wall_ratio); os << ',';
+  boolean("wall_pass", v.wall_pass); os << ',';
+  boolean("rounds_pass", v.rounds_pass); os << ',';
+  boolean("docids_pass", v.docids_pass); os << ',';
+  boolean("overall_pass", v.overall_pass);
+  os << "},";
+  boolean("overall_pass", v.overall_pass);
+  os << "}\n";
+}
+
 // Runs the full real-OSS comparison. Returns the process exit code (0 on success
 // with all docids matching, nonzero otherwise).
 // Concurrent S3 throughput matrix (defined after run_concurrent below). Each worker
@@ -621,19 +680,47 @@ int run_oss_mode(const Args& args, const bench::Corpus& corpus,
   // call resets the cost model and re-issues real OSS GETs (cold), so the spread
   // exposes per-GET OSS latency jitter -- which dominates tiny single-round
   // queries and explains why a single mid-df sample can land either way.
+  //
+  // BENCH.6: each query is gated through bench::evaluate_oss against its kRealOss
+  // floor (median wall_ms ratio CL/SNII >= floor AND serial_rounds parity-or-
+  // better AND docids match). A surface=oss JSONL row is emitted per query when
+  // --bench-out is set; any verdict breach forces a nonzero process exit so the
+  // S3-native latency claim is CI-checkable.
+  bool oss_gate_breach = false;
   if (args.repeat > 1) {
     std::printf("\n=== wall-clock distribution over %u cold repeats "
                 "(real-OSS jitter) ===\n",
                 args.repeat);
     struct Q {
       const char* label;
+      const char* scenario_id;  // manifest id for the kRealOss floor lookup
       bool is_phrase;
       std::string term;
     };
-    std::vector<Q> queries = {{"TERM high-df", false, high_term},
-                              {"TERM mid-df", false, mid_term},
-                              {"TERM low-df", false, low_term}};
-    if (!phrase.empty()) queries.push_back({"PHRASE", true, std::string()});
+    std::vector<Q> queries = {{"TERM high-df", "TERM-high", false, high_term},
+                              {"TERM mid-df", "TERM-mid", false, mid_term},
+                              {"TERM low-df", "TERM-low", false, low_term}};
+    if (!phrase.empty())
+      queries.push_back({"PHRASE", "PHRASE-5", true, std::string()});
+
+    // The kRealOss wall-clock floor: 5M (>=1M docs) demands the documented
+    // advantage; below 1M the floor falls back to parity (1.0) to admit the
+    // known small-scale byte/latency reversal without a false fail.
+    const bench::Scale scale = bench::scale_of(corpus.doc_count);
+    const double kRealOssWallFloor = scale == bench::Scale::kLarge5M ? 2.0 : 1.0;
+
+    std::ofstream oss_jsonl;
+    const bool emit_jsonl = !args.bench_out.empty();
+    if (emit_jsonl) {
+      oss_jsonl.open(args.bench_out, std::ios::out | std::ios::trunc);
+      if (!oss_jsonl) {
+        std::fprintf(stderr, "FATAL: cannot open --bench-out path: %s\n",
+                     args.bench_out.c_str());
+        return 2;
+      }
+    }
+    const std::string rev = git_rev();
+
     for (const Q& q : queries) {
       std::vector<double> snii_ms, cl_ms;
       std::vector<uint32_t> sdoc, cdoc;
@@ -662,6 +749,32 @@ int run_oss_mode(const Args& args, const bench::Corpus& corpus,
       std::printf("[%s] (hits=%zu)\n", q.label, sdoc.size());
       print_wall_distribution("CLucene", cl_ms);
       print_wall_distribution("SNII", snii_ms);
+
+      const bool docids_match = (sdoc == cdoc);
+      const bench::OssVerdict v = bench::evaluate_oss(
+          cl_ms, snii_ms, cm, sm, docids_match, kRealOssWallFloor);
+      std::printf("  oss verdict: wall_ratio=%.2f (floor %.2f) wall=%s rounds=%s "
+                  "docids=%s overall=%s\n",
+                  v.wall_ratio_cl_over_snii, v.min_wall_ratio,
+                  v.wall_pass ? "PASS" : "FAIL", v.rounds_pass ? "PASS" : "FAIL",
+                  v.docids_pass ? "PASS" : "FAIL",
+                  v.overall_pass ? "PASS" : "FAIL");
+      if (!v.overall_pass) oss_gate_breach = true;
+
+      if (emit_jsonl) {
+        write_oss_jsonl(oss_jsonl, q.scenario_id, corpus.doc_count, args.seed,
+                        rev, sdoc.size(), bench::median_ms(cl_ms),
+                        bench::median_ms(snii_ms), cm, sm, v);
+      }
+    }
+    if (emit_jsonl) {
+      oss_jsonl.flush();
+      if (!oss_jsonl) {
+        std::fprintf(stderr, "FATAL: write to --bench-out failed: %s\n",
+                     args.bench_out.c_str());
+        return 2;
+      }
+      std::printf("\nwrote surface=oss JSONL: %s\n", args.bench_out.c_str());
     }
   }
 
@@ -681,9 +794,12 @@ int run_oss_mode(const Args& args, const bench::Corpus& corpus,
   std::printf("\ncleanup: removed %zu / %zu OSS objects\n", removed,
               all_keys.size());
 
-  std::printf("\nresult: %s\n",
-              all_match ? "ALL DOCIDS MATCH" : "DOCID MISMATCH");
-  return all_match ? 0 : 1;
+  std::printf("\nresult: %s%s\n",
+              all_match ? "ALL DOCIDS MATCH" : "DOCID MISMATCH",
+              oss_gate_breach ? " (OSS GATE BREACH)" : "");
+  // Nonzero exit on a docid mismatch (correctness) OR any OSS surface-gate breach
+  // (BENCH.6): the --oss path is a CI gate, not just a printout.
+  return (all_match && !oss_gate_breach) ? 0 : 1;
 }
 #endif  // SNII_WITH_S3
 

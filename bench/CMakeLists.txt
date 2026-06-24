@@ -138,6 +138,16 @@ if(SNII_BUILD_TESTS)
     PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
   target_link_libraries(snii_bench_resource_gate_test PRIVATE snii_gtest snii)
 
+  # BENCH.6: real-OSS surface gate (median_ms + evaluate_oss). Pure: no S3, no
+  # network, no CLucene. Links only oss_gate.cpp; snii for the IoMetrics PUBLIC
+  # header. Asserts the documented 5M phrase numbers + the noise-tolerant edges.
+  add_executable(snii_bench_oss_gate_test
+    ${CMAKE_CURRENT_SOURCE_DIR}/oss_gate_test.cpp
+    ${CMAKE_CURRENT_SOURCE_DIR}/oss_gate.cpp)
+  target_include_directories(snii_bench_oss_gate_test
+    PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
+  target_link_libraries(snii_bench_oss_gate_test PRIVATE snii_gtest snii)
+
   include(GoogleTest)
   gtest_discover_tests(snii_bench_corpus_loader_test)
   gtest_discover_tests(snii_bench_corpus_gen_test)
@@ -149,4 +159,5 @@ if(SNII_BUILD_TESTS)
   gtest_discover_tests(snii_bench_jsonl_test)
   gtest_discover_tests(snii_bench_scenario_gate_test)
   gtest_discover_tests(snii_bench_resource_gate_test)
+  gtest_discover_tests(snii_bench_oss_gate_test)
 endif()
