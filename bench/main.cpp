@@ -38,6 +38,7 @@
 #include "corpus_loader.h"
 #include "parallel_tokenizer.h"
 #include "parquet_corpus_reader.h"
+#include "resource_gate.h"
 #include "scenario_gate.h"
 #include "snii/io/metered_file_reader.h"
 #include "snii_adapter.h"
@@ -735,11 +736,14 @@ void apply_no_merge(bench::CluceneAdapter& idx, bool v) { idx.set_no_merge(v); }
 template <typename Adapter>
 void apply_no_merge(Adapter&, bool) {}
 
-// Builds one engine over the corpus, reporting its on-disk index size and the
-// CPU it took. Returns nothing; peak RSS is read at process exit by the caller.
+// Builds one engine over the corpus and returns its write-side resource trio:
+// build CPU seconds, the process peak RSS high-water observed right after this
+// build (read by the caller), and the on-disk index size. Prints the same line
+// the print-only resource mode always did. peak_rss_mib is filled by the caller
+// (it is a process-global high-water, so it is read AFTER this build returns).
 template <typename Adapter>
-void build_and_report(const char* name, const bench::Corpus& corpus,
-                      uint32_t spill_mib, bool no_merge) {
+bench::ResourceTrio build_and_report(const char* name, const bench::Corpus& corpus,
+                                     uint32_t spill_mib, bool no_merge) {
   Adapter idx;
   apply_spill(idx, spill_mib);
   apply_no_merge(idx, no_merge);
@@ -750,10 +754,13 @@ void build_and_report(const char* name, const bench::Corpus& corpus,
   const double build_cpu = cpu_seconds() - c0;
   const double build_wall =
       std::chrono::duration<double>(std::chrono::steady_clock::now() - w0).count();
+  const uint64_t bytes = idx.index_bytes();
   std::printf("  %-8s index_bytes=%-12llu (%7.2f MiB)  build_cpu_s=%-7.2f "
               "build_wall_s=%-7.2f\n",
-              name, static_cast<unsigned long long>(idx.index_bytes()),
-              mib(idx.index_bytes()), build_cpu, build_wall);
+              name, static_cast<unsigned long long>(bytes), mib(bytes), build_cpu,
+              build_wall);
+  // peak_rss_mib is filled in by the caller after the build (high-water mark).
+  return bench::ResourceTrio{build_cpu, 0.0, bytes};
 }
 
 // --resources mode: index size, build CPU, and peak RSS for the selected engine.
@@ -770,20 +777,98 @@ int run_resources_mode(const Args& args, const bench::Corpus& corpus) {
   }
   const bool snii = args.engine == "snii" || args.engine == "both";
   const bool clu = args.engine == "clucene" || args.engine == "both";
+
+  // The corpus already resident before any build is the shared floor: each
+  // engine's RSS contribution is (peak-after-its-build - corpus_floor), so the
+  // in-memory corpus held by BOTH engines is not double-counted on either side.
+  const double corpus_floor = current_rss_mib();
+
+  bench::ResourceTrio snii_trio;
+  bench::ResourceTrio clu_trio;
+  bool have_snii = false;
+  bool have_clu = false;
   try {
-    if (snii)
-      build_and_report<bench::SniiAdapter>("SNII", corpus, args.spill_mib,
-                                           args.no_merge);
-    // Same threshold for CLucene: its RAM-buffer flush matches SNII's spill.
-    if (clu)
-      build_and_report<bench::CluceneAdapter>("CLucene", corpus, args.spill_mib,
-                                              args.no_merge);
+    if (snii) {
+      snii_trio = build_and_report<bench::SniiAdapter>("SNII", corpus,
+                                                       args.spill_mib, args.no_merge);
+      // High-water right after the SNII build, minus the shared corpus floor.
+      snii_trio.peak_rss_mib = peak_rss_mib() - corpus_floor;
+      have_snii = true;
+    }
+    // Same threshold for CLucene: its RAM-buffer flush matches SNII's spill
+    // (apples-to-apples bounded build memory).
+    if (clu) {
+      clu_trio = build_and_report<bench::CluceneAdapter>("CLucene", corpus,
+                                                         args.spill_mib, args.no_merge);
+      clu_trio.peak_rss_mib = peak_rss_mib() - corpus_floor;
+      have_clu = true;
+    }
   } catch (const std::exception& e) {
     std::fprintf(stderr, "FATAL: resource build failed: %s\n", e.what());
     return 1;
   }
   std::printf("  peak_rss=%.1f MiB (process high-water; engine=%s)\n",
               peak_rss_mib(), args.engine.c_str());
+
+  // No JSONL / verdict requested: keep the historical print-only behaviour.
+  if (args.bench_out.empty()) return 0;
+
+  // --engine none (baseline) or a single engine cannot form a CLucene-vs-SNII
+  // verdict: emit a baseline JSONL row (no verdict) and exit 0 -- a baseline run
+  // is for RSS floor measurement, it does not gate.
+  bench::ResourceRow row;
+  row.surface = "local";
+  row.doc_count = corpus.doc_count;
+  row.seed = args.seed;
+  row.spill_mib = args.spill_mib;
+  row.git_rev = git_rev();
+  if (have_snii) row.snii = snii_trio;
+  if (have_clu) row.clucene = clu_trio;
+
+  const bool both = have_snii && have_clu;
+  if (both) {
+    row.verdict = bench::evaluate_resources(row.clucene, row.snii, row.cpu_cap,
+                                            row.rss_cap, row.disk_cap);
+  }
+
+  std::ofstream os(args.bench_out, std::ios::out | std::ios::trunc);
+  if (!os) {
+    std::fprintf(stderr, "FATAL: cannot open --bench-out path: %s\n",
+                 args.bench_out.c_str());
+    return 1;
+  }
+  bench::write_resource_jsonl(os, row);
+  os.flush();
+  if (!os) {
+    std::fprintf(stderr, "FATAL: write to --bench-out failed: %s\n",
+                 args.bench_out.c_str());
+    return 1;
+  }
+
+  if (!both) {
+    std::printf("\n=== resource baseline row -> %s (no verdict; need --engine "
+                "both) ===\n",
+                args.bench_out.c_str());
+    return 0;  // baseline run does not gate.
+  }
+
+  std::printf("\n=== resource gate (5M write-side caps cpu<=%.2fx rss<=%.2fx "
+              "disk<=%.2fx) ===\n",
+              row.cpu_cap, row.rss_cap, row.disk_cap);
+  std::printf("  cpu_ratio =%.3f  %s\n", row.verdict.cpu_ratio,
+              row.verdict.cpu_pass ? "PASS" : "FAIL");
+  std::printf("  rss_ratio =%.3f  %s\n", row.verdict.rss_ratio,
+              row.verdict.rss_pass ? "PASS" : "FAIL");
+  std::printf("  disk_ratio=%.3f  %s\n", row.verdict.disk_ratio,
+              row.verdict.disk_pass ? "PASS" : "FAIL");
+  std::printf("  verdict=%s -> %s\n",
+              row.verdict.overall_pass ? "PASS" : "FAIL", args.bench_out.c_str());
+  if (!row.verdict.overall_pass) {
+    std::fprintf(stderr, "RESOURCE GATE FAILED: a write-side axis breached its "
+                         "declared cap (see %s)\n",
+                 args.bench_out.c_str());
+    return 1;  // non-zero exit on any threshold breach.
+  }
   return 0;
 }
 

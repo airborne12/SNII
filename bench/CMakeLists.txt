@@ -126,6 +126,18 @@ if(SNII_BUILD_TESTS)
     PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
   target_link_libraries(snii_bench_scenario_gate_test PRIVATE snii_gtest snii)
 
+  # BENCH.5: write-side resource gate (evaluate_resources). Pure: no Arrow/CLucene.
+  # Links only resource_gate.cpp; snii not even needed (no IoMetrics), but kept for
+  # uniform include path. Asserts the documented 5M bounded-spill numbers + edges.
+  add_executable(snii_bench_resource_gate_test
+    ${CMAKE_CURRENT_SOURCE_DIR}/resource_gate_test.cpp
+    ${CMAKE_CURRENT_SOURCE_DIR}/resource_gate.cpp
+    ${CMAKE_CURRENT_SOURCE_DIR}/bench_jsonl.cpp
+    ${CMAKE_CURRENT_SOURCE_DIR}/metric_gate.cpp)
+  target_include_directories(snii_bench_resource_gate_test
+    PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
+  target_link_libraries(snii_bench_resource_gate_test PRIVATE snii_gtest snii)
+
   include(GoogleTest)
   gtest_discover_tests(snii_bench_corpus_loader_test)
   gtest_discover_tests(snii_bench_corpus_gen_test)
@@ -136,4 +148,5 @@ if(SNII_BUILD_TESTS)
   gtest_discover_tests(snii_bench_manifest_test)
   gtest_discover_tests(snii_bench_jsonl_test)
   gtest_discover_tests(snii_bench_scenario_gate_test)
+  gtest_discover_tests(snii_bench_resource_gate_test)
 endif()
