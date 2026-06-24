@@ -80,10 +80,22 @@ if(SNII_BUILD_TESTS)
     PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
   target_link_libraries(snii_bench_corpus_gen_test PRIVATE snii_gtest)
 
+  # BENCH.1: pure golden-metric verdict core (no Arrow/CLucene/SNII-reader).
+  # Links only metric_gate.cpp; consumes snii::io::IoMetrics from the core header.
+  add_executable(snii_bench_metric_gate_test
+    ${CMAKE_CURRENT_SOURCE_DIR}/metric_gate_test.cpp
+    ${CMAKE_CURRENT_SOURCE_DIR}/metric_gate.cpp)
+  target_include_directories(snii_bench_metric_gate_test
+    PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
+  # Links snii only to inherit its PUBLIC core/include path (IoMetrics is a
+  # header-only struct); pulls zero CLucene -- snii has no CLucene dependency.
+  target_link_libraries(snii_bench_metric_gate_test PRIVATE snii_gtest snii)
+
   include(GoogleTest)
   gtest_discover_tests(snii_bench_corpus_loader_test)
   gtest_discover_tests(snii_bench_corpus_gen_test)
   gtest_discover_tests(snii_bench_doris_english_analyzer_test)
   gtest_discover_tests(snii_bench_parallel_tokenizer_test)
   gtest_discover_tests(snii_bench_parquet_corpus_reader_test)
+  gtest_discover_tests(snii_bench_metric_gate_test)
 endif()
