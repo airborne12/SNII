@@ -24,6 +24,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <filesystem>
+#include <fstream>
 #include <map>
 #include <set>
 #include <string>
@@ -31,11 +32,13 @@
 #include <thread>
 #include <vector>
 
+#include "bench_jsonl.h"
 #include "clucene_adapter.h"
 #include "corpus_gen.h"
 #include "corpus_loader.h"
 #include "parallel_tokenizer.h"
 #include "parquet_corpus_reader.h"
+#include "scenario_gate.h"
 #include "snii/io/metered_file_reader.h"
 #include "snii_adapter.h"
 
@@ -82,6 +85,7 @@ struct Args {
   uint32_t concurrency = 0;   // >0: also run a concurrent throughput pass (N threads)
   double concurrency_seconds = 5.0;  // wall-clock duration of each concurrent pass
   uint32_t concurrency_warmup = 50;  // queries discarded per thread before timing
+  std::string bench_out;      // BENCH.4: JSONL output path for the gated scenario suite
 };
 
 Args parse_args(int argc, char** argv) {
@@ -165,6 +169,8 @@ Args parse_args(int argc, char** argv) {
     } else if (flag == "--concurrency-warmup") {
       a.concurrency_warmup = static_cast<uint32_t>(
           std::strtoul(next("--concurrency-warmup"), nullptr, 10));
+    } else if (flag == "--bench-out") {
+      a.bench_out = next("--bench-out");
     } else {
       std::fprintf(stderr, "unknown argument: %s\n", flag.c_str());
       std::exit(2);
@@ -243,6 +249,20 @@ std::string join_words(const std::vector<std::string>& w) {
 double ratio(uint64_t clucene, uint64_t snii_val) {
   if (snii_val == 0) return clucene == 0 ? 1.0 : static_cast<double>(clucene);
   return static_cast<double>(clucene) / static_cast<double>(snii_val);
+}
+
+// Best-effort git revision of the bench tree, captured into each JSONL row so a
+// gated measurement can be replayed at the exact source it was produced from.
+// Returns "unknown" if git is unavailable (never fails the run).
+std::string git_rev() {
+  std::string rev;
+  if (FILE* p = popen("git rev-parse --short HEAD 2>/dev/null", "r")) {
+    char buf[64] = {0};
+    if (std::fgets(buf, sizeof(buf), p) != nullptr) rev = buf;
+    pclose(p);
+  }
+  while (!rev.empty() && (rev.back() == '\n' || rev.back() == '\r')) rev.pop_back();
+  return rev.empty() ? std::string("unknown") : rev;
 }
 
 void print_metrics_row(const char* engine, const snii::io::IoMetrics& m) {
@@ -2148,6 +2168,15 @@ int run_scenario_mode(const Args& args) {
   std::printf("=== scenario suite (local cost-model + wall, %zu scenarios, runs=%u) ===\n",
               scenarios.size(), R);
   bool all_identical = true;
+
+  // BENCH.4: when --bench-out is set, gate each scenario against the declarative
+  // threshold manifest (per-scale, local surface) and emit one JSONL row each.
+  // overall_pass = docids_match AND every manifest metric verdict pass; the run
+  // exits non-zero iff any row fails. The JSONL is the reproducible CI artifact.
+  const bool gated = !args.bench_out.empty();
+  const std::string rev = gated ? git_rev() : std::string();
+  std::vector<bench::BenchRow> rows;
+
   for (const Scenario& s : scenarios) {
     EngineQueryResult sn, cl;
     try {
@@ -2158,6 +2187,37 @@ int run_scenario_mode(const Args& args) {
       return 1;
     }
     report_scenario(s, sn, cl, &all_identical);
+    if (gated) {
+      const bool docids_match = (sn.docids == cl.docids);
+      rows.push_back(bench::build_row(s.id, "local", corpus.doc_count, args.seed,
+                                      rev, sn.docids.size(), docids_match,
+                                      cl.metrics, sn.metrics));
+    }
+  }
+
+  if (gated) {
+    std::ofstream os(args.bench_out, std::ios::out | std::ios::trunc);
+    if (!os) {
+      std::fprintf(stderr, "FATAL: cannot open --bench-out path: %s\n",
+                   args.bench_out.c_str());
+      return 1;  // CI artifact must never fail silently.
+    }
+    for (const bench::BenchRow& row : rows) bench::write_jsonl(os, row);
+    os.flush();
+    if (!os) {
+      std::fprintf(stderr, "FATAL: write to --bench-out failed: %s\n",
+                   args.bench_out.c_str());
+      return 1;
+    }
+    const bool pass = bench::all_passed(rows);
+    std::printf("\n=== gate: %zu rows, verdict=%s -> %s ===\n", rows.size(),
+                pass ? "PASS" : "FAIL", args.bench_out.c_str());
+    if (!pass) {
+      std::fprintf(stderr, "BENCH GATE FAILED: one or more scenarios breached "
+                           "their declared threshold (see %s)\n",
+                   args.bench_out.c_str());
+      return 1;  // non-zero exit on any threshold breach.
+    }
   }
 
   // Concurrent throughput matrix: single (N=1) vs concurrent (N threads), per
