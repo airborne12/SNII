@@ -91,6 +91,17 @@ if(SNII_BUILD_TESTS)
   # header-only struct); pulls zero CLucene -- snii has no CLucene dependency.
   target_link_libraries(snii_bench_metric_gate_test PRIVATE snii_gtest snii)
 
+  # BENCH.2: declarative threshold manifest (pure data + lookup, no Arrow/CLucene).
+  # Links metric_gate.cpp (MetricThreshold/GateCmp) + bench_manifest.cpp; snii only
+  # for the PUBLIC core/include path (no CLucene dependency).
+  add_executable(snii_bench_manifest_test
+    ${CMAKE_CURRENT_SOURCE_DIR}/bench_manifest_test.cpp
+    ${CMAKE_CURRENT_SOURCE_DIR}/bench_manifest.cpp
+    ${CMAKE_CURRENT_SOURCE_DIR}/metric_gate.cpp)
+  target_include_directories(snii_bench_manifest_test
+    PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
+  target_link_libraries(snii_bench_manifest_test PRIVATE snii_gtest snii)
+
   include(GoogleTest)
   gtest_discover_tests(snii_bench_corpus_loader_test)
   gtest_discover_tests(snii_bench_corpus_gen_test)
@@ -98,4 +109,5 @@ if(SNII_BUILD_TESTS)
   gtest_discover_tests(snii_bench_parallel_tokenizer_test)
   gtest_discover_tests(snii_bench_parquet_corpus_reader_test)
   gtest_discover_tests(snii_bench_metric_gate_test)
+  gtest_discover_tests(snii_bench_manifest_test)
 endif()
