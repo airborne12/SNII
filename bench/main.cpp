@@ -42,6 +42,7 @@
 #include "parallel_tokenizer.h"
 #include "parquet_corpus_reader.h"
 #include "resource_gate.h"
+#include "run_header.h"
 #include "scenario_gate.h"
 #include "snii/io/metered_file_reader.h"
 #include "snii_adapter.h"
@@ -266,7 +267,17 @@ std::string git_rev() {
     pclose(p);
   }
   while (!rev.empty() && (rev.back() == '\n' || rev.back() == '\r')) rev.pop_back();
-  return rev.empty() ? std::string("unknown") : rev;
+  if (rev.empty()) return std::string("unknown");
+  // Flag measurements taken on an uncommitted working tree: a non-empty
+  // `git status --porcelain` means the rev alone does not pin the code, so a
+  // "-dirty" suffix warns a CI diff the row is not reproducible from the rev.
+  if (FILE* p = popen("git status --porcelain 2>/dev/null", "r")) {
+    char buf[8] = {0};
+    const bool dirty = std::fgets(buf, sizeof(buf), p) != nullptr;
+    pclose(p);
+    if (dirty) rev += "-dirty";
+  }
+  return rev;
 }
 
 void print_metrics_row(const char* engine, const snii::io::IoMetrics& m) {
@@ -2403,6 +2414,18 @@ int run_scenario_mode(const Args& args) {
                    args.bench_out.c_str());
       return 1;  // CI artifact must never fail silently.
     }
+    // BENCH.7: the FIRST line is the self-describing run-header (seed, scales,
+    // surfaces, git rev, harness version, manifest fingerprint) so the JSONL
+    // replays the exact code + thresholds the rows were gated under. The local
+    // scenario leg runs at this one corpus scale and the local surface.
+    bench::RunHeader header;
+    header.git_rev = rev;
+    header.seed = args.seed;
+    header.scales = {corpus.doc_count};
+    header.surfaces = {"local"};
+    header.harness_version = "snii-bench-suite/1";
+    header.manifest_hash = bench::manifest_hash();
+    bench::write_run_header(os, header);
     for (const bench::BenchRow& row : rows) bench::write_jsonl(os, row);
     os.flush();
     if (!os) {

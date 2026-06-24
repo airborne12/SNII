@@ -148,6 +148,20 @@ if(SNII_BUILD_TESTS)
     PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
   target_link_libraries(snii_bench_oss_gate_test PRIVATE snii_gtest snii)
 
+  # BENCH.7: reproducible run-header serializer + manifest fingerprint. Pure: no
+  # Arrow/CLucene/S3. Links run_header.cpp + bench_jsonl.cpp (json_escape) +
+  # bench_manifest.cpp + metric_gate.cpp (the manifest it fingerprints); snii only
+  # for the PUBLIC core/include path (IoMetrics header-only struct).
+  add_executable(snii_bench_run_header_test
+    ${CMAKE_CURRENT_SOURCE_DIR}/run_header_test.cpp
+    ${CMAKE_CURRENT_SOURCE_DIR}/run_header.cpp
+    ${CMAKE_CURRENT_SOURCE_DIR}/bench_jsonl.cpp
+    ${CMAKE_CURRENT_SOURCE_DIR}/bench_manifest.cpp
+    ${CMAKE_CURRENT_SOURCE_DIR}/metric_gate.cpp)
+  target_include_directories(snii_bench_run_header_test
+    PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
+  target_link_libraries(snii_bench_run_header_test PRIVATE snii_gtest snii)
+
   include(GoogleTest)
   gtest_discover_tests(snii_bench_corpus_loader_test)
   gtest_discover_tests(snii_bench_corpus_gen_test)
@@ -160,4 +174,5 @@ if(SNII_BUILD_TESTS)
   gtest_discover_tests(snii_bench_scenario_gate_test)
   gtest_discover_tests(snii_bench_resource_gate_test)
   gtest_discover_tests(snii_bench_oss_gate_test)
+  gtest_discover_tests(snii_bench_run_header_test)
 endif()
