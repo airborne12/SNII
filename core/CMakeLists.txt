@@ -19,7 +19,7 @@ find_path(ZSTD_INCLUDE_DIR zstd.h PATHS ${_dt_installed_candidates} PATH_SUFFIXE
   NO_DEFAULT_PATH REQUIRED)
 find_library(ZSTD_LIB NAMES zstd libzstd.a PATHS ${_dt_installed_candidates} PATH_SUFFIXES lib
   NO_DEFAULT_PATH REQUIRED)
-target_include_directories(snii PUBLIC ${ZSTD_INCLUDE_DIR})
+target_include_directories(snii SYSTEM PUBLIC ${ZSTD_INCLUDE_DIR})
 target_link_libraries(snii PUBLIC ${ZSTD_LIB})
 
 # CRoaring (for the null-bitmap POD), from the doris-thirdparty install dir.
@@ -27,13 +27,13 @@ find_path(ROARING_INCLUDE_DIR roaring/roaring.hh PATHS ${_dt_installed_candidate
   PATH_SUFFIXES include NO_DEFAULT_PATH REQUIRED)
 find_library(ROARING_LIB NAMES roaring libroaring.a PATHS ${_dt_installed_candidates}
   PATH_SUFFIXES lib NO_DEFAULT_PATH REQUIRED)
-target_include_directories(snii PUBLIC ${ROARING_INCLUDE_DIR})
+target_include_directories(snii SYSTEM PUBLIC ${ROARING_INCLUDE_DIR})
 target_link_libraries(snii PUBLIC ${ROARING_LIB})
 
 # xxHash header (used header-only via XXH_INLINE_ALL by the block-split bloom filter).
 find_path(XXHASH_INCLUDE_DIR xxhash.h PATHS ${_dt_installed_candidates}
   PATH_SUFFIXES include NO_DEFAULT_PATH REQUIRED)
-target_include_directories(snii PUBLIC ${XXHASH_INCLUDE_DIR})
+target_include_directories(snii SYSTEM PUBLIC ${XXHASH_INCLUDE_DIR})
 
 # S3 / OSS backend (optional). When OFF, s3_object_store.cpp is still picked up by
 # the GLOB above but compiles to an empty TU (its body is #ifdef SNII_WITH_S3),

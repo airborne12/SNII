@@ -40,7 +40,7 @@ endif()
 
 if(NOT TARGET snii_clucene)
   add_library(snii_clucene INTERFACE)
-  target_include_directories(snii_clucene INTERFACE
+  target_include_directories(snii_clucene SYSTEM INTERFACE
     "${_clucene_src}/core" "${_clucene_src}/shared" "${_clucene_cfg}")
   target_link_libraries(snii_clucene INTERFACE ${_required_libs} pthread dl m)
 endif()

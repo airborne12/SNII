@@ -80,6 +80,12 @@ TEST(S3ObjectStoreTest, RoundTrip) {
   EXPECT_FALSE(reader.read_at(payload.size(), 1, &oob).ok());
 }
 
+TEST(S3ObjectStoreTest, RejectsNullBatchOutputBeforeNetwork) {
+  snii::io::S3FileReader reader;
+  const snii::Status st = reader.read_batch({snii::io::Range{0, 1}}, nullptr);
+  EXPECT_EQ(st.code(), snii::StatusCode::kInvalidArgument) << st.to_string();
+}
+
 }  // namespace
 
 #endif  // SNII_WITH_S3

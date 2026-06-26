@@ -54,8 +54,7 @@ Status decode_section_refs(Slice payload, SectionRefs* out) {
 void encode_header(uint64_t index_id, const std::string& suffix, uint32_t flags,
                    ByteSink* sink) {
   ByteSink head;
-  head.put_u8(static_cast<uint8_t>(kMetaFormatVersion & 0xFF));
-  head.put_u8(static_cast<uint8_t>((kMetaFormatVersion >> 8) & 0xFF));
+  head.put_fixed16(kMetaFormatVersion);
   head.put_varint64(index_id);
   head.put_varint32(static_cast<uint32_t>(suffix.size()));
   head.put_bytes(Slice(suffix));
@@ -69,12 +68,8 @@ void encode_header(uint64_t index_id, const std::string& suffix, uint32_t flags,
 Status decode_header(Slice block, ByteSource* src, uint64_t* index_id,
                      std::string* suffix, uint32_t* flags) {
   size_t start = src->position();
-  uint8_t lo = 0;
-  uint8_t hi = 0;
-  SNII_RETURN_IF_ERROR(src->get_u8(&lo));
-  SNII_RETURN_IF_ERROR(src->get_u8(&hi));
-  uint16_t version = static_cast<uint16_t>(lo) |
-                     (static_cast<uint16_t>(hi) << 8);
+  uint16_t version = 0;
+  SNII_RETURN_IF_ERROR(src->get_fixed16(&version));
   if (version != kMetaFormatVersion) {
     return Status::Corruption("per_index_meta: unsupported meta_format_version");
   }

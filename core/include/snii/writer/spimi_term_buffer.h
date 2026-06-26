@@ -198,11 +198,11 @@ class SpimiTermBuffer {
   uint64_t total_tokens() const { return total_tokens_; }
   bool has_positions() const { return has_positions_; }
 
-  // OK unless a spill / merge I/O or corruption error, or an out-of-range
-  // term-id, occurred. The streaming for_each_term_sorted swallows such errors
-  // (its callback signature has no return); callers MUST check this after
-  // draining to detect a failed build.
-  Status status() const { return spill_status_; }
+  // OK unless an add_token validation error (out-of-range term-id, wrong vocab
+  // mode) was latched. for_each_term_sorted now returns its own I/O Status
+  // directly; callers that use add_token's latch-and-report pattern MUST check
+  // this after draining to surface input-side validation errors.
+  [[nodiscard]] Status status() const { return spill_status_; }
 
   // TEST-ONLY: number of spill run files written so far (== 0 in pure in-memory
   // mode). Lets tests assert that a gate-2 spill actually fired once the REAL
@@ -221,10 +221,11 @@ class SpimiTermBuffer {
   // TermPostings at a time and freeing that term's accumulated arrays before
   // moving to the next. This keeps at most a single term's postings duplicated,
   // avoiding the input+output coexistence peak. MUST be called at most once: it
-  // drains internal state. A SECOND drain invokes `fn` zero times and latches an
-  // error into status() (a re-merge of the still-present run files would otherwise
-  // re-emit every term).
-  void for_each_term_sorted(const std::function<void(TermPostings&&)>& fn);
+  // drains internal state. A SECOND drain invokes `fn` zero times and returns
+  // an Internal error (a re-merge of the still-present run files would otherwise
+  // re-emit every term). Returns non-OK on spill/merge I/O or corruption errors,
+  // or if a prior add_token latched a validation error into status().
+  Status for_each_term_sorted(const std::function<void(TermPostings&&)>& fn);
 
  private:
   // Compact per-term accumulator: ONE tagged-varint arena chain plus a few cursors.
@@ -276,7 +277,7 @@ class SpimiTermBuffer {
   // sorted terms stream positions via pos_pump (valid only because the callback
   // consumes each term synchronously while the arena is still resident); callers
   // that RETAIN the TermPostings past the drain (finalize_sorted) must pass false.
-  void drain_sorted(const std::function<void(TermPostings&&)>& fn,
+  Status drain_sorted(const std::function<void(TermPostings&&)>& fn,
                     bool allow_stream_positions);
   // Spills the current buffer to a fresh sorted run file and clears memory.
   Status spill_to_run();
@@ -297,7 +298,7 @@ class SpimiTermBuffer {
   // merged term streams positions via pos_pump (valid only because fn consumes
   // synchronously while the run readers stay parked); callers that RETAIN the
   // TermPostings past the merge (finalize_sorted) MUST pass false.
-  void merge_runs(const std::function<void(TermPostings&&)>& fn,
+  Status merge_runs(const std::function<void(TermPostings&&)>& fn,
                   bool allow_stream_positions);
   // Deletes every temp run file; called from the destructor (RAII cleanup).
   void cleanup_runs();

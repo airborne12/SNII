@@ -4,6 +4,10 @@
 
 namespace snii {
 
+void ByteSink::put_fixed16(uint16_t v) {
+  for (int i = 0; i < 2; ++i) buf_.push_back(static_cast<uint8_t>(v >> (8 * i)));
+}
+
 void ByteSink::put_fixed32(uint32_t v) {
   for (int i = 0; i < 4; ++i) buf_.push_back(static_cast<uint8_t>(v >> (8 * i)));
 }

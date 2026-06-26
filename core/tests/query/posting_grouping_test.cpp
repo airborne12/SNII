@@ -272,7 +272,7 @@ std::vector<uint32_t> DecodePerWindow(const LogicalIndexReader& idx,
     // One read round per window (the un-grouped reader could not coalesce across
     // the interleaved freq regions of the old layout).
     snii::io::BatchRangeFetcher fetcher(idx.reader(), /*coalesce_gap=*/0);
-    const size_t h = fetcher.add(r.dd_off, static_cast<size_t>(r.dd_len));
+    const size_t h = fetcher.add(r.dd_off, r.dd_len);
     EXPECT_TRUE(fetcher.fetch().ok());
     std::vector<uint32_t> wd, wf;
     std::vector<std::vector<uint32_t>> wp;

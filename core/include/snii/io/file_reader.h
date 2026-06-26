@@ -6,6 +6,7 @@
 
 #include "snii/common/slice.h"
 #include "snii/common/status.h"
+#include "snii/io/io_metrics.h"
 
 namespace snii::io {
 
@@ -40,6 +41,9 @@ class FileReader {
 
   // Total size of the underlying object in bytes.
   virtual uint64_t size() const = 0;
+
+  // Optional live metrics. Readers that do not account I/O return nullptr.
+  virtual const IoMetrics* io_metrics() const { return nullptr; }
 };
 
 }  // namespace snii::io

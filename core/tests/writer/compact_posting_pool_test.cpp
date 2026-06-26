@@ -22,7 +22,7 @@ struct Chain {
 
 // Reads back the whole chain into a vector for comparison.
 std::vector<uint8_t> ReadChain(const CompactPostingPool& pool, uint32_t head,
-                               uint32_t len) {
+                               uint64_t len) {
   std::vector<uint8_t> out;
   out.reserve(len);
   CompactPostingPool::Cursor c = pool.cursor(head, len);
@@ -75,8 +75,7 @@ TEST(CompactPostingPool, InterleavedChainsIndependent) {
     expect[c].push_back(b);
   }
   for (int i = 0; i < kChains; ++i) {
-    EXPECT_EQ(ReadChain(pool, chains[i].head, static_cast<uint32_t>(expect[i].size())),
-              expect[i])
+    EXPECT_EQ(ReadChain(pool, chains[i].head, expect[i].size()), expect[i])
         << "chain " << i;
   }
 }
@@ -100,8 +99,7 @@ TEST(CompactPostingPool, ManyChainsAcrossBlockBoundaries) {
     expect[c].push_back(b);
   }
   for (int i = 0; i < kChains; ++i) {
-    EXPECT_EQ(ReadChain(pool, chains[i].head, static_cast<uint32_t>(expect[i].size())),
-              expect[i])
+    EXPECT_EQ(ReadChain(pool, chains[i].head, expect[i].size()), expect[i])
         << "chain " << i;
   }
 }
@@ -162,7 +160,7 @@ TEST(CompactPostingPool, CursorOverLargeBudgetSelfTerminates) {
   for (uint8_t b : data) ch.put(&pool, b);
 
   // (1) exact-length budget round-trips the written bytes.
-  EXPECT_EQ(ReadChain(pool, ch.head, static_cast<uint32_t>(data.size())), data);
+  EXPECT_EQ(ReadChain(pool, ch.head, data.size()), data);
 
   // (2) MISUSE: a budget far larger than the payload. The cursor must self-terminate at
   // the chain tail, yielding at most the level-0 slice's payload region and stopping.
@@ -284,8 +282,7 @@ TEST(CompactPostingPool, AllocRunExactBlockFillStartsFreshBlock) {
   // Every chain laid down in block 0 must still round-trip -- proving the case-(c)
   // allocation did NOT return offset 0 and overwrite block 0's live bytes.
   for (size_t i = 0; i < chains.size(); ++i) {
-    EXPECT_EQ(ReadChain(pool, chains[i].head, static_cast<uint32_t>(data[i].size())),
-              data[i])
+    EXPECT_EQ(ReadChain(pool, chains[i].head, data[i].size()), data[i])
         << "block-0 chain " << i << " corrupted across the exact block boundary";
   }
 }

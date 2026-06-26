@@ -62,7 +62,7 @@ endforeach()
 
 if(NOT TARGET snii_aws)
   add_library(snii_aws INTERFACE)
-  target_include_directories(snii_aws INTERFACE "${AWSSDK_ROOT}/include")
+  target_include_directories(snii_aws SYSTEM INTERFACE "${AWSSDK_ROOT}/include")
   # Wrap the archives in a single link group to resolve circular references, then
   # add the platform system libraries the aws sdk depends on.
   target_link_libraries(snii_aws INTERFACE

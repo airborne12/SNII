@@ -12,6 +12,7 @@ namespace snii {
 class ByteSink {
  public:
   void put_u8(uint8_t v) { buf_.push_back(v); }
+  void put_fixed16(uint16_t v);
   void put_fixed32(uint32_t v);
   void put_fixed64(uint64_t v);
   void put_varint32(uint32_t v);

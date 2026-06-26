@@ -130,6 +130,10 @@ class SniiAdapter {
   void phrase_prefix_query(const std::vector<std::string>& fixed,
                            const std::vector<std::string>& expansions,
                            std::vector<uint32_t>* docids, snii::io::IoMetrics* metrics);
+  void phrase_prefix_query_prefix(const std::vector<std::string>& fixed,
+                                  const std::string& prefix,
+                                  std::vector<uint32_t>* docids,
+                                  snii::io::IoMetrics* metrics);
 
   // On-disk byte size of the built .idx container (0 if not built).
   uint64_t index_bytes() const;

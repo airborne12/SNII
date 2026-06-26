@@ -44,6 +44,12 @@ std::wstring widen(const std::string& s) {
   throw std::runtime_error("CLucene adapter: " + what);
 }
 
+int tokenized_field_config() {
+  constexpr int kStoreNo = cl_doc::Field::STORE_NO;
+  constexpr int kIndexTokenized = cl_doc::Field::INDEX_TOKENIZED;
+  return kStoreNo | kIndexTokenized;
+}
+
 std::string make_temp_dir() {
   static int counter = 0;
   return "/tmp/snii_bench_cl_" + std::to_string(::getpid()) + "_" +
@@ -329,8 +335,7 @@ void CluceneAdapter::build_range(const std::string& dir, const Corpus& c,
     auto* reader = _CLNEW lucene::util::SStringReader<char>();
 
     const std::wstring field_name = widen("body");
-    int32_t field_config =
-        cl_doc::Field::STORE_NO | cl_doc::Field::INDEX_TOKENIZED;
+    const int field_config = tokenized_field_config();
     auto* doc = _CLNEW cl_doc::Document();
     auto* field = _CLNEW cl_doc::Field(field_name.c_str(), field_config);
     // Keyword (docs-only) omits freq/positions; tokenized keeps them for phrase.

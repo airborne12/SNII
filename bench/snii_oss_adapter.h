@@ -44,6 +44,7 @@ class SniiOssAdapter {
 
   // The OSS object key (prefix + "/" + key) that was uploaded, for cleanup.
   const std::string& uploaded_key() const { return uploaded_key_; }
+  uint64_t index_bytes() const { return index_bytes_; }
 
   // Bytes of the block-split bloom XFilter section (0 if none) -- lets the bench
   // report the L0/L1 tier (resident iff <= kBsbfResidentMaxBytes).
@@ -80,9 +81,14 @@ class SniiOssAdapter {
   void phrase_prefix_query(const std::vector<std::string>& fixed,
                            const std::vector<std::string>& expansions,
                            std::vector<uint32_t>* docids, snii::io::IoMetrics* metrics);
+  void phrase_prefix_query_prefix(const std::vector<std::string>& fixed,
+                                  const std::string& prefix,
+                                  std::vector<uint32_t>* docids,
+                                  snii::io::IoMetrics* metrics);
 
  private:
   bool docs_only_ = false;
+  uint64_t index_bytes_ = 0;
   std::string local_path_;   // temp local .idx (removed in dtor)
   std::string uploaded_key_;  // full OSS key (prefix + "/" + key)
   std::string object_key_;    // raw key for S3FileReader::open / open_uploaded

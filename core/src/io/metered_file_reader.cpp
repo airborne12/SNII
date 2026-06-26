@@ -5,8 +5,8 @@
 namespace snii::io {
 namespace {
 
-// Inclusive [first, last] block ids touched by [offset, offset+len). Empty len
-// touches no block (returns first > last via the caller's len==0 guard).
+// Inclusive [first, last] block ids touched by a validated [offset, offset+len).
+// Empty len touches no block (callers guard len==0 before calling this).
 void block_range(uint64_t offset, size_t len, size_t block_size, uint64_t* first,
                  uint64_t* last) {
   *first = offset / block_size;
@@ -21,6 +21,16 @@ MeteredFileReader::MeteredFileReader(FileReader* inner, size_t block_size)
 void MeteredFileReader::reset_metrics() {
   resident_.clear();
   metrics_ = IoMetrics{};
+}
+
+Status MeteredFileReader::validate_range(uint64_t offset, size_t len) const {
+  if (inner_ == nullptr) return Status::InvalidArgument("metered: null inner reader");
+  if (block_size_ == 0) return Status::InvalidArgument("metered: zero block size");
+  const uint64_t total = inner_->size();
+  if (offset > total || len > total - offset) {
+    return Status::Corruption("metered: read range past end");
+  }
+  return Status::OK();
 }
 
 // Accounts the FileCache effect of touching [offset, offset+len): newly missed
@@ -53,6 +63,8 @@ bool MeteredFileReader::account_blocks(uint64_t offset, size_t len) {
 
 Status MeteredFileReader::read_at(uint64_t offset, size_t len,
                                   std::vector<uint8_t>* out) {
+  if (out == nullptr) return Status::InvalidArgument("metered: null out");
+  SNII_RETURN_IF_ERROR(validate_range(offset, len));
   ++metrics_.read_at_calls;
   metrics_.total_request_bytes += len;
   // A single blocking read: any miss forces one serial round (the next offset is
@@ -63,6 +75,11 @@ Status MeteredFileReader::read_at(uint64_t offset, size_t len,
 
 Status MeteredFileReader::read_batch(const std::vector<Range>& ranges,
                                      std::vector<std::vector<uint8_t>>* outs) {
+  if (outs == nullptr) return Status::InvalidArgument("metered: null batch out");
+  for (const Range& r : ranges) {
+    SNII_RETURN_IF_ERROR(validate_range(r.offset, r.len));
+  }
+
   // Gather the union of touched blocks so coalescing spans the whole batch, and
   // the entire batch counts as at most one serial round.
   std::vector<uint64_t> blocks;

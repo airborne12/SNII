@@ -8,6 +8,7 @@
 #include "snii/common/slice.h"
 #include "snii/common/status.h"
 #include "snii/encoding/byte_sink.h"
+#include "snii/encoding/byte_source.h"
 #include "snii/encoding/section_framer.h"
 #include "snii/format/dict_block_directory.h"
 #include "snii/format/format_constants.h"
@@ -187,8 +188,9 @@ TEST(PerIndexMeta, HeaderStartsWithMetaFormatVersion) {
   auto bytes = BuildMeta(7, "x", {"a"}, {{0, 1, 1, 0, 0}});
   ASSERT_GE(bytes.size(), 2u);
   // u16 meta_format_version, little-endian, is the first field.
-  uint16_t ver = static_cast<uint16_t>(bytes[0]) |
-                 (static_cast<uint16_t>(bytes[1]) << 8);
+  ByteSource src{Slice(bytes)};
+  uint16_t ver = 0;
+  ASSERT_TRUE(src.get_fixed16(&ver).ok());
   EXPECT_EQ(ver, kMetaFormatVersion);
 }
 

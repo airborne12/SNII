@@ -6,14 +6,18 @@
 
 #include <algorithm>
 #include <cstdio>
+#include <iterator>
 #include <stdexcept>
 #include <utility>
 #include <vector>
 
+#include "docid_range.h"
 #include "snii/common/slice.h"
 #include "snii/format/format_constants.h"
 #include "snii/io/local_file.h"
+#include "snii/query/boolean_query.h"
 #include "snii/query/phrase_query.h"
+#include "snii/query/prefix_query.h"
 #include "snii/query/term_query.h"
 #include "snii/writer/snii_compound_writer.h"
 #include "snii/writer/spimi_term_buffer.h"
@@ -28,7 +32,9 @@ std::string make_temp_path() {
 }
 
 std::string make_object_key() {
-  return "snii_" + std::to_string(::getpid()) + ".idx";
+  static int counter = 0;
+  return "snii_" + std::to_string(::getpid()) + "_" +
+         std::to_string(counter++) + ".idx";
 }
 
 [[noreturn]] void fail(const std::string& what, const snii::Status& s) {
@@ -91,6 +97,7 @@ void SniiOssAdapter::build_upload_and_open(const Corpus& c,
   if (Status s = read_whole_file(local_path_, &idx_bytes); !s.ok()) {
     fail("read local .idx", s);
   }
+  index_bytes_ = idx_bytes.size();
   const std::string key = make_object_key();
   {
     io::S3FileWriter w;
@@ -165,26 +172,17 @@ void SniiOssAdapter::boolean_or(const std::vector<std::string>& terms,
                                 snii::io::IoMetrics* metrics) {
   metered_->reset_metrics();
   docids->clear();
-  std::vector<uint32_t> acc;
-  for (const std::string& t : terms) {
-    std::vector<uint32_t> d;
-    if (snii::Status s = snii::query::term_query(*index_, t, &d); !s.ok()) {
-      fail("boolean_or(" + t + ")", s);
-    }
-    std::vector<uint32_t> merged;
-    merged.reserve(acc.size() + d.size());
-    std::set_union(acc.begin(), acc.end(), d.begin(), d.end(),
-                   std::back_inserter(merged));
-    acc = std::move(merged);
+  if (snii::Status s = snii::query::boolean_or(*index_, terms, docids); !s.ok()) {
+    fail("boolean_or", s);
   }
-  *docids = std::move(acc);
   *metrics = metered_->metrics();
 }
 
 void SniiOssAdapter::match_all(std::vector<uint32_t>* docids,
                                snii::io::IoMetrics* metrics) {
   metered_->reset_metrics();
-  const uint32_t n = index_->stats().doc_count;
+  const uint32_t n = require_uint32_doc_count(index_->stats().doc_count,
+                                              "SNII OSS adapter");
   docids->resize(n);
   for (uint32_t i = 0; i < n; ++i) (*docids)[i] = i;
   *metrics = metered_->metrics();
@@ -195,23 +193,9 @@ void SniiOssAdapter::prefix_query(const std::string& prefix,
                                   snii::io::IoMetrics* metrics) {
   metered_->reset_metrics();
   docids->clear();
-  std::vector<snii::reader::LogicalIndexReader::PrefixHit> hits;
-  if (snii::Status s = index_->prefix_terms(prefix, &hits); !s.ok()) {
-    fail("prefix_terms", s);
+  if (snii::Status s = snii::query::prefix_query(*index_, prefix, docids); !s.ok()) {
+    fail("prefix_query", s);
   }
-  std::vector<uint32_t> acc;
-  for (const auto& h : hits) {
-    std::vector<uint32_t> d;
-    if (snii::Status s = snii::query::term_query(*index_, h.term, &d); !s.ok()) {
-      fail("prefix term_query(" + h.term + ")", s);
-    }
-    std::vector<uint32_t> merged;
-    merged.reserve(acc.size() + d.size());
-    std::set_union(acc.begin(), acc.end(), d.begin(), d.end(),
-                   std::back_inserter(merged));
-    acc = std::move(merged);
-  }
-  *docids = std::move(acc);
   *metrics = metered_->metrics();
 }
 
@@ -248,6 +232,20 @@ void SniiOssAdapter::phrase_prefix_query(const std::vector<std::string>& fixed,
     acc = std::move(merged);
   }
   *docids = std::move(acc);
+  *metrics = metered_->metrics();
+}
+
+void SniiOssAdapter::phrase_prefix_query_prefix(
+    const std::vector<std::string>& fixed, const std::string& prefix,
+    std::vector<uint32_t>* docids, snii::io::IoMetrics* metrics) {
+  metered_->reset_metrics();
+  docids->clear();
+  std::vector<std::string> terms = fixed;
+  terms.push_back(prefix);
+  if (snii::Status s = snii::query::phrase_prefix_query(*index_, terms, docids);
+      !s.ok()) {
+    fail("phrase_prefix_query", s);
+  }
   *metrics = metered_->metrics();
 }
 

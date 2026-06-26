@@ -123,3 +123,33 @@ TEST(MeteredFileReader, ResetClearsCacheAndCounters) {
   EXPECT_EQ(m.metrics().serial_rounds, 1u);
   EXPECT_EQ(m.metrics().remote_bytes, 16u);
 }
+
+TEST(MeteredFileReader, InvalidRangeDoesNotPolluteMetrics) {
+  LocalFileReader inner;
+  ASSERT_TRUE(inner.open(MakeRampFile()).ok());
+  MeteredFileReader m(&inner, 16);
+
+  std::vector<uint8_t> out;
+  const Status st = m.read_at(250, 16, &out);
+  EXPECT_EQ(st.code(), StatusCode::kCorruption) << st.to_string();
+  EXPECT_EQ(m.metrics().read_at_calls, 0u);
+  EXPECT_EQ(m.metrics().serial_rounds, 0u);
+  EXPECT_EQ(m.metrics().range_gets, 0u);
+  EXPECT_EQ(m.metrics().remote_bytes, 0u);
+  EXPECT_EQ(m.metrics().total_request_bytes, 0u);
+}
+
+TEST(MeteredFileReader, InvalidBatchRangeDoesNotPolluteMetrics) {
+  LocalFileReader inner;
+  ASSERT_TRUE(inner.open(MakeRampFile()).ok());
+  MeteredFileReader m(&inner, 16);
+
+  std::vector<std::vector<uint8_t>> outs;
+  const Status st = m.read_batch({Range{0, 4}, Range{250, 16}}, &outs);
+  EXPECT_EQ(st.code(), StatusCode::kCorruption) << st.to_string();
+  EXPECT_EQ(m.metrics().read_at_calls, 0u);
+  EXPECT_EQ(m.metrics().serial_rounds, 0u);
+  EXPECT_EQ(m.metrics().range_gets, 0u);
+  EXPECT_EQ(m.metrics().remote_bytes, 0u);
+  EXPECT_EQ(m.metrics().total_request_bytes, 0u);
+}

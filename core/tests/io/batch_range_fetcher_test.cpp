@@ -1,6 +1,7 @@
 #include <gtest/gtest.h>
 
 #include <cstdint>
+#include <limits>
 #include <string>
 #include <vector>
 
@@ -83,4 +84,21 @@ TEST(BatchRangeFetcher, ClearAndReuse) {
   size_t h = f.add(64, 8);
   ASSERT_TRUE(f.fetch().ok());
   EXPECT_EQ(f.get(h)[0], 64u);
+}
+
+TEST(BatchRangeFetcher, RejectsOverflowingRangeEnd) {
+  LocalFileReader inner;
+  ASSERT_TRUE(inner.open(MakeRampFile()).ok());
+
+  BatchRangeFetcher f(&inner);
+  f.add(std::numeric_limits<uint64_t>::max() - 1, 8);
+  const Status st = f.fetch();
+  EXPECT_EQ(st.code(), StatusCode::kCorruption) << st.to_string();
+}
+
+TEST(BatchRangeFetcher, RejectsNullReaderAtFetch) {
+  BatchRangeFetcher f(nullptr);
+  f.add(0, 1);
+  const Status st = f.fetch();
+  EXPECT_EQ(st.code(), StatusCode::kInvalidArgument) << st.to_string();
 }

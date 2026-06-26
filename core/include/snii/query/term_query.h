@@ -5,6 +5,7 @@
 #include <vector>
 
 #include "snii/common/status.h"
+#include "snii/query/query_profile.h"
 #include "snii/reader/logical_index_reader.h"
 
 // term_query -- the simplest SNII query: return the sorted docid set that
@@ -13,7 +14,9 @@
 // Absent term -> empty result (OK status).
 namespace snii::query {
 
-Status term_query(const snii::reader::LogicalIndexReader& idx,
-                  std::string_view term, std::vector<uint32_t>* docids);
+Status term_query(const snii::reader::LogicalIndexReader& idx, std::string_view term,
+                  std::vector<uint32_t>* docids);
+Status term_query(const snii::reader::LogicalIndexReader& idx, std::string_view term,
+                  std::vector<uint32_t>* docids, QueryProfile* profile);
 
 }  // namespace snii::query

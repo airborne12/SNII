@@ -5,6 +5,7 @@
 #include <vector>
 
 #include "snii/common/status.h"
+#include "snii/query/query_profile.h"
 #include "snii/reader/logical_index_reader.h"
 
 // phrase_query -- MATCH_PHRASE: return the sorted docid set in which the terms
@@ -19,8 +20,20 @@
 namespace snii::query {
 
 Status phrase_query(const snii::reader::LogicalIndexReader& idx,
-                    const std::vector<std::string>& terms,
-                    std::vector<uint32_t>* docids);
+                    const std::vector<std::string>& terms, std::vector<uint32_t>* docids);
+Status phrase_query(const snii::reader::LogicalIndexReader& idx,
+                    const std::vector<std::string>& terms, std::vector<uint32_t>* docids,
+                    QueryProfile* profile);
+
+// phrase_prefix_query -- MATCH_PHRASE_PREFIX: the last item in `terms` is a term
+// prefix and preceding items are exact terms. For example {"quick", "bro"}
+// matches "quick brown" and "quick bronze". Empty terms -> empty result.
+Status phrase_prefix_query(const snii::reader::LogicalIndexReader& idx,
+                           const std::vector<std::string>& terms,
+                           std::vector<uint32_t>* docids);
+Status phrase_prefix_query(const snii::reader::LogicalIndexReader& idx,
+                           const std::vector<std::string>& terms,
+                           std::vector<uint32_t>* docids, QueryProfile* profile);
 
 // boolean_and (MATCH all-terms): sorted docid set of docs containing EVERY term,
 // no positional constraint. Reuses the docid-only conjunction (min-df driver +
@@ -28,7 +41,9 @@ Status phrase_query(const snii::reader::LogicalIndexReader& idx,
 // with selectivity rather than df. Valid on docs-only indexes. Empty terms or any
 // absent term -> empty result.
 Status boolean_and(const snii::reader::LogicalIndexReader& idx,
-                   const std::vector<std::string>& terms,
-                   std::vector<uint32_t>* docids);
+                   const std::vector<std::string>& terms, std::vector<uint32_t>* docids);
+Status boolean_and(const snii::reader::LogicalIndexReader& idx,
+                   const std::vector<std::string>& terms, std::vector<uint32_t>* docids,
+                   QueryProfile* profile);
 
 }  // namespace snii::query

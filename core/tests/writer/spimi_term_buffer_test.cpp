@@ -91,7 +91,7 @@ TEST(SpimiTermBuffer, StreamingMatchesMaterialized) {
 
   std::vector<TermPostings> material = mat.finalize_sorted();
   std::vector<TermPostings> streamed;
-  strm.for_each_term_sorted([&](TermPostings&& tp) { streamed.push_back(std::move(tp)); });
+  EXPECT_TRUE(strm.for_each_term_sorted([&](TermPostings&& tp) { streamed.push_back(std::move(tp)); }).ok());
 
   ASSERT_EQ(material.size(), streamed.size());
   for (size_t i = 0; i < material.size(); ++i) {
@@ -235,11 +235,11 @@ TEST(SpimiTermBuffer, StreamingDrainsAndShrinks) {
   EXPECT_EQ(buf.unique_terms(), 3u);
   std::vector<size_t> remaining_after_each;
   size_t seen = 0;
-  buf.for_each_term_sorted([&](TermPostings&& tp) {
+  EXPECT_TRUE(buf.for_each_term_sorted([&](TermPostings&& tp) {
     ++seen;
     EXPECT_EQ(tp.docids.size(), 100u);
     remaining_after_each.push_back(buf.unique_terms());
-  });
+  }).ok());
   EXPECT_EQ(seen, 3u);
   // After consuming each of the 3 terms, the live count drops 2,1,0.
   EXPECT_EQ(remaining_after_each, (std::vector<size_t>{2u, 1u, 0u}));
@@ -382,9 +382,9 @@ TEST(SpimiTermBuffer, DoubleDrainIsRejected) {
   EXPECT_TRUE(second.empty());
   EXPECT_FALSE(buf.status().ok());
 
-  // for_each_term_sorted after a drain also emits nothing.
+  // for_each_term_sorted after a drain also emits nothing; now returns an error.
   size_t seen = 0;
-  buf.for_each_term_sorted([&](TermPostings&&) { ++seen; });
+  EXPECT_FALSE(buf.for_each_term_sorted([&](TermPostings&&) { ++seen; }).ok());
   EXPECT_EQ(seen, 0u);
 }
 
@@ -394,7 +394,7 @@ TEST(SpimiTermBuffer, DoubleDrainStreamingThenMaterialized) {
   buf.add_token("a", 0, 0);
 
   size_t seen = 0;
-  buf.for_each_term_sorted([&](TermPostings&&) { ++seen; });
+  EXPECT_TRUE(buf.for_each_term_sorted([&](TermPostings&&) { ++seen; }).ok());
   EXPECT_EQ(seen, 1u);
   EXPECT_TRUE(buf.status().ok());
 
@@ -423,7 +423,7 @@ TEST(SpimiTermBuffer, AscendingInputByteIdenticalAcrossDrains) {
 
   std::vector<TermPostings> material = mat.finalize_sorted();
   std::vector<TermPostings> streamed;
-  strm.for_each_term_sorted([&](TermPostings&& tp) { streamed.push_back(std::move(tp)); });
+  EXPECT_TRUE(strm.for_each_term_sorted([&](TermPostings&& tp) { streamed.push_back(std::move(tp)); }).ok());
 
   ASSERT_EQ(material.size(), streamed.size());
   for (size_t i = 0; i < material.size(); ++i) {

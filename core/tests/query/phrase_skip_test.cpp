@@ -1,4 +1,5 @@
 #include <gtest/gtest.h>
+#include <unistd.h>
 
 #include <algorithm>
 #include <cstdint>
@@ -6,7 +7,6 @@
 #include <map>
 #include <set>
 #include <string>
-#include <unistd.h>
 #include <vector>
 
 #include "snii/common/status.h"
@@ -54,8 +54,8 @@ std::string TempPath() {
 }
 
 constexpr uint32_t kDocCount = 60000;
-constexpr uint32_t kHiGap = 24;       // aa_hi at 0, 24, 48 ... -> 2500 occurrences
-constexpr uint32_t kHiCount = 2500;   // df of aa_hi (>512 -> windowed, 10 windows)
+constexpr uint32_t kHiGap = 24;      // aa_hi at 0, 24, 48 ... -> 2500 occurrences
+constexpr uint32_t kHiCount = 2500;  // df of aa_hi (>512 -> windowed, 10 windows)
 // The 5-term phrase is planted only in the FIRST kPhraseSpan occurrences of
 // aa_hi, concentrating its candidate docids into the first window(s).
 constexpr uint32_t kPhraseSpan = 150;
@@ -71,7 +71,10 @@ struct Corpus {
     for (size_t i = 0; i + phrase.size() <= toks.size(); ++i) {
       bool match = true;
       for (size_t k = 0; k < phrase.size(); ++k) {
-        if (toks[i + k] != phrase[k]) { match = false; break; }
+        if (toks[i + k] != phrase[k]) {
+          match = false;
+          break;
+        }
       }
       if (match) return true;
     }
@@ -218,7 +221,8 @@ std::vector<uint32_t> FullReadPhrase(const LogicalIndexReader& idx,
                           posts[t].docids.end(), std::back_inserter(next));
     cand.swap(next);
   }
-  auto positions_for = [](const FullPosting& p, uint32_t d) -> const std::vector<uint32_t>& {
+  auto positions_for = [](const FullPosting& p,
+                          uint32_t d) -> const std::vector<uint32_t>& {
     const auto it = std::lower_bound(p.docids.begin(), p.docids.end(), d);
     return p.positions[static_cast<size_t>(it - p.docids.begin())];
   };
@@ -235,7 +239,10 @@ std::vector<uint32_t> FullReadPhrase(const LogicalIndexReader& idx,
           break;
         }
       }
-      if (ok) { hit = true; break; }
+      if (ok) {
+        hit = true;
+        break;
+      }
     }
     if (hit) out.push_back(d);
   }
@@ -295,10 +302,10 @@ TEST(BooleanAnd, EqualsTermIntersection) {
   };
 
   const std::vector<std::vector<std::string>> cases = {
-      {"aa_hi", "aa_quick"},            // high + low df
+      {"aa_hi", "aa_quick"},  // high + low df
       {"aa_quick", "aa_brown", "aa_fox"},
-      {"aa_hi", "nope_absent"},         // absent term -> empty
-      {"aa_hi"},                        // single term -> its docs
+      {"aa_hi", "nope_absent"},  // absent term -> empty
+      {"aa_hi"},                 // single term -> its docs
   };
   for (const auto& terms : cases) {
     std::string label;
@@ -306,7 +313,8 @@ TEST(BooleanAnd, EqualsTermIntersection) {
     std::vector<uint32_t> got;
     ASSERT_TRUE(query::boolean_and(idx, terms, &got).ok()) << label;
     EXPECT_TRUE(std::is_sorted(got.begin(), got.end())) << label;
-    EXPECT_EQ(got, intersect_terms(terms)) << "boolean_and != term-intersection: [" << label << "]";
+    EXPECT_EQ(got, intersect_terms(terms))
+        << "boolean_and != term-intersection: [" << label << "]";
   }
   std::remove(path.c_str());
 }
@@ -353,7 +361,7 @@ TEST(PrefixTerms, OrderedEnumerationMatchesFilterAndLookup) {
     for (const auto& h : hits) v.push_back(h.term);
     return v;
   };
-  for (const std::string& pfx : {"aa_", "aa_h", "zz_", "zz_0", "alpha"})
+  for (const char* pfx : {"aa_", "aa_h", "zz_", "zz_0", "alpha"})
     EXPECT_EQ(scanned(pfx), filtered(pfx)) << "prefix=" << pfx;
   std::vector<LogicalIndexReader::PrefixHit> none;
   ASSERT_TRUE(idx.prefix_terms("zzzznope", &none).ok());
@@ -392,10 +400,10 @@ TEST(PhraseSkip, SkippingEqualsOracleAndFullRead) {
       {"aa_lazy", "aa_dog"},                                    // no high-df term
       {"aa_brown", "aa_fox"},                                   // sub-phrase
       {"aa_fox", "aa_brown"},                                   // reversed -> absent
-      {"aa_hi", "aa_lazy"},                                     // present terms, absent phrase
-      {"aa_quick", "aa_jumps"},                                 // non-consecutive -> absent
-      {"aa_hi"},                                                // single high-df term
-      {"nope", "missing"},                                      // absent terms -> empty
+      {"aa_hi", "aa_lazy"},      // present terms, absent phrase
+      {"aa_quick", "aa_jumps"},  // non-consecutive -> absent
+      {"aa_hi"},                 // single high-df term
+      {"nope", "missing"},       // absent terms -> empty
   };
 
   for (const auto& p : phrases) {
@@ -417,8 +425,8 @@ TEST(PhraseSkip, SkippingEqualsOracleAndFullRead) {
   // The low-df lead "aa_quick" concentrates candidates into the first window(s)
   // of "aa_hi", so the skip path reads only those windows + the prelude, NOT the
   // whole posting. Compare against a full-read of the same phrase.
-  const std::vector<std::string> hi_phrase = {"aa_hi", "aa_quick", "aa_brown",
-                                              "aa_fox", "aa_jumps"};
+  const std::vector<std::string> hi_phrase = {"aa_hi", "aa_quick", "aa_brown", "aa_fox",
+                                              "aa_jumps"};
   metered.reset_metrics();
   std::vector<uint32_t> got;
   ASSERT_TRUE(query::phrase_query(idx, hi_phrase, &got).ok());

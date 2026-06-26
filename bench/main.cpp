@@ -18,29 +18,39 @@
 
 #include <algorithm>
 #include <chrono>
+#include <cinttypes>
 #include <cstdint>
 #include <cctype>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <filesystem>
-#include <map>
-#include <set>
+#include <fstream>
+#include <iterator>
 #include <string>
 #include <atomic>
 #include <thread>
+#include <unordered_map>
+#include <utility>
 #include <vector>
 
+#include "bench_jsonl.h"
+#include "bench_manifest.h"
 #include "clucene_adapter.h"
 #include "corpus_gen.h"
 #include "corpus_loader.h"
+#include "oss_gate.h"
 #include "parallel_tokenizer.h"
 #include "parquet_corpus_reader.h"
+#include "resource_gate.h"
+#include "run_header.h"
+#include "scenario_gate.h"
 #include "snii/io/metered_file_reader.h"
 #include "snii_adapter.h"
 
 #ifdef SNII_WITH_S3
 #include "clucene_oss_adapter.h"
+#include "clucene_oss_sharded_adapter.h"
 #include "oss_cleanup.h"
 #include "snii/io/s3_object_store.h"
 #include "snii_oss_adapter.h"
@@ -55,6 +65,7 @@ struct Args {
   uint32_t doclen = 12;
   uint64_t seed = 42;
   bool oss = false;  // run the real-OSS wall-clock comparison instead of local
+  bool oss_report_only = false;  // --oss: 打印 gate breach，但不把它转成非零退出
   uint32_t repeat = 1;  // --oss: re-measure each query N times for a distribution
   bool resources = false;     // measure index size / build CPU / peak RSS
   std::string engine = "both";  // --resources scope: snii | clucene | none | both
@@ -82,7 +93,33 @@ struct Args {
   uint32_t concurrency = 0;   // >0: also run a concurrent throughput pass (N threads)
   double concurrency_seconds = 5.0;  // wall-clock duration of each concurrent pass
   uint32_t concurrency_warmup = 50;  // queries discarded per thread before timing
+  std::string bench_out;      // BENCH.4: JSONL output path for the gated scenario suite
 };
+
+// 一个已解析的 benchmark 场景。`words` 保存 phrase tokens（kPhrase）或
+// term 列表（kAnd / kOr）；`term` 保存单 term（kTerm）。
+enum class SKind { kTerm, kPhrase, kAnd, kOr, kMatchAll };
+struct Scenario {
+  std::string id;
+  SKind kind = SKind::kTerm;
+  std::string term;
+  std::vector<std::string> words;
+};
+
+std::vector<Scenario> resolve_scenarios(const bench::Corpus& c);
+
+// 按场景类型分发一次查询，single run 和 concurrent run 共用同一入口。
+template <class Adapter>
+void run_one(Adapter& idx, const Scenario& s, std::vector<uint32_t>* docids,
+             snii::io::IoMetrics* metrics) {
+  switch (s.kind) {
+    case SKind::kTerm: idx.term_query(s.term, docids, metrics); break;
+    case SKind::kPhrase: idx.phrase_query(s.words, docids, metrics); break;
+    case SKind::kAnd: idx.boolean_and(s.words, docids, metrics); break;
+    case SKind::kOr: idx.boolean_or(s.words, docids, metrics); break;
+    case SKind::kMatchAll: idx.match_all(docids, metrics); break;
+  }
+}
 
 Args parse_args(int argc, char** argv) {
   Args a;
@@ -108,6 +145,8 @@ Args parse_args(int argc, char** argv) {
       a.seed = std::strtoull(next("--seed"), nullptr, 10);
     } else if (flag == "--oss") {
       a.oss = true;
+    } else if (flag == "--oss-report-only") {
+      a.oss_report_only = true;
     } else if (flag == "--repeat") {
       a.repeat =
           static_cast<uint32_t>(std::strtoul(next("--repeat"), nullptr, 10));
@@ -165,6 +204,8 @@ Args parse_args(int argc, char** argv) {
     } else if (flag == "--concurrency-warmup") {
       a.concurrency_warmup = static_cast<uint32_t>(
           std::strtoul(next("--concurrency-warmup"), nullptr, 10));
+    } else if (flag == "--bench-out") {
+      a.bench_out = next("--bench-out");
     } else {
       std::fprintf(stderr, "unknown argument: %s\n", flag.c_str());
       std::exit(2);
@@ -178,18 +219,25 @@ Args parse_args(int argc, char** argv) {
 class Oracle {
  public:
   explicit Oracle(const bench::Corpus& c) : corpus_(c) {
+    term_to_id_.reserve(c.vocab.size());
+    term_docs_.resize(c.vocab.size());
+    for (uint32_t tid = 0; tid < c.vocab.size(); ++tid) {
+      term_to_id_.emplace(c.vocab[tid], tid);
+    }
     for (uint32_t d = 0; d < c.doc_count; ++d) {
-      std::set<uint32_t> seen;
-      for (uint32_t tid : c.docs[d]) {
-        if (seen.insert(tid).second) term_docs_[c.vocab[tid]].insert(d);
-      }
+      // 同一 doc 内去重后按 docid 递增追加，生成的 postings 天然有序。
+      std::vector<uint32_t> unique_terms = c.docs[d];
+      std::sort(unique_terms.begin(), unique_terms.end());
+      unique_terms.erase(std::unique(unique_terms.begin(), unique_terms.end()),
+                         unique_terms.end());
+      for (uint32_t tid : unique_terms) term_docs_[tid].push_back(d);
     }
   }
 
   std::vector<uint32_t> term(const std::string& t) const {
-    const auto it = term_docs_.find(t);
-    if (it == term_docs_.end()) return {};
-    return {it->second.begin(), it->second.end()};
+    const auto it = term_to_id_.find(t);
+    if (it == term_to_id_.end()) return {};
+    return term_docs_[it->second];
   }
 
   std::vector<uint32_t> phrase(const std::vector<std::string>& words) const {
@@ -201,7 +249,63 @@ class Oracle {
     return out;
   }
 
+  std::vector<uint32_t> match_all() const {
+    std::vector<uint32_t> out(corpus_.doc_count);
+    for (uint32_t d = 0; d < corpus_.doc_count; ++d) out[d] = d;
+    return out;
+  }
+
+  std::vector<uint32_t> boolean_and(
+      const std::vector<std::string>& terms) const {
+    if (terms.empty()) return {};
+    std::vector<uint32_t> out = term(terms.front());
+    for (size_t i = 1; i < terms.size() && !out.empty(); ++i) {
+      std::vector<uint32_t> next;
+      const std::vector<uint32_t> rhs = term(terms[i]);
+      std::set_intersection(out.begin(), out.end(), rhs.begin(), rhs.end(),
+                            std::back_inserter(next));
+      out = std::move(next);
+    }
+    return out;
+  }
+
+  std::vector<uint32_t> boolean_or(const std::vector<std::string>& terms) const {
+    std::vector<uint32_t> out;
+    for (const std::string& t : terms) {
+      out = union_docids(out, term(t));
+    }
+    return out;
+  }
+
+  std::vector<uint32_t> prefix(const std::string& pfx) const {
+    std::vector<uint32_t> out;
+    for (uint32_t tid = 0; tid < corpus_.vocab.size(); ++tid) {
+      const std::string& term = corpus_.vocab[tid];
+      if (term.rfind(pfx, 0) == 0) out = union_docids(out, term_docs_[tid]);
+    }
+    return out;
+  }
+
+  std::vector<uint32_t> phrase_prefix(
+      const std::vector<std::string>& fixed,
+      const std::string& tail_prefix) const {
+    std::vector<uint32_t> out;
+    for (uint32_t d = 0; d < corpus_.doc_count; ++d) {
+      if (phrase_prefix_in_doc(d, fixed, tail_prefix)) out.push_back(d);
+    }
+    return out;
+  }
+
  private:
+  static std::vector<uint32_t> union_docids(const std::vector<uint32_t>& lhs,
+                                            const std::vector<uint32_t>& rhs) {
+    std::vector<uint32_t> out;
+    out.reserve(lhs.size() + rhs.size());
+    std::set_union(lhs.begin(), lhs.end(), rhs.begin(), rhs.end(),
+                   std::back_inserter(out));
+    return out;
+  }
+
   bool phrase_in_doc(uint32_t d, const std::vector<std::string>& words) const {
     const auto& toks = corpus_.docs[d];
     if (toks.size() < words.size()) return false;
@@ -218,9 +322,42 @@ class Oracle {
     return false;
   }
 
+  bool phrase_prefix_in_doc(uint32_t d,
+                            const std::vector<std::string>& fixed,
+                            const std::string& tail_prefix) const {
+    const auto& toks = corpus_.docs[d];
+    const size_t query_len = fixed.size() + 1;
+    if (toks.size() < query_len) return false;
+    for (size_t i = 0; i + query_len <= toks.size(); ++i) {
+      bool fixed_match = true;
+      for (size_t k = 0; k < fixed.size(); ++k) {
+        if (corpus_.vocab[toks[i + k]] != fixed[k]) {
+          fixed_match = false;
+          break;
+        }
+      }
+      if (!fixed_match) continue;
+      const std::string& tail = corpus_.vocab[toks[i + fixed.size()]];
+      if (tail.rfind(tail_prefix, 0) == 0) return true;
+    }
+    return false;
+  }
+
   const bench::Corpus& corpus_;
-  std::map<std::string, std::set<uint32_t>> term_docs_;
+  std::unordered_map<std::string, uint32_t> term_to_id_;
+  std::vector<std::vector<uint32_t>> term_docs_;
 };
+
+std::vector<uint32_t> oracle_for(const Oracle& oracle, const Scenario& s) {
+  switch (s.kind) {
+    case SKind::kTerm: return oracle.term(s.term);
+    case SKind::kPhrase: return oracle.phrase(s.words);
+    case SKind::kAnd: return oracle.boolean_and(s.words);
+    case SKind::kOr: return oracle.boolean_or(s.words);
+    case SKind::kMatchAll: return oracle.match_all();
+  }
+  return {};
+}
 
 struct QueryResult {
   std::string label;
@@ -243,6 +380,35 @@ std::string join_words(const std::vector<std::string>& w) {
 double ratio(uint64_t clucene, uint64_t snii_val) {
   if (snii_val == 0) return clucene == 0 ? 1.0 : static_cast<double>(clucene);
   return static_cast<double>(clucene) / static_cast<double>(snii_val);
+}
+
+double ratio(double clucene, double snii_val) {
+  if (snii_val == 0.0) return clucene == 0.0 ? 1.0 : clucene;
+  return clucene / snii_val;
+}
+
+// Best-effort git revision of the bench tree, captured into each JSONL row so a
+// gated measurement can be replayed at the exact source it was produced from.
+// Returns "unknown" if git is unavailable (never fails the run).
+std::string git_rev() {
+  std::string rev;
+  if (FILE* p = popen("git rev-parse --short HEAD 2>/dev/null", "r")) {
+    char buf[64] = {0};
+    if (std::fgets(buf, sizeof(buf), p) != nullptr) rev = buf;
+    pclose(p);
+  }
+  while (!rev.empty() && (rev.back() == '\n' || rev.back() == '\r')) rev.pop_back();
+  if (rev.empty()) return std::string("unknown");
+  // Flag measurements taken on an uncommitted working tree: a non-empty
+  // `git status --porcelain` means the rev alone does not pin the code, so a
+  // "-dirty" suffix warns a CI diff the row is not reproducible from the rev.
+  if (FILE* p = popen("git status --porcelain 2>/dev/null", "r")) {
+    char buf[8] = {0};
+    const bool dirty = std::fgets(buf, sizeof(buf), p) != nullptr;
+    pclose(p);
+    if (dirty) rev += "-dirty";
+  }
+  return rev;
 }
 
 void print_metrics_row(const char* engine, const snii::io::IoMetrics& m) {
@@ -272,29 +438,79 @@ struct OssQueryResult {
   bool docids_match = false;
 };
 
+struct OssTimedSample {
+  double wall_ms = 0.0;
+  snii::io::IoMetrics metrics;
+  std::vector<uint32_t> docids;
+};
+
+std::vector<double> sample_walls(const std::vector<OssTimedSample>& samples) {
+  std::vector<double> out;
+  out.reserve(samples.size());
+  for (const OssTimedSample& s : samples) out.push_back(s.wall_ms);
+  return out;
+}
+
+OssTimedSample median_sample(std::vector<OssTimedSample> samples) {
+  std::sort(samples.begin(), samples.end(),
+            [](const OssTimedSample& lhs, const OssTimedSample& rhs) {
+              return lhs.wall_ms < rhs.wall_ms;
+            });
+  return samples[samples.size() / 2];
+}
+
 double ms_since(std::chrono::steady_clock::time_point t0) {
   return std::chrono::duration<double, std::milli>(
              std::chrono::steady_clock::now() - t0)
       .count();
 }
 
-// Builds the OSS connection config. Credentials are read from the environment
-// (SNII_OSS_AK / SNII_OSS_SK) and never hardcoded. A per-run prefix suffix keeps
-// concurrent runs from colliding on the same object keys.
+// 构建 OSS/S3 连接配置。凭证只从环境变量读取，不硬编码。每次运行追加独立
+// prefix suffix，避免并发运行写入同名 object key。
 bool build_oss_config(snii::io::S3Config* cfg) {
-  const char* ak = std::getenv("SNII_OSS_AK");
-  const char* sk = std::getenv("SNII_OSS_SK");
-  if (ak == nullptr || sk == nullptr || ak[0] == '\0' || sk[0] == '\0') {
+  auto env = [](const char* name) -> const char* {
+    const char* v = std::getenv(name);
+    return v != nullptr && v[0] != '\0' ? v : nullptr;
+  };
+  auto pick = [&](const char* primary, const char* fallback,
+                  const char* default_value) -> std::string {
+    if (const char* v = env(primary); v != nullptr) return v;
+    if (const char* v = env(fallback); v != nullptr) return v;
+    return default_value;
+  };
+  auto pick_timeout = [&](const char* name, long default_value) -> long {
+    if (const char* v = env(name); v != nullptr) {
+      return std::strtol(v, nullptr, 10);
+    }
+    return default_value;
+  };
+  const char* ak = env("SNII_OSS_AK");
+  if (ak == nullptr) ak = env("STORE_AK");
+  if (ak == nullptr) ak = env("AWS_ACCESS_KEY_ID");
+  const char* sk = env("SNII_OSS_SK");
+  if (sk == nullptr) sk = env("STORE_SK");
+  if (sk == nullptr) sk = env("AWS_SECRET_ACCESS_KEY");
+  if (ak == nullptr || sk == nullptr) {
     std::fprintf(stderr,
-                 "FATAL: --oss requires SNII_OSS_AK and SNII_OSS_SK in the "
+                 "FATAL: --oss requires SNII_OSS_AK/SK or STORE_AK/SK in the "
                  "environment\n");
     return false;
   }
-  cfg->endpoint = "oss-cn-hongkong.aliyuncs.com";
-  cfg->region = "cn-hongkong";
-  cfg->bucket = "doris-community-test";
-  cfg->prefix = "cloud_regression/snii_oss_bench/run_" +
+  cfg->endpoint = pick("SNII_OSS_ENDPOINT", "STORE_ENDPOINT",
+                       "oss-cn-hongkong.aliyuncs.com");
+  cfg->region = pick("SNII_OSS_REGION", "STORE_REGION", "cn-hongkong");
+  cfg->bucket = pick("SNII_OSS_BUCKET", "STORE_BUCKET", "doris-community-test");
+  std::string prefix =
+      pick("SNII_OSS_PREFIX", "STORE_PREFIX", "cloud_regression/snii_oss_bench");
+  while (!prefix.empty() && prefix.back() == '/') prefix.pop_back();
+  cfg->prefix = prefix + "/run_" +
                 std::to_string(static_cast<long long>(::getpid()));
+  cfg->connect_timeout_ms =
+      pick_timeout("SNII_OSS_CONNECT_TIMEOUT_MS", cfg->connect_timeout_ms);
+  cfg->request_timeout_ms =
+      pick_timeout("SNII_OSS_REQUEST_TIMEOUT_MS", cfg->request_timeout_ms);
+  cfg->http_request_timeout_ms = pick_timeout(
+      "SNII_OSS_HTTP_REQUEST_TIMEOUT_MS", cfg->http_request_timeout_ms);
   cfg->ak = ak;
   cfg->sk = sk;
   return true;
@@ -327,12 +543,69 @@ void print_wall_distribution(const char* engine, std::vector<double> samples) {
               engine, n, samples.front(), med, p90, sum / static_cast<double>(n));
 }
 
+// Emits exactly one surface=oss JSONL line for a single gated OSS query: the two
+// engines' median wall_ms + serial_rounds/request_bytes (the SAME cost-model
+// yardstick), the noise-tolerant OssVerdict, and the reproduction metadata
+// (scenario id, doc_count scale, seed, git rev, wall-floor). Integer metrics are
+// written as integer literals; doubles use %.6g (never sci-notation). Mirrors the
+// escaping/precision convention of bench_jsonl / resource_gate.
+void write_oss_jsonl(std::ostream& os, const char* scenario_id,
+                     uint32_t doc_count, uint64_t seed, const std::string& rev,
+                     size_t hits, double cl_median_ms, double sn_median_ms,
+                     const snii::io::IoMetrics& cl, const snii::io::IoMetrics& sn,
+                     const bench::OssVerdict& v) {
+  auto u64 = [&os](const char* k, uint64_t val) {
+    char b[32];
+    std::snprintf(b, sizeof(b), "%" PRIu64, val);
+    os << '"' << k << "\":" << b;
+  };
+  auto dbl = [&os](const char* k, double val) {
+    char b[32];
+    std::snprintf(b, sizeof(b), "%.6g", val);
+    os << '"' << k << "\":" << b;
+  };
+  auto boolean = [&os](const char* k, bool val) {
+    os << '"' << k << "\":" << (val ? "true" : "false");
+  };
+  os << '{';
+  os << "\"metric_kind\":\"oss\",";
+  os << "\"surface\":\"oss\",";
+  os << "\"scenario_id\":\"" << bench::json_escape(scenario_id) << "\",";
+  u64("doc_count", doc_count); os << ',';
+  u64("seed", seed); os << ',';
+  os << "\"git_rev\":\"" << bench::json_escape(rev) << "\",";
+  u64("hits", hits); os << ',';
+  os << "\"clucene\":{";
+  dbl("median_wall_ms", cl_median_ms); os << ',';
+  u64("serial_rounds", cl.serial_rounds); os << ',';
+  u64("range_gets", cl.range_gets); os << ',';
+  u64("total_request_bytes", cl.total_request_bytes);
+  os << "},";
+  os << "\"snii\":{";
+  dbl("median_wall_ms", sn_median_ms); os << ',';
+  u64("serial_rounds", sn.serial_rounds); os << ',';
+  u64("range_gets", sn.range_gets); os << ',';
+  u64("total_request_bytes", sn.total_request_bytes);
+  os << "},";
+  os << "\"verdict\":{";
+  dbl("wall_ratio_cl_over_snii", v.wall_ratio_cl_over_snii); os << ',';
+  dbl("min_wall_ratio", v.min_wall_ratio); os << ',';
+  boolean("wall_pass", v.wall_pass); os << ',';
+  boolean("rounds_pass", v.rounds_pass); os << ',';
+  boolean("docids_pass", v.docids_pass); os << ',';
+  boolean("overall_pass", v.overall_pass);
+  os << "},";
+  boolean("overall_pass", v.overall_pass);
+  os << "}\n";
+}
+
 // Runs the full real-OSS comparison. Returns the process exit code (0 on success
 // with all docids matching, nonzero otherwise).
 // Concurrent S3 throughput matrix (defined after run_concurrent below). Each worker
 // opens its OWN S3 reader chain over the already-uploaded index via open_uploaded.
 void run_oss_concurrent(const Args& args, const bench::Corpus& corpus,
                         const snii::io::S3Config& cfg, const std::string& snii_key,
+                        const std::string& clu_prefix,
                         const std::vector<std::string>& clu_names);
 
 int run_oss_mode(const Args& args, const bench::Corpus& corpus,
@@ -348,7 +621,8 @@ int run_oss_mode(const Args& args, const bench::Corpus& corpus,
               cfg.bucket.c_str(), cfg.prefix.c_str());
 
   bench::SniiOssAdapter snii_idx;
-  bench::CluceneOssAdapter cl_idx;
+  bench::CluceneOssShardedAdapter cl_idx;
+  cl_idx.set_no_merge(args.no_merge);
   std::vector<std::string> all_keys;  // for best-effort cleanup at the end
   try {
     std::printf("building + uploading SNII index to OSS...\n");
@@ -368,12 +642,22 @@ int run_oss_mode(const Args& args, const bench::Corpus& corpus,
     }
     all_keys.push_back(snii_idx.uploaded_key());
 
-    std::printf("building + uploading CLucene index to OSS...\n");
+    std::printf("building + uploading CLucene index to OSS%s%s...\n",
+                args.no_merge ? " (no-merge)" : "",
+                args.shard_docs != 0 ? " (sharded)" : "");
     t0 = std::chrono::steady_clock::now();
-    cl_idx.build_upload_and_open(corpus, cfg);
-    std::printf("  CLucene uploaded %zu files in %.0f ms\n",
-                cl_idx.uploaded_keys().size(), ms_since(t0));
+    cl_idx.build_upload_and_open(corpus, cfg, args.shard_docs);
+    std::printf("  CLucene uploaded %zu files across %zu shard(s) in %.0f ms\n",
+                cl_idx.uploaded_keys().size(), cl_idx.shard_count(), ms_since(t0));
     for (const std::string& k : cl_idx.uploaded_keys()) all_keys.push_back(k);
+    const double mib = 1024.0 * 1024.0;
+    std::printf("index size: SNII=%llu bytes (%.1f MiB) CLucene=%llu bytes "
+                "(%.1f MiB) CLucene/SNII=%.2f\n",
+                static_cast<unsigned long long>(snii_idx.index_bytes()),
+                static_cast<double>(snii_idx.index_bytes()) / mib,
+                static_cast<unsigned long long>(cl_idx.index_bytes()),
+                static_cast<double>(cl_idx.index_bytes()) / mib,
+                ratio(cl_idx.index_bytes(), snii_idx.index_bytes()));
   } catch (const std::exception& e) {
     std::fprintf(stderr, "FATAL: OSS index build/upload failed: %s\n", e.what());
     bench::oss_delete_objects(cfg, all_keys);
@@ -395,7 +679,7 @@ int run_oss_mode(const Args& args, const bench::Corpus& corpus,
   std::vector<OssQueryResult> results;
   bool all_match = true;
 
-  auto run_term = [&](const std::string& label, const std::string& term) {
+  auto run_term = [&](const std::string& label, const std::string& term) -> bool {
     OssQueryResult r;
     r.label = label + " '" + term + "'";
     std::vector<uint32_t> sdoc, cdoc;
@@ -409,8 +693,8 @@ int run_oss_mode(const Args& args, const bench::Corpus& corpus,
     } catch (const std::exception& e) {
       std::fprintf(stderr, "FATAL: OSS term query '%s' failed: %s\n",
                    term.c_str(), e.what());
-      bench::oss_delete_objects(cfg, all_keys);
-      std::exit(1);
+      all_match = false;
+      return false;
     }
     const std::vector<uint32_t> odoc = oracle.term(term);
     r.hits = sdoc.size();
@@ -422,9 +706,10 @@ int run_oss_mode(const Args& args, const bench::Corpus& corpus,
                    r.label.c_str(), sdoc.size(), cdoc.size(), odoc.size());
     }
     results.push_back(r);
+    return true;
   };
 
-  auto run_phrase = [&](const std::vector<std::string>& words) {
+  auto run_phrase = [&](const std::vector<std::string>& words) -> bool {
     OssQueryResult r;
     r.label = "PHRASE '" + join_words(words) + "'";
     std::vector<uint32_t> sdoc, cdoc;
@@ -437,8 +722,8 @@ int run_oss_mode(const Args& args, const bench::Corpus& corpus,
       r.clucene_wall_ms = ms_since(t0);
     } catch (const std::exception& e) {
       std::fprintf(stderr, "FATAL: OSS phrase query failed: %s\n", e.what());
-      bench::oss_delete_objects(cfg, all_keys);
-      std::exit(1);
+      all_match = false;
+      return false;
     }
     const std::vector<uint32_t> odoc = oracle.phrase(words);
     r.hits = sdoc.size();
@@ -450,19 +735,32 @@ int run_oss_mode(const Args& args, const bench::Corpus& corpus,
                    sdoc.size(), cdoc.size(), odoc.size());
     }
     results.push_back(r);
+    return true;
   };
 
-  run_term("TERM high-df", high_term);
-  run_term("TERM mid-df", mid_term);
-  run_term("TERM low-df", low_term);
+  if (!run_term("TERM high-df", high_term) ||
+      !run_term("TERM mid-df", mid_term) ||
+      !run_term("TERM low-df", low_term)) {
+    const size_t removed = bench::oss_delete_objects(cfg, all_keys);
+    std::printf("\ncleanup: removed %zu / %zu OSS objects\n", removed,
+                all_keys.size());
+    return 1;
+  }
   if (!phrase.empty()) {
-    run_phrase(phrase);
+    if (!run_phrase(phrase)) {
+      const size_t removed = bench::oss_delete_objects(cfg, all_keys);
+      std::printf("\ncleanup: removed %zu / %zu OSS objects\n", removed,
+                  all_keys.size());
+      return 1;
+    }
   } else {
     std::fprintf(stderr, "WARNING: no 5-token phrase found in corpus\n");
   }
 
   // --- Boolean / match-all / prefix / match_phrase_prefix on the tokenized index. ---
-  auto run_op2 = [&](const std::string& label, auto snii_fn, auto clu_fn) {
+  auto run_op2 = [&](const std::string& label,
+                     const std::vector<uint32_t>& odoc, auto snii_fn,
+                     auto clu_fn) {
     OssQueryResult r;
     r.label = label;
     std::vector<uint32_t> sdoc, cdoc;
@@ -476,20 +774,24 @@ int run_oss_mode(const Args& args, const bench::Corpus& corpus,
     } catch (const std::exception& e) {
       std::fprintf(stderr, "WARNING: OSS op '%s' failed: %s\n", label.c_str(),
                    e.what());
+      all_match = false;
+      r.docids_match = false;
+      results.push_back(r);
       return;
     }
     r.hits = sdoc.size();
-    r.docids_match = (sdoc == cdoc);
+    r.docids_match = (sdoc == cdoc) && (sdoc == odoc);
     if (!r.docids_match) {
       all_match = false;
-      std::fprintf(stderr, "MISMATCH on %s: snii=%zu clucene=%zu\n", label.c_str(),
-                   sdoc.size(), cdoc.size());
+      std::fprintf(stderr,
+                   "MISMATCH on %s: snii=%zu clucene=%zu oracle=%zu\n",
+                   label.c_str(), sdoc.size(), cdoc.size(), odoc.size());
     }
     results.push_back(r);
   };
 
   const std::vector<std::string> and_terms = {high_term, low_term};
-  run_op2("AND high+low",
+  run_op2("AND high+low", oracle.boolean_and(and_terms),
           [&](std::vector<uint32_t>* d, snii::io::IoMetrics* m) {
             snii_idx.boolean_and(and_terms, d, m);
           },
@@ -497,14 +799,14 @@ int run_oss_mode(const Args& args, const bench::Corpus& corpus,
             cl_idx.boolean_and(and_terms, d, m);
           });
   const std::vector<std::string> or_terms = {high_term, mid_term, low_term};
-  run_op2("OR high+mid+low",
+  run_op2("OR high+mid+low", oracle.boolean_or(or_terms),
           [&](std::vector<uint32_t>* d, snii::io::IoMetrics* m) {
             snii_idx.boolean_or(or_terms, d, m);
           },
           [&](std::vector<uint32_t>* d, snii::io::IoMetrics* m) {
             cl_idx.boolean_or(or_terms, d, m);
           });
-  run_op2("MATCH-ALL",
+  run_op2("MATCH-ALL", oracle.match_all(),
           [&](std::vector<uint32_t>* d, snii::io::IoMetrics* m) {
             snii_idx.match_all(d, m);
           },
@@ -512,17 +814,29 @@ int run_oss_mode(const Args& args, const bench::Corpus& corpus,
             cl_idx.match_all(d, m);
           });
 
-  // Bounded prefix (<=200 expansions) from a real word, via SNII's enumeration.
-  auto bounded_prefix = [&](const std::string& w) -> std::string {
-    for (size_t L = 1; L <= w.size(); ++L) {
-      std::string p = w.substr(0, L);
-      if (snii_idx.enumerate_prefix(p).size() <= 200) return p;
+  auto corpus_prefix_expansions = [&](const std::string& prefix) {
+    std::vector<std::string> out;
+    for (const std::string& term : corpus.vocab) {
+      if (term.rfind(prefix, 0) == 0) out.push_back(term);
     }
-    return w;
+    return out;
   };
-  const std::string pfx = bounded_prefix(high_term);
+
+  // 从真实词选择 expansion 数量受控（<=200）的 prefix。这里使用内存词表，
+  // 避免在正式 PrefixQuery 计时前额外触发一次 OSS 词典扫描。
+  auto bounded_prefix = [&](const std::vector<std::string>& words) -> std::string {
+    for (const std::string& w : words) {
+      for (size_t L = 1; L <= w.size(); ++L) {
+        std::string p = w.substr(0, L);
+        const size_t expansions = corpus_prefix_expansions(p).size();
+        if (expansions != 0 && expansions <= 200) return p;
+      }
+    }
+    return std::string();
+  };
+  const std::string pfx = bounded_prefix({mid_term, low_term, high_term});
   if (!pfx.empty()) {
-    run_op2("PREFIX '" + pfx + "*'",
+    run_op2("PREFIX '" + pfx + "*'", oracle.prefix(pfx),
             [&](std::vector<uint32_t>* d, snii::io::IoMetrics* m) {
               snii_idx.prefix_query(pfx, d, m);
             },
@@ -532,22 +846,27 @@ int run_oss_mode(const Args& args, const bench::Corpus& corpus,
   }
   if (phrase.size() >= 2) {
     const std::vector<std::string> fixed(phrase.begin(), phrase.end() - 1);
-    const std::string pfx2 = bounded_prefix(phrase.back());
-    const std::vector<std::string> exp = snii_idx.enumerate_prefix(pfx2);
-    run_op2("MATCH_PHRASE_PREFIX (" + std::to_string(exp.size()) + " exp)",
-            [&](std::vector<uint32_t>* d, snii::io::IoMetrics* m) {
-              snii_idx.phrase_prefix_query(fixed, exp, d, m);
-            },
-            [&](std::vector<uint32_t>* d, snii::io::IoMetrics* m) {
-              cl_idx.phrase_prefix_query(fixed, exp, d, m);
-            });
+    const std::string pfx2 = bounded_prefix({phrase.back()});
+    if (!pfx2.empty()) {
+      const std::vector<std::string> exp = corpus_prefix_expansions(pfx2);
+      run_op2("MATCH_PHRASE_PREFIX native-vs-CLucene-preexpanded (" +
+                  std::to_string(exp.size()) + " exp)",
+              oracle.phrase_prefix(fixed, pfx2),
+              [&](std::vector<uint32_t>* d, snii::io::IoMetrics* m) {
+                snii_idx.phrase_prefix_query_prefix(fixed, pfx2, d, m);
+              },
+              [&](std::vector<uint32_t>* d, snii::io::IoMetrics* m) {
+                cl_idx.phrase_prefix_query(fixed, exp, d, m);
+              });
+    }
   }
 
   // --- Keyword (non-tokenized, docs-only): a SECOND OSS index pair. ---
   bench::SniiOssAdapter snii_kw;
-  bench::CluceneOssAdapter cl_kw;
+  bench::CluceneOssShardedAdapter cl_kw;
   snii_kw.set_docs_only(true);
   cl_kw.set_docs_only(true);
+  cl_kw.set_no_merge(args.no_merge);
   {
     static const char* kSvc[] = {"frontend",     "cartservice", "checkoutservice",
                                  "paymentservice", "shippingservice",
@@ -557,10 +876,11 @@ int run_oss_mode(const Args& args, const bench::Corpus& corpus,
     for (uint32_t i = 0; i < corpus.doc_count / 1000; ++i)
       values[i] = "trace" + std::to_string(i);
     bench::Corpus kw = bench::keyword_corpus(values);
+    const Oracle kw_oracle(kw);
     try {
       snii_kw.build_upload_and_open(kw, cfg);
       all_keys.push_back(snii_kw.uploaded_key());
-      cl_kw.build_upload_and_open(kw, cfg);
+      cl_kw.build_upload_and_open(kw, cfg, args.shard_docs);
       for (const std::string& k : cl_kw.uploaded_keys()) all_keys.push_back(k);
       const std::string kv = kw.vocab[bench::term_in_df_bucket(kw, 0.1, 1.0)];
       OssQueryResult r;
@@ -573,11 +893,13 @@ int run_oss_mode(const Args& args, const bench::Corpus& corpus,
       cl_kw.term_query(kv, &cdoc, &r.clucene);
       r.clucene_wall_ms = ms_since(t0);
       r.hits = sdoc.size();
-      r.docids_match = (sdoc == cdoc);
+      const std::vector<uint32_t> odoc = kw_oracle.term(kv);
+      r.docids_match = (sdoc == cdoc) && (sdoc == odoc);
       if (!r.docids_match) all_match = false;
       results.push_back(r);
     } catch (const std::exception& e) {
       std::fprintf(stderr, "WARNING: OSS keyword build failed: %s\n", e.what());
+      all_match = false;
     }
   }
 
@@ -590,66 +912,128 @@ int run_oss_mode(const Args& args, const bench::Corpus& corpus,
     print_oss_metrics_row("SNII", r.snii_wall_ms, r.snii);
     std::printf("  ratio    wall_ms(CL/SNII)=%.2f  serial_rounds(CL/SNII)=%.2f  "
                 "range_gets(CL/SNII)=%.2f\n",
-                ratio(static_cast<uint64_t>(r.clucene_wall_ms),
-                      static_cast<uint64_t>(r.snii_wall_ms)),
+                ratio(r.clucene_wall_ms, r.snii_wall_ms),
                 ratio(r.clucene.serial_rounds, r.snii.serial_rounds),
                 ratio(r.clucene.range_gets, r.snii.range_gets));
   }
 
-  // Optional distribution pass: re-measure each query args.repeat times. Every
-  // call resets the cost model and re-issues real OSS GETs (cold), so the spread
-  // exposes per-GET OSS latency jitter -- which dominates tiny single-round
-  // queries and explains why a single mid-df sample can land either way.
+  // 可选分布测量：对已解析的场景目录重复测量 args.repeat 次。每次调用都会
+  // reset cost model 并重新发起真实 OSS GET（cold），用于暴露单次 GET 的延迟抖动。
+  //
+  // BENCH.6：原先声明过的 real-OSS latency 场景仍强制 gate。新增算子场景
+  // 也打印同样的 verdict 字段，但不会强制非零退出。
+  bool oss_gate_breach = false;
   if (args.repeat > 1) {
     std::printf("\n=== wall-clock distribution over %u cold repeats "
                 "(real-OSS jitter) ===\n",
                 args.repeat);
-    struct Q {
-      const char* label;
-      bool is_phrase;
-      std::string term;
+    const std::vector<Scenario> queries = resolve_scenarios(corpus);
+    auto enforce_oss_gate = [](const Scenario& s) {
+      return s.id == "TERM-high" || s.id == "TERM-mid" || s.id == "TERM-low" ||
+             s.id == "PHRASE-5";
     };
-    std::vector<Q> queries = {{"TERM high-df", false, high_term},
-                              {"TERM mid-df", false, mid_term},
-                              {"TERM low-df", false, low_term}};
-    if (!phrase.empty()) queries.push_back({"PHRASE", true, std::string()});
-    for (const Q& q : queries) {
-      std::vector<double> snii_ms, cl_ms;
-      std::vector<uint32_t> sdoc, cdoc;
-      snii::io::IoMetrics sm, cm;
+
+    // The kRealOss wall-clock floor: 5M (>=1M docs) demands the documented
+    // advantage; below 1M the floor falls back to parity (1.0) to admit the
+    // known small-scale byte/latency reversal without a false fail.
+    const bench::Scale scale = bench::scale_of(corpus.doc_count);
+    const double kRealOssWallFloor = scale == bench::Scale::kLarge5M ? 2.0 : 1.0;
+
+    std::ofstream oss_jsonl;
+    const bool emit_jsonl = !args.bench_out.empty();
+    if (emit_jsonl) {
+      oss_jsonl.open(args.bench_out, std::ios::out | std::ios::trunc);
+      if (!oss_jsonl) {
+        std::fprintf(stderr, "FATAL: cannot open --bench-out path: %s\n",
+                     args.bench_out.c_str());
+        return 2;
+      }
+    }
+    const std::string rev = git_rev();
+
+    for (const Scenario& q : queries) {
+      std::vector<OssTimedSample> snii_samples;
+      std::vector<OssTimedSample> cl_samples;
+      bool measurement_ok = true;
       try {
         for (uint32_t i = 0; i < args.repeat; ++i) {
+          OssTimedSample ss;
           auto t0 = std::chrono::steady_clock::now();
-          if (q.is_phrase) {
-            snii_idx.phrase_query(phrase, &sdoc, &sm);
-          } else {
-            snii_idx.term_query(q.term, &sdoc, &sm);
-          }
-          snii_ms.push_back(ms_since(t0));
+          run_one(snii_idx, q, &ss.docids, &ss.metrics);
+          ss.wall_ms = ms_since(t0);
+          snii_samples.push_back(std::move(ss));
+
+          OssTimedSample cs;
           t0 = std::chrono::steady_clock::now();
-          if (q.is_phrase) {
-            cl_idx.phrase_query(phrase, &cdoc, &cm);
-          } else {
-            cl_idx.term_query(q.term, &cdoc, &cm);
-          }
-          cl_ms.push_back(ms_since(t0));
+          run_one(cl_idx, q, &cs.docids, &cs.metrics);
+          cs.wall_ms = ms_since(t0);
+          cl_samples.push_back(std::move(cs));
         }
       } catch (const std::exception& e) {
+        measurement_ok = false;
         std::fprintf(stderr, "WARNING: repeat measurement failed: %s\n",
                      e.what());
       }
-      std::printf("[%s] (hits=%zu)\n", q.label, sdoc.size());
+      const std::vector<double> snii_ms = sample_walls(snii_samples);
+      const std::vector<double> cl_ms = sample_walls(cl_samples);
+      const size_t sample_hits =
+          snii_samples.empty() ? 0 : snii_samples.back().docids.size();
+      std::printf("[%s] (hits=%zu)\n", q.id.c_str(), sample_hits);
       print_wall_distribution("CLucene", cl_ms);
       print_wall_distribution("SNII", snii_ms);
+      const bool enforced = enforce_oss_gate(q);
+      if (!measurement_ok || snii_samples.empty() || cl_samples.empty()) {
+        std::printf("  oss verdict: measurement=FAIL enforced=%s\n",
+                    enforced ? "YES" : "NO");
+        if (enforced) oss_gate_breach = true;
+        continue;
+      }
+
+      const OssTimedSample sn_med = median_sample(snii_samples);
+      const OssTimedSample cl_med = median_sample(cl_samples);
+      const std::vector<uint32_t> odoc = oracle_for(oracle, q);
+      const bool docids_match = (sn_med.docids == cl_med.docids) &&
+                                (sn_med.docids == odoc);
+      const bench::OssVerdict v = bench::evaluate_oss(
+          cl_ms, snii_ms, cl_med.metrics, sn_med.metrics, docids_match,
+          kRealOssWallFloor);
+      std::printf("  oss verdict: wall_ratio=%.2f (floor %.2f) wall=%s rounds=%s "
+                  "docids=%s overall=%s enforced=%s\n",
+                  v.wall_ratio_cl_over_snii, v.min_wall_ratio,
+                  v.wall_pass ? "PASS" : "FAIL", v.rounds_pass ? "PASS" : "FAIL",
+                  v.docids_pass ? "PASS" : "FAIL",
+                  v.overall_pass ? "PASS" : "FAIL", enforced ? "YES" : "NO");
+      if (enforced && !v.overall_pass) oss_gate_breach = true;
+
+      if (emit_jsonl) {
+        write_oss_jsonl(oss_jsonl, q.id.c_str(), corpus.doc_count, args.seed,
+                        rev, sn_med.docids.size(), cl_med.wall_ms,
+                        sn_med.wall_ms, cl_med.metrics, sn_med.metrics, v);
+      }
+    }
+    if (emit_jsonl) {
+      oss_jsonl.flush();
+      if (!oss_jsonl) {
+        std::fprintf(stderr, "FATAL: write to --bench-out failed: %s\n",
+                     args.bench_out.c_str());
+        return 2;
+      }
+      std::printf("\nwrote surface=oss JSONL: %s\n", args.bench_out.c_str());
     }
   }
 
-  // Concurrent S3 throughput matrix (single vs N threads), term/phrase scenarios.
-  // The aws_guard above stays live across the worker pool (required for S3 init).
+  // 并发 S3 吞吐矩阵（单线程 vs N 线程），覆盖已解析场景。上面的 aws_guard
+  // 必须覆盖整个 worker pool 生命周期。
   if (args.concurrency != 0) {
     try {
-      run_oss_concurrent(args, corpus, cfg, snii_idx.object_key(),
-                         cl_idx.file_names());
+      if (cl_idx.shard_count() == 1) {
+        run_oss_concurrent(args, corpus, cfg, snii_idx.object_key(),
+                           cl_idx.object_prefix(), cl_idx.file_names());
+      } else {
+        std::printf("\n(skip concurrent throughput: CLucene OSS sharded mode has "
+                    "%zu shards)\n",
+                    cl_idx.shard_count());
+      }
     } catch (const std::exception& e) {
       std::fprintf(stderr, "WARN: OSS concurrent pass failed: %s\n", e.what());
     }
@@ -660,9 +1044,15 @@ int run_oss_mode(const Args& args, const bench::Corpus& corpus,
   std::printf("\ncleanup: removed %zu / %zu OSS objects\n", removed,
               all_keys.size());
 
-  std::printf("\nresult: %s\n",
-              all_match ? "ALL DOCIDS MATCH" : "DOCID MISMATCH");
-  return all_match ? 0 : 1;
+  std::printf("\nresult: %s%s\n",
+              all_match ? "ALL DOCIDS MATCH" : "DOCID MISMATCH",
+              oss_gate_breach ? (args.oss_report_only
+                                      ? " (OSS GATE BREACH, REPORT ONLY)"
+                                      : " (OSS GATE BREACH)")
+                              : "");
+  // 默认 --oss 是 CI gate：docid mismatch 或 OSS surface-gate breach 都返回非零。
+  // 性能研究可用 --oss-report-only 保留完整输出，同时不让 latency gate 中断流程。
+  return all_match && (args.oss_report_only || !oss_gate_breach) ? 0 : 1;
 }
 #endif  // SNII_WITH_S3
 
@@ -707,19 +1097,19 @@ void apply_spill(bench::SniiAdapter& idx, uint32_t spill_mib) {
 void apply_spill(bench::CluceneAdapter& idx, uint32_t spill_mib) {
   idx.set_ram_buffer_mb(static_cast<double>(spill_mib));  // 0 = no auto flush
 }
-template <typename Adapter>
-void apply_spill(Adapter&, uint32_t) {}
 
 // CLucene-only: flush segments without optimize() (no merge). No-op for SNII.
+void apply_no_merge(bench::SniiAdapter&, bool) {}
 void apply_no_merge(bench::CluceneAdapter& idx, bool v) { idx.set_no_merge(v); }
-template <typename Adapter>
-void apply_no_merge(Adapter&, bool) {}
 
-// Builds one engine over the corpus, reporting its on-disk index size and the
-// CPU it took. Returns nothing; peak RSS is read at process exit by the caller.
+// Builds one engine over the corpus and returns its write-side resource trio:
+// build CPU seconds, the process peak RSS high-water observed right after this
+// build (read by the caller), and the on-disk index size. Prints the same line
+// the print-only resource mode always did. peak_rss_mib is filled by the caller
+// (it is a process-global high-water, so it is read AFTER this build returns).
 template <typename Adapter>
-void build_and_report(const char* name, const bench::Corpus& corpus,
-                      uint32_t spill_mib, bool no_merge) {
+bench::ResourceTrio build_and_report(const char* name, const bench::Corpus& corpus,
+                                     uint32_t spill_mib, bool no_merge) {
   Adapter idx;
   apply_spill(idx, spill_mib);
   apply_no_merge(idx, no_merge);
@@ -730,10 +1120,13 @@ void build_and_report(const char* name, const bench::Corpus& corpus,
   const double build_cpu = cpu_seconds() - c0;
   const double build_wall =
       std::chrono::duration<double>(std::chrono::steady_clock::now() - w0).count();
+  const uint64_t bytes = idx.index_bytes();
   std::printf("  %-8s index_bytes=%-12llu (%7.2f MiB)  build_cpu_s=%-7.2f "
               "build_wall_s=%-7.2f\n",
-              name, static_cast<unsigned long long>(idx.index_bytes()),
-              mib(idx.index_bytes()), build_cpu, build_wall);
+              name, static_cast<unsigned long long>(bytes), mib(bytes), build_cpu,
+              build_wall);
+  // peak_rss_mib is filled in by the caller after the build (high-water mark).
+  return bench::ResourceTrio{build_cpu, 0.0, bytes};
 }
 
 // --resources mode: index size, build CPU, and peak RSS for the selected engine.
@@ -750,20 +1143,98 @@ int run_resources_mode(const Args& args, const bench::Corpus& corpus) {
   }
   const bool snii = args.engine == "snii" || args.engine == "both";
   const bool clu = args.engine == "clucene" || args.engine == "both";
+
+  // The corpus already resident before any build is the shared floor: each
+  // engine's RSS contribution is (peak-after-its-build - corpus_floor), so the
+  // in-memory corpus held by BOTH engines is not double-counted on either side.
+  const double corpus_floor = current_rss_mib();
+
+  bench::ResourceTrio snii_trio;
+  bench::ResourceTrio clu_trio;
+  bool have_snii = false;
+  bool have_clu = false;
   try {
-    if (snii)
-      build_and_report<bench::SniiAdapter>("SNII", corpus, args.spill_mib,
-                                           args.no_merge);
-    // Same threshold for CLucene: its RAM-buffer flush matches SNII's spill.
-    if (clu)
-      build_and_report<bench::CluceneAdapter>("CLucene", corpus, args.spill_mib,
-                                              args.no_merge);
+    if (snii) {
+      snii_trio = build_and_report<bench::SniiAdapter>("SNII", corpus,
+                                                       args.spill_mib, args.no_merge);
+      // High-water right after the SNII build, minus the shared corpus floor.
+      snii_trio.peak_rss_mib = peak_rss_mib() - corpus_floor;
+      have_snii = true;
+    }
+    // Same threshold for CLucene: its RAM-buffer flush matches SNII's spill
+    // (apples-to-apples bounded build memory).
+    if (clu) {
+      clu_trio = build_and_report<bench::CluceneAdapter>("CLucene", corpus,
+                                                         args.spill_mib, args.no_merge);
+      clu_trio.peak_rss_mib = peak_rss_mib() - corpus_floor;
+      have_clu = true;
+    }
   } catch (const std::exception& e) {
     std::fprintf(stderr, "FATAL: resource build failed: %s\n", e.what());
     return 1;
   }
   std::printf("  peak_rss=%.1f MiB (process high-water; engine=%s)\n",
               peak_rss_mib(), args.engine.c_str());
+
+  // No JSONL / verdict requested: keep the historical print-only behaviour.
+  if (args.bench_out.empty()) return 0;
+
+  // --engine none (baseline) or a single engine cannot form a CLucene-vs-SNII
+  // verdict: emit a baseline JSONL row (no verdict) and exit 0 -- a baseline run
+  // is for RSS floor measurement, it does not gate.
+  bench::ResourceRow row;
+  row.surface = "local";
+  row.doc_count = corpus.doc_count;
+  row.seed = args.seed;
+  row.spill_mib = args.spill_mib;
+  row.git_rev = git_rev();
+  if (have_snii) row.snii = snii_trio;
+  if (have_clu) row.clucene = clu_trio;
+
+  const bool both = have_snii && have_clu;
+  if (both) {
+    row.verdict = bench::evaluate_resources(row.clucene, row.snii, row.cpu_cap,
+                                            row.rss_cap, row.disk_cap);
+  }
+
+  std::ofstream os(args.bench_out, std::ios::out | std::ios::trunc);
+  if (!os) {
+    std::fprintf(stderr, "FATAL: cannot open --bench-out path: %s\n",
+                 args.bench_out.c_str());
+    return 1;
+  }
+  bench::write_resource_jsonl(os, row);
+  os.flush();
+  if (!os) {
+    std::fprintf(stderr, "FATAL: write to --bench-out failed: %s\n",
+                 args.bench_out.c_str());
+    return 1;
+  }
+
+  if (!both) {
+    std::printf("\n=== resource baseline row -> %s (no verdict; need --engine "
+                "both) ===\n",
+                args.bench_out.c_str());
+    return 0;  // baseline run does not gate.
+  }
+
+  std::printf("\n=== resource gate (5M write-side caps cpu<=%.2fx rss<=%.2fx "
+              "disk<=%.2fx) ===\n",
+              row.cpu_cap, row.rss_cap, row.disk_cap);
+  std::printf("  cpu_ratio =%.3f  %s\n", row.verdict.cpu_ratio,
+              row.verdict.cpu_pass ? "PASS" : "FAIL");
+  std::printf("  rss_ratio =%.3f  %s\n", row.verdict.rss_ratio,
+              row.verdict.rss_pass ? "PASS" : "FAIL");
+  std::printf("  disk_ratio=%.3f  %s\n", row.verdict.disk_ratio,
+              row.verdict.disk_pass ? "PASS" : "FAIL");
+  std::printf("  verdict=%s -> %s\n",
+              row.verdict.overall_pass ? "PASS" : "FAIL", args.bench_out.c_str());
+  if (!row.verdict.overall_pass) {
+    std::fprintf(stderr, "RESOURCE GATE FAILED: a write-side axis breached its "
+                         "declared cap (see %s)\n",
+                 args.bench_out.c_str());
+    return 1;  // non-zero exit on any threshold breach.
+  }
   return 0;
 }
 
@@ -1208,7 +1679,8 @@ int run_query_mode(const Args& args) {
     } catch (const std::exception& e) {
       std::fprintf(stderr, "FATAL: query '%s' failed: %s\n", label.c_str(),
                    e.what());
-      std::exit(1);
+      all_identical = false;
+      return;
     }
     const bool identical = !have_clu || (s.docids == c.docids);
     if (have_clu && !identical) {
@@ -1427,17 +1899,20 @@ int run_sharded_e2e(const Args& args) {
                          : args.terms);
   std::vector<std::string> phrase =
       split_ws(args.phrase.empty() ? "failed to place order" : args.phrase);
+  const Oracle oracle(corpus);
   bool all_identical = true;
 
   auto report = [&](const std::string& label, bool is_phrase,
                     const std::string& term, const std::vector<std::string>& w) {
     EngineQueryResult s = query_shards_merged(snii_shards, bases, is_phrase, term, w, R);
     EngineQueryResult c = query_shards_merged(clu_shards, bases, is_phrase, term, w, R);
-    const bool identical = (s.docids == c.docids);
+    const std::vector<uint32_t> odoc = is_phrase ? oracle.phrase(w) : oracle.term(term);
+    const bool identical = (s.docids == c.docids) && (s.docids == odoc);
     if (!identical) {
       all_identical = false;
-      std::fprintf(stderr, "MISMATCH %s: snii=%zu clucene=%zu\n", label.c_str(),
-                   s.docids.size(), c.docids.size());
+      std::fprintf(stderr,
+                   "MISMATCH %s: snii=%zu clucene=%zu oracle=%zu\n",
+                   label.c_str(), s.docids.size(), c.docids.size(), odoc.size());
     }
     std::printf("\n[%s]  hits=%zu  identical=%s\n", label.c_str(), s.docids.size(),
                 identical ? "YES" : "NO");
@@ -1469,16 +1944,6 @@ int run_sharded_e2e(const Args& args) {
               K, corpus.doc_count);
   return all_identical ? 0 : 1;
 }
-
-// One resolved benchmark scenario. `words` holds phrase tokens (kPhrase) or the
-// term list (kAnd / kOr); `term` holds the single term (kTerm).
-enum class SKind { kTerm, kPhrase, kAnd, kOr, kMatchAll };
-struct Scenario {
-  std::string id;
-  SKind kind = SKind::kTerm;
-  std::string term;
-  std::vector<std::string> words;
-};
 
 // Resolves the enriched catalog from the corpus via the df-bucket selectors: a
 // calibrated term df sweep, a phrase length sweep, boolean AND (mixed-df, the
@@ -1536,19 +2001,6 @@ std::vector<Scenario> resolve_scenarios(const bench::Corpus& c) {
   return out;
 }
 
-// One query of a scenario, dispatched on kind (shared by single + concurrent runs).
-template <class Adapter>
-void run_one(Adapter& idx, const Scenario& s, std::vector<uint32_t>* docids,
-             snii::io::IoMetrics* metrics) {
-  switch (s.kind) {
-    case SKind::kTerm: idx.term_query(s.term, docids, metrics); break;
-    case SKind::kPhrase: idx.phrase_query(s.words, docids, metrics); break;
-    case SKind::kAnd: idx.boolean_and(s.words, docids, metrics); break;
-    case SKind::kOr: idx.boolean_or(s.words, docids, metrics); break;
-    case SKind::kMatchAll: idx.match_all(docids, metrics); break;
-  }
-}
-
 // Runs one scenario `runs` times on an adapter, dispatching on its kind.
 template <class Adapter>
 EngineQueryResult run_scenario_on(Adapter& idx, const Scenario& s, uint32_t runs) {
@@ -1587,6 +2039,7 @@ ConcResult run_concurrent(MakeAdapter make_adapter, RunFn run_query,
                           const std::vector<Scenario>& scs, uint32_t threads,
                           double seconds, uint32_t warmup) {
   std::atomic<bool> go{false}, stop{false};
+  std::atomic<uint32_t> ready{0};
   std::vector<std::vector<double>> per_thread(threads);
   std::vector<std::thread> workers;
   workers.reserve(threads);
@@ -1598,6 +2051,7 @@ ConcResult run_concurrent(MakeAdapter make_adapter, RunFn run_query,
       std::vector<uint32_t> docids;
       snii::io::IoMetrics scratch;
       size_t si = t;  // round-robin offset so threads spread across scenarios
+      ready.fetch_add(1, std::memory_order_release);
       while (!go.load(std::memory_order_acquire)) {
       }
       while (!stop.load(std::memory_order_relaxed)) {
@@ -1608,8 +2062,11 @@ ConcResult run_concurrent(MakeAdapter make_adapter, RunFn run_query,
       }
     });
   }
-  const auto wall0 = std::chrono::steady_clock::now();
+  while (ready.load(std::memory_order_acquire) < threads) {
+    std::this_thread::sleep_for(std::chrono::milliseconds(1));
+  }
   go.store(true, std::memory_order_release);
+  const auto wall0 = std::chrono::steady_clock::now();
   std::this_thread::sleep_for(std::chrono::duration<double>(seconds));
   stop.store(true, std::memory_order_relaxed);
   for (auto& w : workers) w.join();
@@ -1647,17 +2104,13 @@ void print_conc_row(const char* engine, const ConcResult& c) {
 }
 
 #ifdef SNII_WITH_S3
-// Concurrent S3 throughput: build/upload already done; each worker opens its OWN
-// S3 reader chain over the uploaded index (open_uploaded). term/phrase scenarios
-// only (the OSS adapters expose term_query/phrase_query). The wall-clock is real
-// OSS round-trips, where SNII's fewer serial rounds drive the QPS / tail advantage.
+// 并发 S3 吞吐：build/upload 已完成，每个 worker 通过 open_uploaded 打开自己
+// 独立的 S3 reader chain。wall-clock 是真实 OSS 往返。
 void run_oss_concurrent(const Args& args, const bench::Corpus& corpus,
                         const snii::io::S3Config& cfg, const std::string& snii_key,
+                        const std::string& clu_prefix,
                         const std::vector<std::string>& clu_names) {
-  std::vector<Scenario> all = resolve_scenarios(corpus);
-  std::vector<Scenario> scs;  // term + phrase only (OSS adapter query surface)
-  for (const Scenario& s : all)
-    if (s.kind == SKind::kTerm || s.kind == SKind::kPhrase) scs.push_back(s);
+  std::vector<Scenario> scs = resolve_scenarios(corpus);
   if (scs.empty()) return;
 
   auto make_snii = [&cfg, snii_key]() {
@@ -1665,36 +2118,45 @@ void run_oss_concurrent(const Args& args, const bench::Corpus& corpus,
     a->open_uploaded(snii_key, cfg);
     return a;
   };
-  auto make_clu = [&cfg, clu_names]() {
+  auto make_clu = [&cfg, clu_prefix, clu_names]() {
+    snii::io::S3Config object_cfg = cfg;
+    object_cfg.prefix = clu_prefix;
     auto a = std::make_unique<bench::CluceneOssAdapter>();
-    a->open_uploaded(cfg, clu_names);
+    a->open_uploaded(object_cfg, clu_names);
     return a;
   };
-  auto run_tp = [](auto& a, const Scenario& s, std::vector<uint32_t>* d,
-                   snii::io::IoMetrics* m) {
-    if (s.kind == SKind::kPhrase) a.phrase_query(s.words, d, m);
-    else a.term_query(s.term, d, m);
+  auto run_resolved = [](auto& a, const Scenario& s, std::vector<uint32_t>* d,
+                         snii::io::IoMetrics* m) {
+    run_one(a, s, d, m);
   };
 
   const double secs = args.concurrency_seconds;
   const uint32_t W = args.concurrency;
   std::printf("\n=== concurrent throughput (REAL OSS, %.0fs/pass, warmup=%u/thread, "
-              "term+phrase) ===\n", secs, args.concurrency_warmup);
+              "resolved scenarios) ===\n", secs, args.concurrency_warmup);
   std::vector<uint32_t> levels = {1u};
   if (W != 1) levels.push_back(W);
   for (uint32_t N : levels) {
-    print_conc_row("CLucene", run_concurrent(make_clu, run_tp, scs, N, secs,
+    print_conc_row("CLucene", run_concurrent(make_clu, run_resolved, scs, N, secs,
                                              args.concurrency_warmup));
-    print_conc_row("SNII", run_concurrent(make_snii, run_tp, scs, N, secs,
+    print_conc_row("SNII", run_concurrent(make_snii, run_resolved, scs, N, secs,
                                           args.concurrency_warmup));
   }
 }
 #endif  // SNII_WITH_S3
 
 void report_scenario(const Scenario& s, const EngineQueryResult& sn,
-                     const EngineQueryResult& cl, bool* all_identical) {
-  const bool id = (sn.docids == cl.docids);
-  if (!id) *all_identical = false;
+                     const EngineQueryResult& cl,
+                     const std::vector<uint32_t>& oracle_docids,
+                     bool* all_identical) {
+  const bool id = (sn.docids == cl.docids) && (sn.docids == oracle_docids);
+  if (!id) {
+    *all_identical = false;
+    std::fprintf(stderr,
+                 "MISMATCH %s: snii=%zu clucene=%zu oracle=%zu\n",
+                 s.id.c_str(), sn.docids.size(), cl.docids.size(),
+                 oracle_docids.size());
+  }
   std::printf("\n[%s] hits=%zu identical=%s\n", s.id.c_str(), sn.docids.size(),
               id ? "YES" : "NO");
   std::printf("  CLucene gold: serial_rounds=%-5llu range_gets=%-5llu bytes=%-11llu\n",
@@ -1892,11 +2354,14 @@ int run_prefix_mode(const Args& args) {
       const std::vector<std::string> exp2 = snii_idx.enumerate_prefix(p2);
       const std::vector<std::string> fixed = {bigram[0]};
       std::vector<uint32_t> sp, cp;
-      snii_idx.phrase_prefix_query(fixed, exp2, &sp, &ms);
+      snii_idx.phrase_prefix_query_prefix(fixed, p2, &sp, &ms);
       cl_idx.phrase_prefix_query(fixed, exp2, &cp, &mc);
       std::printf("phrase-prefix '%s %s*' (%zu expansions)", bigram[0].c_str(),
                   p2.c_str(), exp2.size());
-      compare(("MATCH_PHRASE_PREFIX '" + bigram[0] + " " + p2 + "*'").c_str(), sp, cp);
+      compare(("MATCH_PHRASE_PREFIX native-vs-CLucene-preexpanded '" +
+               bigram[0] + " " + p2 + "*'")
+                  .c_str(),
+              sp, cp);
     }
   }
 
@@ -2089,6 +2554,7 @@ int run_keyword_mode(const Args& args) {
   const uint32_t R = std::max(args.runs, 5u);
   std::printf("=== keyword (non-tokenized, docs-only) exact-query suite (%zu, runs=%u) ===\n",
               scenarios.size(), R);
+  const Oracle oracle(corpus);
   bool all_identical = true;
   for (const Scenario& s : scenarios) {
     EngineQueryResult sn, cl;
@@ -2099,7 +2565,7 @@ int run_keyword_mode(const Args& args) {
       std::fprintf(stderr, "FATAL: keyword scenario %s: %s\n", s.id.c_str(), e.what());
       return 1;
     }
-    report_scenario(s, sn, cl, &all_identical);
+    report_scenario(s, sn, cl, oracle_for(oracle, s), &all_identical);
   }
   std::printf("\nresult: %s (keyword, %zu scenarios)\n",
               all_identical ? "ALL DOCIDS IDENTICAL (SNII == CLucene)"
@@ -2147,7 +2613,17 @@ int run_scenario_mode(const Args& args) {
   const uint32_t R = std::max(args.runs, 5u);
   std::printf("=== scenario suite (local cost-model + wall, %zu scenarios, runs=%u) ===\n",
               scenarios.size(), R);
+  const Oracle oracle(corpus);
   bool all_identical = true;
+
+  // BENCH.4: when --bench-out is set, gate each scenario against the declarative
+  // threshold manifest (per-scale, local surface) and emit one JSONL row each.
+  // overall_pass = docids_match AND every manifest metric verdict pass; the run
+  // exits non-zero iff any row fails. The JSONL is the reproducible CI artifact.
+  const bool gated = !args.bench_out.empty();
+  const std::string rev = gated ? git_rev() : std::string();
+  std::vector<bench::BenchRow> rows;
+
   for (const Scenario& s : scenarios) {
     EngineQueryResult sn, cl;
     try {
@@ -2157,7 +2633,51 @@ int run_scenario_mode(const Args& args) {
       std::fprintf(stderr, "FATAL: scenario %s: %s\n", s.id.c_str(), e.what());
       return 1;
     }
-    report_scenario(s, sn, cl, &all_identical);
+    const std::vector<uint32_t> odoc = oracle_for(oracle, s);
+    report_scenario(s, sn, cl, odoc, &all_identical);
+    if (gated) {
+      const bool docids_match = (sn.docids == cl.docids) && (sn.docids == odoc);
+      rows.push_back(bench::build_row(s.id, "local", corpus.doc_count, args.seed,
+                                      rev, sn.docids.size(), docids_match,
+                                      cl.metrics, sn.metrics));
+    }
+  }
+
+  if (gated) {
+    std::ofstream os(args.bench_out, std::ios::out | std::ios::trunc);
+    if (!os) {
+      std::fprintf(stderr, "FATAL: cannot open --bench-out path: %s\n",
+                   args.bench_out.c_str());
+      return 1;  // CI artifact must never fail silently.
+    }
+    // BENCH.7: the FIRST line is the self-describing run-header (seed, scales,
+    // surfaces, git rev, harness version, manifest fingerprint) so the JSONL
+    // replays the exact code + thresholds the rows were gated under. The local
+    // scenario leg runs at this one corpus scale and the local surface.
+    bench::RunHeader header;
+    header.git_rev = rev;
+    header.seed = args.seed;
+    header.scales = {corpus.doc_count};
+    header.surfaces = {"local"};
+    header.harness_version = "snii-bench-suite/1";
+    header.manifest_hash = bench::manifest_hash();
+    bench::write_run_header(os, header);
+    for (const bench::BenchRow& row : rows) bench::write_jsonl(os, row);
+    os.flush();
+    if (!os) {
+      std::fprintf(stderr, "FATAL: write to --bench-out failed: %s\n",
+                   args.bench_out.c_str());
+      return 1;
+    }
+    const bool pass = bench::all_passed(rows);
+    std::printf("\n=== gate: %zu rows, verdict=%s -> %s ===\n", rows.size(),
+                pass ? "PASS" : "FAIL", args.bench_out.c_str());
+    if (!pass) {
+      std::fprintf(stderr, "BENCH GATE FAILED: one or more scenarios breached "
+                           "their declared threshold (see %s)\n",
+                   args.bench_out.c_str());
+      return 1;  // non-zero exit on any threshold breach.
+    }
   }
 
   // Concurrent throughput matrix: single (N=1) vs concurrent (N threads), per
@@ -2355,7 +2875,7 @@ int main(int argc, char** argv) {
   std::vector<QueryResult> results;
   bool all_match = true;
 
-  auto run_term = [&](const std::string& label, const std::string& term) {
+  auto run_term = [&](const std::string& label, const std::string& term) -> bool {
     QueryResult r;
     r.label = label + " '" + term + "'";
     std::vector<uint32_t> sdoc, cdoc;
@@ -2366,7 +2886,8 @@ int main(int argc, char** argv) {
     } catch (const std::exception& e) {
       std::fprintf(stderr, "FATAL: term query '%s' failed: %s\n", term.c_str(),
                    e.what());
-      std::exit(1);
+      all_match = false;
+      return false;
     }
     const std::vector<uint32_t> odoc = oracle.term(term);
     r.snii = sm;
@@ -2380,9 +2901,10 @@ int main(int argc, char** argv) {
                    r.label.c_str(), sdoc.size(), cdoc.size(), odoc.size());
     }
     results.push_back(r);
+    return true;
   };
 
-  auto run_phrase = [&](const std::vector<std::string>& words) {
+  auto run_phrase = [&](const std::vector<std::string>& words) -> bool {
     QueryResult r;
     r.label = "PHRASE '" + join_words(words) + "'";
     r.is_phrase = true;
@@ -2393,7 +2915,8 @@ int main(int argc, char** argv) {
       cl_idx.phrase_query(words, &cdoc, &cm);
     } catch (const std::exception& e) {
       std::fprintf(stderr, "FATAL: phrase query failed: %s\n", e.what());
-      std::exit(1);
+      all_match = false;
+      return false;
     }
     const std::vector<uint32_t> odoc = oracle.phrase(words);
     r.snii = sm;
@@ -2407,6 +2930,7 @@ int main(int argc, char** argv) {
                    sdoc.size(), cdoc.size(), odoc.size());
     }
     results.push_back(r);
+    return true;
   };
 
   run_term("TERM high-df", high_term);

@@ -24,7 +24,7 @@ class BatchRangeFetcher {
   explicit BatchRangeFetcher(FileReader* reader, uint64_t coalesce_gap = 0);
 
   // Registers a desired range; returns a handle usable with get() after fetch().
-  size_t add(uint64_t offset, size_t len);
+  size_t add(uint64_t offset, uint64_t len);
 
   // Coalesces and issues one batched read; fills internal buffers.
   Status fetch();
@@ -38,7 +38,8 @@ class BatchRangeFetcher {
  private:
   struct Req {
     uint64_t offset;
-    size_t len;
+    uint64_t len;
+    size_t len_size = 0;   // validated size_t length after successful fetch()
     size_t phys_idx = 0;   // index into phys_ after fetch
     size_t sub_offset = 0; // byte offset of this req within its physical read
   };

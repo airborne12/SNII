@@ -25,7 +25,7 @@ endif()
 
 if(NOT TARGET snii_gtest)
   add_library(snii_gtest INTERFACE)
-  target_include_directories(snii_gtest INTERFACE "${GTEST_ROOT}/include")
+  target_include_directories(snii_gtest SYSTEM INTERFACE "${GTEST_ROOT}/include")
   target_link_libraries(snii_gtest INTERFACE
     "${GTEST_ROOT}/lib/libgtest.a"
     "${GTEST_ROOT}/lib/libgtest_main.a"
