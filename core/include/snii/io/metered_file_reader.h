@@ -5,19 +5,10 @@
 #include <unordered_set>
 #include <vector>
 
-#include "snii/common/status.h"
 #include "snii/io/file_reader.h"
+#include "snii/io/io_metrics.h"
 
 namespace snii::io {
-
-// The four object-storage access metrics the SNII design optimizes for.
-struct IoMetrics {
-  uint64_t read_at_calls = 0;       // BE-internal logical read requests issued
-  uint64_t serial_rounds = 0;       // dependent serial I/O rounds (latency driver)
-  uint64_t range_gets = 0;          // remote range GETs after FileCache coalescing
-  uint64_t remote_bytes = 0;        // bytes fetched from remote (missed cache blocks)
-  uint64_t total_request_bytes = 0; // sum of requested lengths (raw, pre-cache)
-};
 
 // A FileReader decorator that models an object-storage FileCache: reads are
 // aligned to fixed (default 1MiB) blocks; only not-yet-resident blocks become
@@ -39,10 +30,13 @@ class MeteredFileReader : public FileReader {
   uint64_t size() const override { return inner_->size(); }
 
   const IoMetrics& metrics() const { return metrics_; }
+  const IoMetrics* io_metrics() const override { return &metrics_; }
   // Clears counters AND the resident block set, modelling a cold (cache-empty) query.
   void reset_metrics();
 
  private:
+  Status validate_range(uint64_t offset, size_t len) const;
+
   // Accounts the cache effect of touching [offset, offset+len): records misses,
   // coalesced GETs, and remote bytes. Returns true iff at least one block missed.
   bool account_blocks(uint64_t offset, size_t len);

@@ -9,6 +9,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <filesystem>
 #include <memory>
 #include <stdexcept>
 #include <string>
@@ -48,9 +49,23 @@ std::wstring widen(const std::string& s) {
   throw std::runtime_error("CLucene OSS adapter: " + what);
 }
 
+int tokenized_field_config() {
+  constexpr int kStoreNo = cl_doc::Field::STORE_NO;
+  constexpr int kIndexTokenized = cl_doc::Field::INDEX_TOKENIZED;
+  return kStoreNo | kIndexTokenized;
+}
+
 std::string make_temp_dir() {
   static int counter = 0;
   return "/tmp/snii_bench_cl_oss_" + std::to_string(::getpid()) + "_" +
+         std::to_string(counter++);
+}
+
+std::string make_remote_prefix(std::string base) {
+  static int counter = 0;
+  while (!base.empty() && base.back() == '/') base.pop_back();
+  if (!base.empty()) base.push_back('/');
+  return base + "clucene_" + std::to_string(::getpid()) + "_" +
          std::to_string(counter++);
 }
 
@@ -80,19 +95,27 @@ struct CluceneOssAdapter::Impl {
   std::string dir_path;  // local temp build dir (removed in dtor)
   std::vector<std::string> file_names;     // segment file names (no prefix)
   std::vector<std::string> uploaded_keys;  // prefix + "/" + name
+  std::string object_prefix;               // 包含 file_names 的远端 prefix
+  uint64_t index_bytes = 0;
   std::unique_ptr<OssCluceneDirectory> directory;
   std::unique_ptr<cl_search::IndexSearcher> searcher;
   cl_index::IndexReader* reader = nullptr;
 
-  ~Impl() {
+  void close_reader() {
     searcher.reset();  // closes the searcher (isOwner=false, reader untouched)
     if (reader) {
       reader->close();
       _CLLDELETE(reader);
+      reader = nullptr;
     }
     directory.reset();
+  }
+
+  ~Impl() {
+    close_reader();
     if (!dir_path.empty()) {
-      (void)std::system(("rm -rf '" + dir_path + "'").c_str());
+      std::error_code ec;
+      std::filesystem::remove_all(dir_path, ec);
     }
   }
 };
@@ -104,12 +127,33 @@ const std::vector<std::string>& CluceneOssAdapter::uploaded_keys() const {
   return impl_->uploaded_keys;
 }
 
+uint64_t CluceneOssAdapter::index_bytes() const {
+  return impl_->index_bytes;
+}
+
 const std::vector<std::string>& CluceneOssAdapter::file_names() const {
   return impl_->file_names;
 }
 
+const std::string& CluceneOssAdapter::object_prefix() const {
+  return impl_->object_prefix;
+}
+
 void CluceneOssAdapter::build_upload_and_open(const Corpus& c,
                                               const snii::io::S3Config& cfg) {
+  build_upload_and_open_range(c, 0, c.doc_count, cfg);
+}
+
+void CluceneOssAdapter::build_upload_and_open_range(
+    const Corpus& c, uint32_t doc_lo, uint32_t doc_hi,
+    const snii::io::S3Config& cfg) {
+  if (doc_lo >= doc_hi || doc_hi > c.doc_count) fail("bad build range");
+  impl_->close_reader();
+  impl_->file_names.clear();
+  impl_->uploaded_keys.clear();
+  impl_->object_prefix.clear();
+  impl_->index_bytes = 0;
+
   impl_->dir_path = make_temp_dir();
   run_shell("mkdir -p '" + impl_->dir_path + "'");
 
@@ -129,14 +173,13 @@ void CluceneOssAdapter::build_upload_and_open(const Corpus& c,
     auto* sreader = _CLNEW lucene::util::SStringReader<char>();
 
     const std::wstring field_name = widen("body");
-    int32_t field_config =
-        cl_doc::Field::STORE_NO | cl_doc::Field::INDEX_TOKENIZED;
+    const int field_config = tokenized_field_config();
     auto* doc = _CLNEW cl_doc::Document();
     auto* field = _CLNEW cl_doc::Field(field_name.c_str(), field_config);
     field->setOmitTermFreqAndPositions(docs_only_);  // keyword -> docs-only
     doc->add(*field);
 
-    for (uint32_t d = 0; d < c.doc_count; ++d) {
+    for (uint32_t d = doc_lo; d < doc_hi; ++d) {
       std::string joined;
       const auto& toks = c.docs[d];
       for (uint32_t k = 0; k < toks.size(); ++k) {
@@ -149,7 +192,9 @@ void CluceneOssAdapter::build_upload_and_open(const Corpus& c,
       field->setValue(stream);
       writer->addDocument(doc);
     }
-    writer->optimize();
+    if (!no_merge_) {
+      writer->optimize();
+    }
     writer->close();
 
     _CLLDELETE(writer);
@@ -169,15 +214,20 @@ void CluceneOssAdapter::build_upload_and_open(const Corpus& c,
 
   if (impl_->file_names.empty()) fail("build produced no index files");
 
-  // --- Upload phase: push every segment file to OSS under cfg.prefix. ---
+  // --- 上传阶段：每个 adapter 使用独立远端 prefix，避免多索引同名覆盖。 ---
+  snii::io::S3Config object_cfg = cfg;
+  object_cfg.prefix = make_remote_prefix(cfg.prefix);
+  impl_->object_prefix = object_cfg.prefix;
+  impl_->index_bytes = 0;
   for (const std::string& name : impl_->file_names) {
     const std::string local_path = impl_->dir_path + "/" + name;
     std::vector<uint8_t> bytes;
     if (snii::Status s = read_whole_file(local_path, &bytes); !s.ok()) {
       fail("read local index file '" + name + "': " + s.to_string());
     }
+    impl_->index_bytes += bytes.size();
     snii::io::S3FileWriter w;
-    if (snii::Status s = w.open(cfg, name); !s.ok()) {
+    if (snii::Status s = w.open(object_cfg, name); !s.ok()) {
       fail("S3 open '" + name + "': " + s.to_string());
     }
     if (snii::Status s = w.append(snii::Slice(bytes)); !s.ok()) {
@@ -186,16 +236,18 @@ void CluceneOssAdapter::build_upload_and_open(const Corpus& c,
     if (snii::Status s = w.finalize(); !s.ok()) {
       fail("S3 finalize '" + name + "': " + s.to_string());
     }
-    impl_->uploaded_keys.push_back(cfg.prefix + "/" + name);
+    impl_->uploaded_keys.push_back(object_cfg.prefix + "/" + name);
   }
 
   // --- Read phase: open through the OSS-backed metered directory. ---
-  open_uploaded(cfg, impl_->file_names);
+  open_uploaded(object_cfg, impl_->file_names);
 }
 
 void CluceneOssAdapter::open_uploaded(const snii::io::S3Config& cfg,
                                       const std::vector<std::string>& file_names) {
+  impl_->close_reader();
   impl_->file_names = file_names;
+  impl_->object_prefix = cfg.prefix;
   impl_->directory = std::make_unique<OssCluceneDirectory>(cfg, impl_->file_names);
   impl_->reader = cl_index::IndexReader::open(impl_->directory->directory());
   if (impl_->reader == nullptr) fail("IndexReader::open returned null");

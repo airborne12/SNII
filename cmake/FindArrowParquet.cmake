@@ -53,7 +53,7 @@ endif()
 
 if(NOT TARGET snii_arrow)
   add_library(snii_arrow INTERFACE)
-  target_include_directories(snii_arrow INTERFACE "${_arrow_inc}")
+  target_include_directories(snii_arrow SYSTEM INTERFACE "${_arrow_inc}")
   target_link_libraries(snii_arrow INTERFACE
     -Wl,--start-group ${_arrow_archives} -Wl,--end-group
     pthread dl m rt)

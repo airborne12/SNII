@@ -45,7 +45,7 @@ Status SniiStatsProvider::open(const snii::reader::LogicalIndexReader* idx,
   }
 
   snii::io::BatchRangeFetcher fetcher(idx->reader());
-  const size_t h = fetcher.add(norms.offset, static_cast<size_t>(norms.length));
+  const size_t h = fetcher.add(norms.offset, norms.length);
   SNII_RETURN_IF_ERROR(fetcher.fetch());
   Slice framed = fetcher.get(h);
   out->norms_bytes_.assign(framed.data(), framed.data() + framed.size());

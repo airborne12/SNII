@@ -128,7 +128,7 @@ class CompactPostingPool {
   //   of (budget exhausted, chain tail reached).
   class Cursor {
    public:
-    Cursor(const CompactPostingPool* pool, uint32_t head, uint32_t budget);
+    Cursor(const CompactPostingPool* pool, uint32_t head, uint64_t budget);
 
     // True while the cursor can still yield a REAL payload byte: the budget is not
     // spent AND the cursor has not reached the chain tail. It peeks the tail forward
@@ -144,14 +144,14 @@ class CompactPostingPool {
     uint32_t cur_;        // absolute read cursor
     uint32_t slice_end_;  // one-past-last payload byte of the current slice
     uint32_t level_;      // current slice level
-    uint32_t budget_;     // remaining byte budget (upper bound on bytes to yield)
+    uint64_t budget_;     // remaining byte budget (upper bound on bytes to yield)
   };
 
   // Builds a cursor over the chain at `head`. `budget` is an UPPER BOUND on bytes to
   // read (see Cursor's contract): the exact payload length or anything larger. The
   // production caller passes the write-head offset, which always bounds the payload
   // from above; the cursor self-terminates at the chain tail regardless.
-  Cursor cursor(uint32_t head, uint32_t budget) const {
+  Cursor cursor(uint32_t head, uint64_t budget) const {
     return Cursor(this, head, budget);
   }
 

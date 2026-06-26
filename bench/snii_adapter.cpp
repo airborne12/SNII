@@ -5,13 +5,17 @@
 #include <algorithm>
 #include <cstdio>
 #include <filesystem>
+#include <iterator>
 #include <stdexcept>
 #include <system_error>
 #include <utility>
 
+#include "docid_range.h"
 #include "snii/format/format_constants.h"
+#include "snii/query/boolean_query.h"
 #include "snii/query/bm25_scorer.h"
 #include "snii/query/phrase_query.h"
+#include "snii/query/prefix_query.h"
 #include "snii/query/scoring_query.h"
 #include "snii/query/term_query.h"
 #include "snii/writer/snii_compound_writer.h"
@@ -292,23 +296,11 @@ void SniiAdapter::boolean_and(const std::vector<std::string>& terms,
 void SniiAdapter::boolean_or(const std::vector<std::string>& terms,
                              std::vector<uint32_t>* docids,
                              snii::io::IoMetrics* metrics) {
-  // One cold measurement covering the whole disjunction: read each term's posting
-  // (no reset between terms) and union the docid sets.
   metered_->reset_metrics();
   docids->clear();
-  std::vector<uint32_t> acc;
-  for (const std::string& t : terms) {
-    std::vector<uint32_t> d;
-    if (snii::Status s = snii::query::term_query(*index_, t, &d); !s.ok()) {
-      fail("boolean_or(" + t + ")", s);
-    }
-    std::vector<uint32_t> merged;
-    merged.reserve(acc.size() + d.size());
-    std::set_union(acc.begin(), acc.end(), d.begin(), d.end(),
-                   std::back_inserter(merged));
-    acc = std::move(merged);
+  if (snii::Status s = snii::query::boolean_or(*index_, terms, docids); !s.ok()) {
+    fail("boolean_or", s);
   }
-  *docids = std::move(acc);
   *metrics = metered_->metrics();
 }
 
@@ -316,7 +308,8 @@ void SniiAdapter::match_all(std::vector<uint32_t>* docids,
                             snii::io::IoMetrics* metrics) {
   // Every docid from the resident doc count -- no posting I/O.
   metered_->reset_metrics();
-  const uint32_t n = index_->stats().doc_count;
+  const uint32_t n = require_uint32_doc_count(index_->stats().doc_count,
+                                              "SNII adapter");
   docids->resize(n);
   for (uint32_t i = 0; i < n; ++i) (*docids)[i] = i;
   *metrics = metered_->metrics();
@@ -327,23 +320,9 @@ void SniiAdapter::prefix_query(const std::string& prefix,
                                snii::io::IoMetrics* metrics) {
   metered_->reset_metrics();
   docids->clear();
-  std::vector<snii::reader::LogicalIndexReader::PrefixHit> hits;
-  if (snii::Status s = index_->prefix_terms(prefix, &hits); !s.ok()) {
-    fail("prefix_terms", s);
+  if (snii::Status s = snii::query::prefix_query(*index_, prefix, docids); !s.ok()) {
+    fail("prefix_query", s);
   }
-  std::vector<uint32_t> acc;
-  for (const auto& h : hits) {
-    std::vector<uint32_t> d;
-    if (snii::Status s = snii::query::term_query(*index_, h.term, &d); !s.ok()) {
-      fail("prefix term_query(" + h.term + ")", s);
-    }
-    std::vector<uint32_t> merged;
-    merged.reserve(acc.size() + d.size());
-    std::set_union(acc.begin(), acc.end(), d.begin(), d.end(),
-                   std::back_inserter(merged));
-    acc = std::move(merged);
-  }
-  *docids = std::move(acc);
   *metrics = metered_->metrics();
 }
 
@@ -380,6 +359,21 @@ void SniiAdapter::phrase_prefix_query(const std::vector<std::string>& fixed,
     acc = std::move(merged);
   }
   *docids = std::move(acc);
+  *metrics = metered_->metrics();
+}
+
+void SniiAdapter::phrase_prefix_query_prefix(const std::vector<std::string>& fixed,
+                                             const std::string& prefix,
+                                             std::vector<uint32_t>* docids,
+                                             snii::io::IoMetrics* metrics) {
+  metered_->reset_metrics();
+  docids->clear();
+  std::vector<std::string> terms = fixed;
+  terms.push_back(prefix);
+  if (snii::Status s = snii::query::phrase_prefix_query(*index_, terms, docids);
+      !s.ok()) {
+    fail("phrase_prefix_query", s);
+  }
   *metrics = metered_->metrics();
 }
 

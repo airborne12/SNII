@@ -439,8 +439,8 @@ void SpimiTermBuffer::release_term(uint32_t term_id) {
   --live_term_count_;
 }
 
-void SpimiTermBuffer::drain_sorted(const std::function<void(TermPostings&&)>& fn,
-                                   bool allow_stream_positions) {
+Status SpimiTermBuffer::drain_sorted(const std::function<void(TermPostings&&)>& fn,
+                                    bool allow_stream_positions) {
   const std::vector<std::string>& v = vocab();
   for (uint32_t id : sorted_ids()) {
     Term term = std::move(slots_[slot_of_[id] - 1]);
@@ -462,6 +462,7 @@ void SpimiTermBuffer::drain_sorted(const std::function<void(TermPostings&&)>& fn
   // Arena reset + slot_of_ freed: now real resident ~0, so this emits the final
   // negative that returns every reported byte (no leak after the in-memory drain).
   report_arena_delta();
+  return Status::OK();
 }
 
 Status SpimiTermBuffer::drain_to_writer(RunWriter* w) {
@@ -511,15 +512,15 @@ Status SpimiTermBuffer::spill_to_run() {
   return w.close();
 }
 
-void SpimiTermBuffer::merge_runs(const std::function<void(TermPostings&&)>& fn,
-                                 bool allow_stream_positions) {
+Status SpimiTermBuffer::merge_runs(const std::function<void(TermPostings&&)>& fn,
+                                  bool allow_stream_positions) {
   // Flush whatever is still resident as one final sorted run so the k-way merge
   // sees a uniform set of run files (and never holds two term sources at once).
   if (!touched_ids_.empty()) {
     Status s = spill_to_run();
     if (!s.ok() && spill_status_.ok()) spill_status_ = s;
   }
-  if (!spill_status_.ok()) return;  // a spill failed earlier; emit nothing
+  if (!spill_status_.ok()) return spill_status_;  // a spill or add_token error; emit nothing
   // All terms are now spilled; the merge reads runs and never touches the
   // accumulators. Free the pool + the vocab-sized slot index so the merge phase
   // holds none of the input-side arrays resident -- keeps spill-mode peak RSS
@@ -534,35 +535,33 @@ void SpimiTermBuffer::merge_runs(const std::function<void(TermPostings&&)>& fn,
   // full spilled drain reported_resident_ returns to 0 (no leak).
   report_arena_delta();
   Status s = MergeRuns(run_paths_, vocab(), has_positions_, fn, allow_stream_positions);
-  if (!s.ok() && spill_status_.ok()) spill_status_ = s;
   // The merge churns one large coalesced TermPostings per term (the widest term's
   // arrays are tens of MiB) plus per-run reader windows; on completion glibc
   // retains those freed chunks in its arenas. Trim again so the post-merge resident
   // set (and thus the process peak high-water if a later phase allocates) reflects
   // only live state, not merge-transient retention.
   TrimMalloc();
+  return s;
 }
 
-void SpimiTermBuffer::for_each_term_sorted(const std::function<void(TermPostings&&)>& fn) {
+Status SpimiTermBuffer::for_each_term_sorted(const std::function<void(TermPostings&&)>& fn) {
   // Single-drain contract: a second call would re-merge the (still-present) run
-  // files and re-emit every term, or emit nothing in the in-memory path. Latch an
-  // error and emit NOTHING rather than produce a wrong second stream.
+  // files and re-emit every term, or emit nothing in the in-memory path. Return
+  // an error and emit NOTHING rather than produce a wrong second stream.
   if (drained_) {
-    if (spill_status_.ok()) {
-      spill_status_ = Status::Internal("spimi: already drained (single-drain contract)");
-    }
-    return;
+    return Status::Internal("spimi: already drained (single-drain contract)");
   }
   drained_ = true;
   // The callback is invoked synchronously while the arena is resident, so large
   // sorted terms may stream positions via pos_pump (peak-RSS win for the writer).
   if (run_paths_.empty() && spill_status_.ok()) {
-    drain_sorted(fn, /*allow_stream_positions=*/true);  // pure in-memory path
-    return;
+    return drain_sorted(fn, /*allow_stream_positions=*/true);  // pure in-memory path
   }
-  // Spilled path: the merge may STREAM a wide term's positions via pos_pump (fn
-  // consumes each term synchronously while the run readers stay parked).
-  merge_runs(fn, /*allow_stream_positions=*/true);
+  // Spilled path (or add_token latched a validation error): the merge may STREAM
+  // a wide term's positions via pos_pump (fn consumes each term synchronously
+  // while the run readers stay parked). merge_runs returns the I/O status
+  // directly; add_token validation errors surface via spill_status_ inside it.
+  return merge_runs(fn, /*allow_stream_positions=*/true);
 }
 
 std::vector<TermPostings> SpimiTermBuffer::finalize_sorted() {
@@ -581,13 +580,15 @@ std::vector<TermPostings> SpimiTermBuffer::finalize_sorted() {
   // RETAINS each TermPostings past the drain, so positions must be MATERIALIZED
   // (a streamed pos_pump would reference the arena, freed when the drain ends).
   if (run_paths_.empty() && spill_status_.ok()) {
-    drain_sorted([&out](TermPostings&& tp) { out.push_back(std::move(tp)); },
+    Status s = drain_sorted([&out](TermPostings&& tp) { out.push_back(std::move(tp)); },
                  /*allow_stream_positions=*/false);
+    if (!s.ok() && spill_status_.ok()) spill_status_ = s;
   } else {
     // RETAINS each TermPostings past the merge, so positions MUST be materialized
     // (a streamed pos_pump would reference run readers freed when the merge ends).
-    merge_runs([&out](TermPostings&& tp) { out.push_back(std::move(tp)); },
+    Status s = merge_runs([&out](TermPostings&& tp) { out.push_back(std::move(tp)); },
                /*allow_stream_positions=*/false);
+    if (!s.ok() && spill_status_.ok()) spill_status_ = s;
   }
   return out;
 }

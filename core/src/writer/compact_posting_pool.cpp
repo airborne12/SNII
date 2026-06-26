@@ -106,7 +106,7 @@ void CompactPostingPool::append_byte(SliceWriter* w, uint8_t* level, uint8_t val
 }
 
 CompactPostingPool::Cursor::Cursor(const CompactPostingPool* pool, uint32_t head,
-                                   uint32_t budget)
+                                   uint64_t budget)
     : pool_(pool), cur_(head), level_(0), budget_(budget) {
   // The first slice is level 0; its payload region ends kSliceSizes[0] bytes in.
   slice_end_ = head + CompactPostingPool::kSliceSizes[0];

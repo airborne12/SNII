@@ -68,7 +68,7 @@ Status FetchSlimWindowBytes(const LogicalIndexReader& idx, const DictEntry& entr
   uint64_t win_len = 0;
   SNII_RETURN_IF_ERROR(idx.resolve_frq_window(entry, frq_base, &win_abs, &win_len));
   snii::io::BatchRangeFetcher fetcher(idx.reader());
-  const size_t h = fetcher.add(win_abs, static_cast<size_t>(win_len));
+  const size_t h = fetcher.add(win_abs, win_len);
   SNII_RETURN_IF_ERROR(fetcher.fetch());
   Slice got = fetcher.get(h);
   window_owned->assign(got.data(), got.data() + got.size());
@@ -82,8 +82,7 @@ Status FetchPrelude(const LogicalIndexReader& idx, const DictEntry& entry,
   const auto& region = idx.section_refs().posting_region;
   const uint64_t prelude_abs = region.offset + frq_base + entry.frq_off_delta;
   snii::io::BatchRangeFetcher fetcher(idx.reader());
-  const size_t h =
-      fetcher.add(prelude_abs, static_cast<size_t>(entry.prelude_len));
+  const size_t h = fetcher.add(prelude_abs, entry.prelude_len);
   SNII_RETURN_IF_ERROR(fetcher.fetch());
   return FrqPreludeReader::open(fetcher.get(h), out);
 }
@@ -378,8 +377,8 @@ Status MaterializeWindow(LazyTermCursor* c, uint32_t w) {
   // Scoring needs docids + freqs: fetch the window's dd sub-range AND freq sub-range.
   snii::io::BatchRangeFetcher fetcher(c->idx->reader(),
                                       snii::reader::kSameTermCoalesceGap);
-  const size_t dh = fetcher.add(r.dd_off, static_cast<size_t>(r.dd_len));
-  const size_t fh = fetcher.add(r.freq_off, static_cast<size_t>(r.freq_len));
+  const size_t dh = fetcher.add(r.dd_off, r.dd_len);
+  const size_t fh = fetcher.add(r.freq_off, r.freq_len);
   SNII_RETURN_IF_ERROR(fetcher.fetch());
   std::vector<uint32_t> docids;
   std::vector<uint32_t> freqs;

@@ -116,7 +116,7 @@ Status fetch_windowed_prelude(const LogicalIndexReader& idx, const DictEntry& en
   }
   const uint64_t prelude_abs = PreludeAbs(idx, entry, frq_base);
   snii::io::BatchRangeFetcher fetcher(idx.reader());
-  const size_t h = fetcher.add(prelude_abs, static_cast<size_t>(entry.prelude_len));
+  const size_t h = fetcher.add(prelude_abs, entry.prelude_len);
   SNII_RETURN_IF_ERROR(fetcher.fetch());
   return FrqPreludeReader::open(fetcher.get(h), prelude);
 }
@@ -203,14 +203,14 @@ Status FetchBlocks(const LogicalIndexReader& idx, const DictEntry& entry,
                    uint64_t prx_base, const BlockGeometry& g, bool want_positions,
                    bool want_freq, snii::io::BatchRangeFetcher* fetcher,
                    size_t* dd_h, size_t* freq_h, size_t* prx_h) {
-  *dd_h = fetcher->add(g.dd_block_off, static_cast<size_t>(g.dd_block_len));
+  *dd_h = fetcher->add(g.dd_block_off, g.dd_block_len);
   if (want_freq) {
-    *freq_h = fetcher->add(g.freq_block_off, static_cast<size_t>(g.freq_block_len));
+    *freq_h = fetcher->add(g.freq_block_off, g.freq_block_len);
   }
   if (want_positions) {
     const uint64_t prx_region_start =
         idx.section_refs().posting_region.offset + prx_base + entry.prx_off_delta;
-    *prx_h = fetcher->add(prx_region_start, static_cast<size_t>(entry.prx_len));
+    *prx_h = fetcher->add(prx_region_start, entry.prx_len);
   }
   return fetcher->fetch();
 }

@@ -37,6 +37,9 @@ struct S3Config {
   std::string prefix;    // object key prefix (no trailing slash required)
   std::string ak;        // access key id
   std::string sk;        // secret access key
+  long connect_timeout_ms = 10000;
+  long request_timeout_ms = 180000;
+  long http_request_timeout_ms = 180000;
 };
 
 // Process-wide aws InitAPI / ShutdownAPI lifecycle guard.

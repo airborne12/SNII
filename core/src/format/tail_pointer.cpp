@@ -21,28 +21,10 @@ constexpr size_t kFixedSize = kMagicBytes + kVersionBytes + 3 * kU64Bytes +
 // tail_checksum is the trailing u32 and covers every byte before it.
 constexpr size_t kChecksumCoverage = kFixedSize - kU32Bytes;
 
-// Emits a little-endian u16 through the ByteSink u8 primitive (ByteSink has no
-// put_fixed16); keeps the fixed layout exact without hand-rolling buffers.
-void put_fixed16(ByteSink* sink, uint16_t v) {
-  sink->put_u8(static_cast<uint8_t>(v & 0xFFu));
-  sink->put_u8(static_cast<uint8_t>((v >> 8) & 0xFFu));
-}
-
-// Reads a little-endian u16 via the ByteSource u8 primitive.
-Status get_fixed16(ByteSource* src, uint16_t* out) {
-  uint8_t lo = 0;
-  uint8_t hi = 0;
-  SNII_RETURN_IF_ERROR(src->get_u8(&lo));
-  SNII_RETURN_IF_ERROR(src->get_u8(&hi));
-  *out = static_cast<uint16_t>(lo) |
-         static_cast<uint16_t>(static_cast<uint16_t>(hi) << 8);
-  return Status::OK();
-}
-
 // Serializes the checksum-covered region in fixed field order into covered.
 void serialize_covered(const TailPointer& tp, ByteSink* covered) {
   covered->put_fixed32(kTailMagic);
-  put_fixed16(covered, kFormatVersion);
+  covered->put_fixed16(kFormatVersion);
   covered->put_fixed64(tp.meta_region_offset);
   covered->put_fixed64(tp.meta_region_length);
   covered->put_fixed64(tp.hot_off);
@@ -85,7 +67,7 @@ Status decode_tail_pointer(Slice last_bytes, TailPointer* out) {
   }
 
   uint16_t format_version = 0;
-  SNII_RETURN_IF_ERROR(get_fixed16(&src, &format_version));
+  SNII_RETURN_IF_ERROR(src.get_fixed16(&format_version));
   (void)format_version;  // Read to advance the cursor; version policy lives in
                          // the bootstrap header, not here.
   SNII_RETURN_IF_ERROR(src.get_fixed64(&out->meta_region_offset));

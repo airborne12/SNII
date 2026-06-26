@@ -14,6 +14,7 @@ class ByteSource {
   explicit ByteSource(Slice s) : s_(s) {}
 
   Status get_u8(uint8_t* v);
+  Status get_fixed16(uint16_t* v);
   Status get_fixed32(uint32_t* v);
   Status get_fixed64(uint64_t* v);
   Status get_varint32(uint32_t* v);

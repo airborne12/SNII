@@ -54,9 +54,14 @@ void api_release() {
 std::shared_ptr<Aws::S3::S3Client> make_client(const S3Config& cfg) {
   Aws::Auth::AWSCredentials creds(Aws::String(cfg.ak.c_str()),
                                   Aws::String(cfg.sk.c_str()));
-  Aws::Client::ClientConfiguration client_cfg;
+  Aws::Client::ClientConfigurationInitValues init;
+  init.shouldDisableIMDS = true;
+  Aws::Client::ClientConfiguration client_cfg(init);
   client_cfg.endpointOverride = Aws::String(cfg.endpoint.c_str());
   client_cfg.region = Aws::String(cfg.region.c_str());
+  client_cfg.connectTimeoutMs = cfg.connect_timeout_ms;
+  client_cfg.requestTimeoutMs = cfg.request_timeout_ms;
+  client_cfg.httpRequestTimeoutMs = cfg.http_request_timeout_ms;
   return std::make_shared<Aws::S3::S3Client>(
       creds, client_cfg,
       Aws::Client::AWSAuthV4Signer::PayloadSigningPolicy::Never,
@@ -135,6 +140,7 @@ Status S3FileReader::read_at(uint64_t offset, size_t len,
 
 Status S3FileReader::read_batch(const std::vector<Range>& ranges,
                                 std::vector<std::vector<uint8_t>>* outs) {
+  if (outs == nullptr) return Status::InvalidArgument("read_batch: null outs");
   outs->resize(ranges.size());
   if (ranges.empty()) return Status::OK();
   // Issue GETs concurrently in bounded waves; aws S3Client is safe for parallel

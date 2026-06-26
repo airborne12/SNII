@@ -549,16 +549,14 @@ Status LogicalIndexWriter::build_blocks() {
   if (term_source_ != nullptr) {
     Status streamed = Status::OK();
     // Drain the SPIMI buffer term-by-term; only one TermPostings is alive at a
-    // time, so the input+output never fully coexist. Errors are latched and the
-    // drain continues so the source is fully consumed (no partial state reuse).
-    term_source_->for_each_term_sorted([&](TermPostings&& tp) {
+    // time, so the input+output never fully coexist. The returned Status covers
+    // both spill/merge I/O errors and add_token validation errors (the latter
+    // flow through merge_runs -> spill_status_), so a separate status() check
+    // is no longer needed.
+    SNII_RETURN_IF_ERROR(term_source_->for_each_term_sorted([&](TermPostings&& tp) {
       if (streamed.ok()) streamed = process_term(tp, &st);
-    });
+    }));
     SNII_RETURN_IF_ERROR(streamed);
-    // The streaming callback cannot return a Status, so a spill/merge I/O error
-    // is latched inside the source; surface it here so a failed out-of-core
-    // build does not masquerade as an empty-but-successful index.
-    SNII_RETURN_IF_ERROR(term_source_->status());
   } else {
     // Materialized fallback (tests / callers holding a vector): process_term frees
     // the term's arrays, so feed a per-term COPY to keep terms_ intact for the

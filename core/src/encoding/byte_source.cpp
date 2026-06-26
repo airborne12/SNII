@@ -10,6 +10,15 @@ Status ByteSource::get_u8(uint8_t* v) {
   return Status::OK();
 }
 
+Status ByteSource::get_fixed16(uint16_t* v) {
+  if (remaining() < 2) return Status::Corruption("get_fixed16 overrun");
+  uint16_t r = 0;
+  for (int i = 0; i < 2; ++i) r |= static_cast<uint16_t>(s_[pos_ + i]) << (8 * i);
+  pos_ += 2;
+  *v = r;
+  return Status::OK();
+}
+
 Status ByteSource::get_fixed32(uint32_t* v) {
   if (remaining() < 4) return Status::Corruption("get_fixed32 overrun");
   uint32_t r = 0;
